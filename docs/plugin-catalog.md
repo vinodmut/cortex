@@ -25,6 +25,7 @@ AuthBridge pipeline YAML, not whether it is compiled into the binary
 | [`a2a-parser`](#a2a-parser) | Parses A2A messages into `pctx.Extensions.A2A` for downstream plugins. | Beta | Inbound | No |
 | [`context-guru`](#context-guru) | Compacts the outbound LLM request context before forwarding. | Opt-in | Outbound | No |
 | [`cpex`](#cpex) | APL DSL + named [CPEX](https://github.com/contextforge-org/cpex) 0.3 plugins (JWT identity, OAuth delegation, Cedar, CEL, OPA) over a single chain step. | Opt-in | Outbound | No |
+| [`evolve`](#evolve) | Injects reviewed [altk-evolve](https://github.com/AgentToolkit/altk-evolve) guidelines into main-agent requests and reports idle sessions so evolve can learn from them. | Alpha | Outbound | No |
 | [`ibac`](#ibac) | LLM-judge intent-based access control for outbound tool calls. | Alpha | Outbound | No |
 | [`inference-parser`](#inference-parser) | Parses LLM completions into `pctx.Extensions.Inference`. | Alpha | Outbound | No |
 | [`inference-router`](#inference-router) | Sends each coding agent's new sessions to the inference server chosen for it; a session stays on the server it started on until moved. | Alpha | Outbound | No |
@@ -69,6 +70,15 @@ cortex-cpex` (`-tags cpex`, `CGO_ENABLED=1`, links `libcpex_ffi.a` from the
 pinned CPEX 0.3.1 release). The CPEX policy
 uses 0.3's schema; a 0.2.x policy fails at boot. Full details in [cpex-plugin.md](./cpex-plugin.md);
 see also the plugin's [README](../core/plugins/cpex/README.md).
+
+## `evolve`
+
+Closes a self-improvement loop with the
+[altk-evolve](https://github.com/AgentToolkit/altk-evolve) service: appends the
+active guidelines relevant to a session's task to its main-agent requests, and
+reports idle sessions so evolve can learn candidate guidelines from them. Only
+guidelines a reviewer promoted are injected. Fails open. Full details in
+[evolve-plugin.md](./evolve-plugin.md).
 
 ## `ibac`
 
