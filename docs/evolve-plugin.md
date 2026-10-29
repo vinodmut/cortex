@@ -137,6 +137,9 @@ pipeline:
 
 ## Running evolve beside Cortex
 
+For a step-by-step walkthrough that runs the whole loop against a real Claude Code session,
+without touching your everyday Cortex, see [evolve-plugin-e2e.md](evolve-plugin-e2e.md).
+
 ```bash
 env -u HTTPS_PROXY \
   EVOLVE_INJECTION_MODE=retrieval \
