@@ -49,6 +49,9 @@ const blockTag = "evolve-guidelines"
 // guideline text cannot end the block early or forge a second one.
 var tagPattern = regexp.MustCompile(`(?i)</?\s*` + blockTag + `[^>]*>`)
 
+// blockPattern matches a whole injected block, for removal from trajectories.
+var blockPattern = regexp.MustCompile(`(?is)<` + blockTag + `\b[^>]*>.*?</` + blockTag + `>`)
+
 // formatBlock renders guidelines as the delimited block appended to the system
 // prompt. The output is a pure function of its input: the same guidelines give
 // the same bytes on every turn, so the provider's prompt cache keeps hitting.
@@ -157,8 +160,7 @@ func taskText(messages []messageText) string {
 		if m.role != "user" {
 			continue
 		}
-		text := reminderPattern.ReplaceAllString(m.content, "")
-		text = strings.TrimSpace(text)
+		text := clean(m.content)
 		if text == "" {
 			continue
 		}

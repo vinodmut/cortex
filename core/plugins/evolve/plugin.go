@@ -1,27 +1,28 @@
 // Package evolve connects Cortex to altk-evolve, a service that learns
-// guidelines from agent trajectories (https://github.com/AgentToolkit/altk-evolve).
+// guidelines from agent trajectories (https://github.com/AgentToolkit/altk-evolve),
+// using only the tools a stock `evolve-mcp --transport sse` server exposes.
 //
 // The plugin does two things, both optional:
 //
 //   - Inject. On a session's first main-agent inference request it asks evolve
-//     for the active guidelines relevant to the session's task, caches them per
-//     session, and appends them to the system instructions of every main-agent
-//     request in that session as a delimited <evolve-guidelines> block. The
-//     block is byte-stable across turns so prompt caching keeps working.
-//   - Export. When a session has been idle for idle_after_seconds, the plugin
-//     notifies evolve, which reads the session's new turns from Cortex's session
-//     API and learns candidate guidelines from them.
+//     (get_guidelines_with_attribution) for the guidelines relevant to the
+//     session's task in the serve namespace, caches them per session, and
+//     appends them to the system instructions of every main-agent request in
+//     that session as a delimited <evolve-guidelines> block. The block is
+//     byte-stable across turns so prompt caching keeps working.
+//   - Learn. It records each completed main-agent turn as OpenAI chat messages
+//     and, when the session has been idle for idle_after_seconds, sends the new
+//     turns to evolve (process_trajectory) as one identified batch. Evolve
+//     generates guidelines from them into the learn namespace.
 //
-// Evolve serves only guidelines a reviewer promoted to active; what it learns
-// from sessions arrives as a candidate. That gate lives in evolve, not here:
-// session content includes tool output, so nothing distilled from it should
-// steer an agent unreviewed.
+// The two namespaces are the review gate. Session content includes tool output
+// the agent read, so a guideline distilled from it can carry text an attacker
+// wrote. Learned guidelines therefore land in learn_namespace, which is never
+// injected from; a person copies the ones worth keeping into serve_namespace.
 //
 // Every failure fails open. Evolve unreachable, slow, or returning nonsense
 // means the request goes upstream untouched; the guidelines are an
-// improvement, never a dependency. Because parsers read the client's original
-// bytes, the session archive never contains the injected block, so evolve does
-// not learn from its own output.
+// improvement, never a dependency.
 package evolve
 
 import (
@@ -30,8 +31,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
-	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -45,18 +44,21 @@ import (
 const name = "evolve"
 
 type config struct {
-	Endpoint   string   `json:"endpoint" required:"true" description:"Base URL of the evolve Cortex API (evolve cortex serve), e.g. http://127.0.0.1:8202."`
-	Bearer     string   `json:"bearer" description:"Bearer token for the evolve API. Prefer bearer_file or ${ENV} expansion over a literal."`
-	BearerFile string   `json:"bearer_file" description:"File holding the bearer token; ~ expands to the home directory."`
-	Inject     *bool    `json:"inject" description:"Append active guidelines to main-agent requests." default:"true"`
-	Export     *bool    `json:"export" description:"Notify evolve when a session goes idle so it can learn from it." default:"true"`
-	Agents     []string `json:"agents" description:"Client names to act on (claude-code, codex, bob, opencode). Empty = all recognised agents."`
-	TopK       int      `json:"top_k" description:"Most guidelines to inject per session." default:"8"`
-	TimeoutMs  int      `json:"timeout_ms" description:"Per-call timeout for evolve. The first request of a session waits up to this long." default:"1500"`
-	CacheTTL   int      `json:"cache_ttl_seconds" description:"How long a session's guidelines are reused before refetching (how soon a retired guideline stops)." default:"1800"`
-	RetryAfter int      `json:"retry_after_seconds" description:"After a failed fetch, how long to inject nothing before trying again." default:"60"`
-	IdleAfter  int      `json:"idle_after_seconds" description:"Quiet time after which a session is reported to evolve for learning." default:"900"`
-	MaxCached  int      `json:"max_sessions" description:"Most sessions whose guidelines are cached." default:"1024"`
+	Endpoint       string   `json:"endpoint" required:"true" description:"SSE URL of the evolve MCP server (evolve-mcp --transport sse), e.g. http://127.0.0.1:8201/sse."`
+	ServeNamespace string   `json:"serve_namespace" description:"Evolve namespace guidelines are injected from: the reviewed set." default:"cortex"`
+	LearnNamespace string   `json:"learn_namespace" description:"Evolve namespace learned guidelines are written to, for review. Never injected from." default:"cortex-candidates"`
+	Profile        string   `json:"processing_profile" description:"Evolve processing profile the plugin creates and learns with." default:"cortex"`
+	Inject         *bool    `json:"inject" description:"Append guidelines to main-agent requests." default:"true"`
+	Learn          *bool    `json:"learn" description:"Send idle sessions' new turns to evolve to learn from." default:"true"`
+	Agents         []string `json:"agents" description:"Client names to act on (claude-code, codex, bob, opencode). Empty = all recognised agents."`
+	TopK           int      `json:"top_k" description:"Most guidelines to inject per session." default:"8"`
+	TimeoutMs      int      `json:"timeout_ms" description:"Timeout for fetching a session's guidelines. The first request of a session waits up to this long." default:"3000"`
+	LearnTimeout   int      `json:"learn_timeout_seconds" description:"Timeout for one learning call; evolve generates guidelines with an LLM before answering." default:"300"`
+	CacheTTL       int      `json:"cache_ttl_seconds" description:"How long a session's guidelines are reused before refetching (how soon a removed guideline stops)." default:"1800"`
+	RetryAfter     int      `json:"retry_after_seconds" description:"After a failed fetch, how long to inject nothing before trying again." default:"60"`
+	IdleAfter      int      `json:"idle_after_seconds" description:"Quiet time after which a session's new turns are sent to evolve." default:"900"`
+	MinTurns       int      `json:"min_turns" description:"Fewest new main-agent turns worth learning from." default:"2"`
+	MaxCached      int      `json:"max_sessions" description:"Most sessions tracked for caching and learning." default:"1024"`
 }
 
 func (c *config) applyDefaults() {
@@ -64,26 +66,29 @@ func (c *config) applyDefaults() {
 	if c.Inject == nil {
 		c.Inject = &t
 	}
-	if c.Export == nil {
-		c.Export = &t
+	if c.Learn == nil {
+		c.Learn = &t
 	}
-	if c.TopK == 0 {
-		c.TopK = 8
+	defaults := []struct {
+		field *int
+		value int
+	}{
+		{&c.TopK, 8}, {&c.TimeoutMs, 3000}, {&c.LearnTimeout, 300}, {&c.CacheTTL, 1800},
+		{&c.RetryAfter, 60}, {&c.IdleAfter, 900}, {&c.MinTurns, 2}, {&c.MaxCached, 1024},
 	}
-	if c.TimeoutMs == 0 {
-		c.TimeoutMs = 1500
+	for _, d := range defaults {
+		if *d.field == 0 {
+			*d.field = d.value
+		}
 	}
-	if c.CacheTTL == 0 {
-		c.CacheTTL = 1800
+	if c.ServeNamespace == "" {
+		c.ServeNamespace = "cortex"
 	}
-	if c.RetryAfter == 0 {
-		c.RetryAfter = 60
+	if c.LearnNamespace == "" {
+		c.LearnNamespace = "cortex-candidates"
 	}
-	if c.IdleAfter == 0 {
-		c.IdleAfter = 900
-	}
-	if c.MaxCached == 0 {
-		c.MaxCached = 1024
+	if c.Profile == "" {
+		c.Profile = "cortex"
 	}
 }
 
@@ -91,8 +96,8 @@ func (c *config) validate() error {
 	if !strings.HasPrefix(c.Endpoint, "http://") && !strings.HasPrefix(c.Endpoint, "https://") {
 		return fmt.Errorf("endpoint must be an http(s) URL, got %q", c.Endpoint)
 	}
-	if c.Bearer != "" && c.BearerFile != "" {
-		return fmt.Errorf("set bearer or bearer_file, not both")
+	if c.ServeNamespace == c.LearnNamespace {
+		return fmt.Errorf("serve_namespace and learn_namespace must differ: learned guidelines are reviewed before they are served")
 	}
 	if c.TopK < 1 || c.TopK > 50 {
 		return fmt.Errorf("top_k must be between 1 and 50")
@@ -100,8 +105,10 @@ func (c *config) validate() error {
 	if c.TimeoutMs < 50 {
 		return fmt.Errorf("timeout_ms must be at least 50")
 	}
-	if c.CacheTTL < 1 || c.RetryAfter < 1 || c.IdleAfter < 1 || c.MaxCached < 1 {
-		return fmt.Errorf("cache_ttl_seconds, retry_after_seconds, idle_after_seconds and max_sessions must be positive")
+	for _, v := range []int{c.LearnTimeout, c.CacheTTL, c.RetryAfter, c.IdleAfter, c.MinTurns, c.MaxCached} {
+		if v < 1 {
+			return fmt.Errorf("learn_timeout_seconds, cache_ttl_seconds, retry_after_seconds, idle_after_seconds, min_turns and max_sessions must be positive")
+		}
 	}
 	return nil
 }
@@ -116,9 +123,12 @@ type cached struct {
 	failed     bool
 }
 
-type seen struct {
-	at    time.Time
-	agent string
+// session is one session's learning state: its unsent turns and when it was
+// last active.
+type session struct {
+	rec     *recorder
+	last    time.Time
+	sending bool
 }
 
 // Plugin is the evolve plugin.
@@ -128,12 +138,13 @@ type Plugin struct {
 	client Evolve
 	agents map[string]struct{}
 	now    func() time.Time
+	epoch  int64
 
 	mu       sync.Mutex
 	cache    map[string]*cached
 	order    []string // cache insertion order, for eviction
 	inflight map[string]*sync.Mutex
-	lastSeen map[string]*seen
+	sessions map[string]*session
 
 	tick   time.Duration
 	cancel context.CancelFunc
@@ -155,7 +166,7 @@ func (p *Plugin) Capabilities() pipeline.PluginCapabilities {
 		ReadsBody:         true,
 		WritesRequestBody: true,
 		RequiresAny:       []string{"inference-parser"},
-		Description:       "Injects reviewed altk-evolve guidelines; reports idle sessions for learning.",
+		Description:       "Injects reviewed altk-evolve guidelines; sends idle sessions to learn from.",
 	}
 }
 
@@ -178,14 +189,6 @@ func (p *Plugin) Configure(raw json.RawMessage) error {
 	if err := c.validate(); err != nil {
 		return fmt.Errorf("evolve config: %w", err)
 	}
-	bearer := c.Bearer
-	if c.BearerFile != "" {
-		b, err := os.ReadFile(expandHome(c.BearerFile))
-		if err != nil {
-			return fmt.Errorf("evolve config: bearer_file: %w", err)
-		}
-		bearer = strings.TrimSpace(string(b))
-	}
 	p.cfg = c
 	p.raw = raw
 	p.agents = make(map[string]struct{}, len(c.Agents))
@@ -194,44 +197,38 @@ func (p *Plugin) Configure(raw json.RawMessage) error {
 	}
 	p.cache = map[string]*cached{}
 	p.inflight = map[string]*sync.Mutex{}
-	p.lastSeen = map[string]*seen{}
+	p.sessions = map[string]*session{}
+	p.epoch = p.now().Unix()
 	if p.client == nil {
-		p.client = newHTTPClient(strings.TrimRight(c.Endpoint, "/"), bearer, time.Duration(c.TimeoutMs)*time.Millisecond)
+		p.client = newMCPEvolve(c.Endpoint, c.Profile, time.Duration(c.TimeoutMs)*time.Millisecond)
 	}
 	return nil
 }
 
-func expandHome(path string) string {
-	if path == "~" || strings.HasPrefix(path, "~/") {
-		if home, err := os.UserHomeDir(); err == nil {
-			return filepath.Join(home, strings.TrimPrefix(path, "~"))
-		}
-	}
-	return path
-}
-
-// Init starts the idle-session notifier.
+// Init starts the idle-session sender.
 func (p *Plugin) Init(context.Context) error {
-	if !*p.cfg.Export {
+	if !*p.cfg.Learn {
 		return nil
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	p.cancel = cancel
 	p.done = make(chan struct{})
-	go p.notifyLoop(ctx)
+	go p.learnLoop(ctx)
 	return nil
 }
 
-// Shutdown stops the notifier. Sessions not yet reported are picked up later by
-// `evolve sync cortex`, so nothing is flushed here.
+// Shutdown stops the sender. Unsent turns are dropped: learning is
+// best-effort, and a restart is not worth delaying for an LLM call.
 func (p *Plugin) Shutdown(ctx context.Context) error {
-	if p.cancel == nil {
-		return nil
+	if p.cancel != nil {
+		p.cancel()
+		select {
+		case <-p.done:
+		case <-ctx.Done():
+		}
 	}
-	p.cancel()
-	select {
-	case <-p.done:
-	case <-ctx.Done():
+	if c, ok := p.client.(interface{ Close() }); ok {
+		c.Close()
 	}
 	return nil
 }
@@ -301,7 +298,7 @@ func (p *Plugin) OnRequest(ctx context.Context, pctx *pipeline.Context) (action 
 		pctx.Skip("path_not_inference")
 		return action
 	}
-	reason, sessionID, agent := p.eligible(pctx)
+	reason, sessionID, _ := p.eligible(pctx)
 	if reason != "" {
 		pctx.Skip(reason)
 		return action
@@ -311,7 +308,7 @@ func (p *Plugin) OnRequest(ctx context.Context, pctx *pipeline.Context) (action 
 		return action
 	}
 
-	entry, hit := p.guidelinesFor(ctx, sessionID, agent, pctx.Extensions.Inference.Messages)
+	entry, hit := p.guidelinesFor(ctx, sessionID, pctx.Extensions.Inference.Messages)
 	ev := event{Cached: hit, FetchedAt: entry.fetchedAt}
 	if len(entry.guidelines) == 0 {
 		reason := "no_guidelines"
@@ -335,8 +332,8 @@ func (p *Plugin) OnRequest(ctx context.Context, pctx *pipeline.Context) (action 
 	ev.Injected = applied
 	for _, g := range entry.guidelines {
 		ev.IDs = append(ev.IDs, g.ID)
-		ev.Revisions = append(ev.Revisions, g.MemoryRevision)
-		ev.Sources = append(ev.Sources, g.SourceTaskID)
+		ev.Revisions = append(ev.Revisions, g.Revision)
+		ev.Sources = append(ev.Sources, g.Source)
 	}
 	p.publish(pctx, ev)
 	if applied {
@@ -350,7 +347,7 @@ func (p *Plugin) OnRequest(ctx context.Context, pctx *pipeline.Context) (action 
 // guidelinesFor returns the session's cached guidelines, fetching them when
 // absent or expired. One fetch per session at a time: concurrent requests of
 // the same session wait for it rather than each calling evolve.
-func (p *Plugin) guidelinesFor(ctx context.Context, sessionID, agent string, messages []pipeline.InferenceMessage) (*cached, bool) {
+func (p *Plugin) guidelinesFor(ctx context.Context, sessionID string, messages []pipeline.InferenceMessage) (*cached, bool) {
 	p.mu.Lock()
 	if c, ok := p.cache[sessionID]; ok && p.now().Before(c.expires) {
 		p.mu.Unlock()
@@ -384,7 +381,7 @@ func (p *Plugin) guidelinesFor(ctx context.Context, sessionID, agent string, mes
 		entry.expires = p.now().Add(time.Duration(p.cfg.RetryAfter) * time.Second)
 	} else {
 		callCtx, cancel := context.WithTimeout(ctx, time.Duration(p.cfg.TimeoutMs)*time.Millisecond)
-		gs, err := p.client.Guidelines(callCtx, GuidelinesRequest{Task: task, SessionID: sessionID, Agent: agent, TopK: p.cfg.TopK})
+		gs, err := p.client.Guidelines(callCtx, p.cfg.ServeNamespace, task, sessionID)
 		cancel()
 		p.m.inc(&p.m.fetches)
 		switch {
@@ -439,20 +436,45 @@ func (p *Plugin) OnResponse(context.Context, *pipeline.Context) pipeline.Action 
 	return pipeline.Action{Type: pipeline.Continue}
 }
 
-// OnFinish records session activity for the idle notifier. It runs after the
-// response is on the wire, so it only touches a map.
+// OnFinish records the completed turn for learning. It runs after the
+// response is on the wire, and only appends to the session's recorder.
 func (p *Plugin) OnFinish(_ context.Context, pctx *pipeline.Context) {
-	if !*p.cfg.Export {
+	if !*p.cfg.Learn {
 		return
 	}
-	if reason, sessionID, agent := p.eligible(pctx); reason == "" {
-		p.mu.Lock()
-		p.lastSeen[sessionID] = &seen{at: p.now(), agent: agent}
-		p.mu.Unlock()
+	if out := pctx.Outcome(); out == nil || out.StatusCode < 200 || out.StatusCode >= 300 {
+		return
 	}
+	reason, sessionID, agent := p.eligible(pctx)
+	if reason != "" {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	s, ok := p.sessions[sessionID]
+	if !ok {
+		if len(p.sessions) >= p.cfg.MaxCached {
+			p.evictOldestSession()
+		}
+		s = &session{rec: newRecorder(agent, p.epoch)}
+		p.sessions[sessionID] = s
+	}
+	s.rec.observe(pctx.Extensions.Inference)
+	s.last = p.now()
 }
 
-func (p *Plugin) notifyLoop(ctx context.Context) {
+func (p *Plugin) evictOldestSession() {
+	var oldest string
+	var at time.Time
+	for id, s := range p.sessions {
+		if !s.sending && (oldest == "" || s.last.Before(at)) {
+			oldest, at = id, s.last
+		}
+	}
+	delete(p.sessions, oldest)
+}
+
+func (p *Plugin) learnLoop(ctx context.Context) {
 	defer close(p.done)
 	t := time.NewTicker(p.tick)
 	defer t.Stop()
@@ -461,42 +483,56 @@ func (p *Plugin) notifyLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			p.notifyIdle(ctx)
+			p.learnIdle(ctx)
 		}
 	}
 }
 
-// notifyIdle reports each session idle for idle_after_seconds once per idle
-// period. A failed report is retried on the next tick; evolve's per-session
-// cursor makes a duplicate report harmless.
-func (p *Plugin) notifyIdle(ctx context.Context) {
+// learnIdle sends each idle session's new turns to evolve. A failed send is
+// restored and retried on a later tick under the same batch id; evolve skips a
+// batch it already processed, so a send that succeeded but reported failure is
+// not learned twice.
+func (p *Plugin) learnIdle(ctx context.Context) {
 	cutoff := p.now().Add(-time.Duration(p.cfg.IdleAfter) * time.Second)
-	type due struct{ sessionID, agent string }
-	var pending []due
-	p.mu.Lock()
-	for sid, s := range p.lastSeen {
-		if !s.at.After(cutoff) {
-			pending = append(pending, due{sid, s.agent})
-		}
+	type due struct {
+		id string
+		s  *session
+		t  Trajectory
 	}
-	p.mu.Unlock()
-	for _, d := range pending {
-		callCtx, cancel := context.WithTimeout(ctx, time.Duration(p.cfg.TimeoutMs)*time.Millisecond)
-		err := p.client.NotifyIdle(callCtx, d.sessionID, d.agent)
-		cancel()
-		if err != nil {
-			p.m.inc(&p.m.notifyErrors)
-			slog.Warn("evolve: idle-session notification failed; will retry", "session", d.sessionID, "err", err)
+	var batches []due
+	p.mu.Lock()
+	for id, s := range p.sessions {
+		if s.sending || s.last.After(cutoff) {
 			continue
 		}
-		p.m.inc(&p.m.notified)
+		// A session stays tracked after it is learned from, so a resumed session
+		// continues its batch sequence; max_sessions bounds how many are kept.
+		t, ok := s.rec.take(id, p.cfg.MinTurns)
+		if !ok {
+			continue
+		}
+		s.sending = true
+		batches = append(batches, due{id, s, t})
+	}
+	p.mu.Unlock()
+
+	for _, b := range batches {
+		callCtx, cancel := context.WithTimeout(ctx, time.Duration(p.cfg.LearnTimeout)*time.Second)
+		err := p.client.Learn(callCtx, p.cfg.LearnNamespace, b.t)
+		cancel()
 		p.mu.Lock()
-		// Reported once per idle period: new activity records the session
-		// again, and only then is it reported again.
-		if s, ok := p.lastSeen[d.sessionID]; ok && !s.at.After(cutoff) {
-			delete(p.lastSeen, d.sessionID)
+		b.s.sending = false
+		if err != nil {
+			b.s.rec.restore(b.t)
 		}
 		p.mu.Unlock()
+		if err != nil {
+			p.m.inc(&p.m.learnErrors)
+			slog.Warn("evolve: sending session to learn from failed; will retry", "session", b.id, "err", err)
+			continue
+		}
+		p.m.inc(&p.m.learned)
+		slog.Info("evolve: sent idle session to learn from", "session", b.id, "messages", len(b.t.Messages), "batch", b.t.Batch.BatchID)
 	}
 }
 

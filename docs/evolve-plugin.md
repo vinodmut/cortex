@@ -2,31 +2,46 @@
 
 The `evolve` plugin connects Cortex to [altk-evolve](https://github.com/AgentToolkit/altk-evolve),
 a service that learns *guidelines* — short instructions that would have steered an agent
-better — from recorded agent sessions. It closes the loop rossoctl#2653 describes:
+better — from agent trajectories. It closes the loop rossoctl#2653 describes:
 
-1. **Capture** — Cortex already records every session (`core/session/archive`, session API).
-2. **Learn** — when a session goes quiet, the plugin tells evolve, which reads the session's
-   new turns from Cortex's session API and distils **candidate** guidelines from them.
-3. **Inject** — on each main-agent request, the plugin appends the **active** guidelines
-   relevant to the session's task to the system instructions.
+1. **Capture** — the plugin records each completed main-agent turn as OpenAI chat messages.
+2. **Learn** — when a session goes quiet, it sends the new turns to evolve, which distils
+   guidelines from them into a **candidates** namespace.
+3. **Inject** — on each main-agent request, it appends the guidelines relevant to the
+   session's task, from a separate **reviewed** namespace, to the system instructions.
 
-Evolve is Python, so it runs beside Cortex as a local service (`evolve cortex serve`) and the
-plugin is a thin HTTP client — the same shape as [`sparc`](sparc-plugin.md).
+Evolve is Python, so it runs beside Cortex and the plugin is a client of its stock MCP server
+(`evolve-mcp --transport sse`) — no evolve-side changes. The tools it calls:
+
+| Purpose | Tool |
+|---|---|
+| Fetch the task-relevant guideline ids | `get_guidelines_with_attribution` |
+| Read their text and provenance | `list_entities` |
+| Create the plugin's processing profile, once | `ensure_processing_profile` |
+| Learn from a batch of turns | `process_trajectory` |
 
 ## Nothing learned is injected until a person accepts it
 
 Session content includes tool output: fetched web pages, file contents, command output. A
 guideline distilled from it can carry text an attacker wrote, and injecting it makes that text
-persistent across every later session. So evolve stores everything it learns from Cortex as
-`status: candidate`, and serves the plugin only guidelines a reviewer promoted:
+persistent across every later session. So learned guidelines land in `learn_namespace`
+(default `cortex-candidates`), which the plugin never injects from, and are served only once
+someone copies them into `serve_namespace` (default `cortex`):
 
 ```bash
-evolve entities list cortex --status candidate     # review what was learned
-evolve entities promote cortex <id> --reason "..." # accept: injected from now on
-evolve entities retire cortex <id> --reason "..."  # withdraw; content and history are kept
+evolve entities list cortex-candidates --type guideline     # review what was learned
+evolve entities show cortex-candidates <id>                 # content and provenance
+evolve entities add cortex --no-conflict-resolution \
+  -c "<content>" -m '{"source_task_id": "...", "task_description": "..."}'   # accept
+evolve entities delete cortex-candidates <id>               # clear the candidate
+evolve entities delete cortex <id>                          # withdraw a served guideline
 ```
 
-A retired guideline stops being injected once each session's cache expires
+Keeping the sets in separate namespaces also keeps untrusted input away from what is served:
+evolve's conflict resolution reconciles new guidelines only against the namespace they are
+written to, so a trajectory can never rewrite or delete a reviewed guideline.
+
+A withdrawn guideline stops being injected once each session's cache expires
 (`cache_ttl_seconds`, default 30 minutes).
 
 ## What a request looks like
@@ -36,9 +51,9 @@ on Anthropic Messages, the leading system message on Chat Completions, `instruct
 Responses API:
 
 ```text
-<evolve-guidelines source="altk-evolve" ids="0b5c…,7d21…">
+<evolve-guidelines source="altk-evolve" ids="3,2">
 Guidelines learned from earlier sessions on this machine. Apply them when they are relevant to the task; ignore them otherwise.
-1. Run the test suite with `uv run pytest -v` before committing.
+1. Verify the outputs of commands executed and cross-check them with the task requirements.
 2. …
 </evolve-guidelines>
 ```
@@ -49,8 +64,19 @@ identical bytes and the provider's prompt cache keeps hitting. Requests the plug
 alone: subagents, tool-less side calls (titles, summaries), sessions without an id, agents
 outside `agents`, and its own calls (`X-Evolve-Cortex`).
 
-Inference parsers read the client's original bytes, so the session archive — and therefore
-what evolve learns from — never contains the injected block.
+## What is learned from
+
+Only the main conversation of sessions the plugin saw: each successful (2xx) main-agent
+exchange contributes the new user messages, the assistant's reply and tool calls, and the tool
+results the next request carried (truncated to 4 KB each, errors marked `[error]`).
+`<system-reminder>` and `<evolve-guidelines>` blocks are stripped, so evolve does not learn
+from harness context or from its own injected guidelines. A session is sent once it has been
+idle for `idle_after_seconds` with at least `min_turns` new turns; a resumed session sends only
+its new turns, with the original task as context.
+
+Each send is an identified batch (`source: cortex`, the session id, a per-process sequence
+number): a send that is retried after a timeout is skipped by evolve if it was already
+processed. Unsent turns live in memory, so a Cortex restart drops them.
 
 ## Seeing what it did
 
@@ -58,22 +84,20 @@ Every handled request records an invocation (`modify` when the block was added, 
 reason otherwise) and publishes `plugins.evolve` on its session event:
 
 ```json
-{"injected": true, "ids": ["0b5c…", "7d21…"], "revisions": [1, 3],
- "sources": ["cortex:<session>:<seq>", null], "cached": true, "fetchedAt": "…"}
+{"injected": true, "ids": ["3", "2"], "revisions": [null, null],
+ "sources": ["cortex:<session>:<batch>", ""], "cached": true, "fetchedAt": "…"}
 ```
 
-`ids` and `revisions` name exactly which guideline versions shaped the request; `sources` is
-the session turn each one was learned from. agentop's detail pane shows the event; the plugin
-pane shows counters (`requests injected`, `fetch errors`, `idle sessions reported`, …).
+`ids` name exactly which guidelines shaped the request; `sources` is the session batch each
+was learned from. agentop's detail pane shows the event; the plugin pane shows counters
+(`requests injected`, `fetch errors`, `sessions sent to learn`, …).
 
 ## Failure policy: open
 
-Evolve unreachable, slow (`timeout_ms`, default 1.5 s, paid once per session), or returning an
+Evolve unreachable, slow (`timeout_ms`, default 3 s, paid once per session), or returning an
 error means the request is forwarded **unchanged**, a fetch error is counted, and the plugin
 tries again after `retry_after_seconds`. A session that already has guidelines keeps them
-through a failed refresh. Idle-session reports that fail are retried on the next 30-second tick;
-evolve's per-session cursor makes a repeated report harmless. Sessions never reported (Cortex
-restarted, evolve down) are picked up by `evolve sync cortex`.
+through a failed refresh. A failed learning send is retried on the next 30-second tick.
 
 ## Configuration
 
@@ -87,53 +111,59 @@ pipeline:
       - name: tool-prune
       - name: evolve
         config:
-          endpoint: http://127.0.0.1:8202
-          bearer_file: ~/.evolve/cortex-token
+          endpoint: http://127.0.0.1:8201/sse
           agents: [claude-code]
 ```
 
 | Field | Default | Meaning |
 |---|---|---|
-| `endpoint` | required | Base URL of `evolve cortex serve`. |
-| `bearer` / `bearer_file` | — | The token evolve was started with. Use one; prefer the file or `${ENV}`. |
-| `inject` | `true` | Append active guidelines to main-agent requests. |
-| `export` | `true` | Report idle sessions so evolve learns from them. |
+| `endpoint` | required | SSE URL of `evolve-mcp --transport sse`. |
+| `serve_namespace` | `cortex` | Reviewed guidelines, injected from. |
+| `learn_namespace` | `cortex-candidates` | Learned guidelines, for review. Must differ. |
+| `processing_profile` | `cortex` | Evolve profile created and used for learning. |
+| `inject` | `true` | Append guidelines to main-agent requests. |
+| `learn` | `true` | Send idle sessions' new turns to evolve. |
 | `agents` | all | Client names to act on (`claude-code`, `codex`, `bob`, `opencode`). |
 | `top_k` | `8` | Most guidelines injected per session. |
-| `timeout_ms` | `1500` | Per-call timeout. |
+| `timeout_ms` | `3000` | Timeout for fetching a session's guidelines. |
+| `learn_timeout_seconds` | `300` | Timeout for one learning call (evolve runs an LLM). |
 | `cache_ttl_seconds` | `1800` | How long a session's guidelines are reused. |
 | `retry_after_seconds` | `60` | Back-off after a failed fetch. |
-| `idle_after_seconds` | `900` | Quiet time before a session is reported. |
-| `max_sessions` | `1024` | Sessions whose guidelines are cached. |
+| `idle_after_seconds` | `900` | Quiet time before a session's new turns are sent. |
+| `min_turns` | `2` | Fewest new turns worth learning from. |
+| `max_sessions` | `1024` | Sessions tracked for caching and learning. |
 
 `on_error: observe` computes the block and publishes the event without changing any bytes.
 
 ## Running evolve beside Cortex
 
 ```bash
-umask 077; mkdir -p ~/.evolve; openssl rand -hex 32 > ~/.evolve/cortex-token
 env -u HTTPS_PROXY \
-  EVOLVE_API_TOKEN_FILE=~/.evolve/cortex-token \
-  EVOLVE_NAMESPACE_ID=cortex EVOLVE_BACKEND=filesystem EVOLVE_DATA_DIR=~/.evolve/data \
-  EVOLVE_CORTEX_URL=http://127.0.0.1:47601 \
+  EVOLVE_INJECTION_MODE=retrieval \
+  EVOLVE_BACKEND=filesystem EVOLVE_DATA_DIR=~/.evolve/data \
   EVOLVE_MODEL_NAME=<litellm model for guideline generation> \
-  evolve cortex serve --port 8202
+  evolve-mcp --transport sse --port 8201
 ```
 
-`evolve cortex serve` refuses to start without a token and serves only the Cortex API — not
-evolve's unauthenticated dashboard. Unset `HTTPS_PROXY` so evolve's own LLM calls do not
-route through Cortex and get recorded as agent traffic.
+- `EVOLVE_INJECTION_MODE=retrieval` makes `get_guidelines_with_attribution` rank guidelines by
+  task similarity; the default mode matches the task text literally and on the filesystem
+  backend almost never returns anything.
+- Unset `HTTPS_PROXY` so evolve's own LLM calls do not route through Cortex and get recorded
+  as agent traffic.
+- **The MCP server has no authentication**: any local process can read and change the
+  guidelines it serves. Bind it to loopback (the default) and run it only on a single-user
+  machine. A shared or remote Cortex needs an authenticated evolve before it can use this.
 
 ## Turning it off
 
 Remove the `evolve` entry (or set `on_error: off`); the config hot-reloads. Learned guidelines
-stay in evolve; retiring them there is the per-guideline off switch.
+stay in evolve.
 
 ## Not yet
 
-- **Shadow evaluation.** Adoption is a manual promotion today. Injecting a candidate on a
-  fraction of sessions and promoting it only when cost and an outcome signal strictly beat the
-  baseline (rossoctl#2653, SkillOpt's gate) is the next step.
+- **Shadow evaluation.** Adoption is a manual copy today. Injecting a candidate on a fraction
+  of sessions and promoting it only when cost and an outcome signal strictly beat the baseline
+  (rossoctl#2653, SkillOpt's gate) is the next step.
 - Redaction of session content before it reaches evolve's LLM (evolve's hooks can do this but
   are opt-in), and subagent trajectories.
 - Ordering with `context-guru`, which may compact the block away; place `evolve` after it.

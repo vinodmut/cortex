@@ -9,6 +9,7 @@ require (
 	github.com/gobwas/glob v1.0.0
 	github.com/klauspost/compress v1.20.3
 	github.com/lestrrat-go/jwx/v2 v2.1.7
+	github.com/mark3labs/mcp-go v0.43.2
 	github.com/maximhq/bifrost/core v1.7.15
 	github.com/open-policy-agent/opa v1.21.4
 	github.com/rossoctl/context-guru v0.5.4
@@ -82,7 +83,6 @@ require (
 	github.com/lestrrat-go/option v1.0.1 // indirect
 	github.com/lestrrat-go/option/v2 v2.0.0 // indirect
 	github.com/mailru/easyjson v0.9.1 // indirect
-	github.com/mark3labs/mcp-go v0.43.2 // indirect
 	github.com/mattn/go-pointer v0.0.1 // indirect
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
 	github.com/opencontainers/go-digest v1.0.0 // indirect

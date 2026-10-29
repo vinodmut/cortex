@@ -70,8 +70,8 @@ var membership = map[PluginName][]ProfileName{
 	"inferencerouter": {ProfileFull, ProfileFullCpex},
 
 	// Full only, like inference-router: it reaches laptops through the release tarballs
-	// and changes no traffic until a pipeline names it. It needs an altk-evolve service
-	// beside it, which only a laptop runs today; only cmd/cortex registers it.
+	// and changes no traffic until a pipeline names it. It needs an altk-evolve MCP
+	// server beside it, which only a laptop runs today; only cmd/cortex registers it.
 	"evolve": {ProfileFull, ProfileFullCpex},
 
 	// The credential and identity plugins lite exists for, plus budget tracking.

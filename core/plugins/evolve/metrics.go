@@ -18,8 +18,8 @@ type metrics struct {
 	fetches      uint64
 	fetchErrors  uint64
 	injectErrors uint64 // request shapes the block could not be added to
-	notified     uint64
-	notifyErrors uint64
+	learned      uint64 // session batches sent to evolve
+	learnErrors  uint64
 	recovered    uint64
 }
 
@@ -43,8 +43,8 @@ func (m *metrics) snapshot() []pipeline.Metric {
 		{"guideline fetches", m.fetches, ""},
 		{"fetch errors", m.fetchErrors, "requests were forwarded without guidelines"},
 		{"inject errors", m.injectErrors, "unsupported request shape; forwarded unchanged"},
-		{"idle sessions reported", m.notified, ""},
-		{"report errors", m.notifyErrors, "retried on the next tick"},
+		{"sessions sent to learn", m.learned, ""},
+		{"learn errors", m.learnErrors, "retried on the next tick"},
 		{"panics recovered", m.recovered, "the original body was forwarded"},
 	}
 	var out []pipeline.Metric
