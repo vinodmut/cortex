@@ -24,6 +24,7 @@ func fullEvent() pipeline.SessionEvent {
 		Host:       "api.example.com",
 		StatusCode: 200,
 		Duration:   1200 * time.Millisecond,
+		Ttfb:       412 * time.Millisecond,
 		BytesUp:    4210,
 		BytesDown:  18230,
 		Identity:   &pipeline.EventIdentity{},
@@ -83,6 +84,9 @@ func fullEvent() pipeline.SessionEvent {
 		// Set only on a Claude Code subagent's requests; the parent only on a nested one's.
 		Subagent:       "a1a2e36cb5946f31c",
 		ParentSubagent: "a0974b0b8591dc76b",
+		Proc:           "100.5",
+		ClientProc:     "101.5",
+		SessionHeader:  "X-Claude-Code-Session-Id",
 	}
 }
 
@@ -150,6 +154,12 @@ func TestSummarizeEvent_DropsPayloadsKeepsTimelineFields(t *testing.T) {
 		t.Errorf("requestedHost = %q, want %q — the detail pane's redirected: line reads it",
 			got.RequestedHost, full.RequestedHost)
 	}
+	// ttfb is kept for the same reason as requestedHost: the detail pane draws its
+	// timing: line from the projected event, splitting a response's duration into the
+	// origin's answer time and the body's (#1251).
+	if got.Ttfb != full.Ttfb {
+		t.Errorf("ttfb = %v, want %v — the detail pane's timing: line reads it", got.Ttfb, full.Ttfb)
+	}
 	// upgradeStripped is kept for the same reason as requestedHost: the detail pane's
 	// upgrade: line reads it off the projected event, and a 405 whose explanation only
 	// appears after a round trip is the confusion this field exists to end.
@@ -166,6 +176,11 @@ func TestSummarizeEvent_DropsPayloadsKeepsTimelineFields(t *testing.T) {
 	if got.ParentSubagent != full.ParentSubagent {
 		t.Errorf("parentSubagent = %q, want %q — the tree of agents is built from it",
 			got.ParentSubagent, full.ParentSubagent)
+	}
+	// proc is kept: agentop merges a session's linked process rows into its timeline by it.
+	if got.Proc != full.Proc || got.ClientProc != full.ClientProc || got.SessionHeader != full.SessionHeader {
+		t.Errorf("proc %q sessionHeader %q, want %q %q — the linked-row fold reads them",
+			got.Proc, got.SessionHeader, full.Proc, full.SessionHeader)
 	}
 	if got.Direction != full.Direction || got.Phase != full.Phase {
 		t.Error("direction/phase did not survive")
@@ -360,7 +375,17 @@ func TestSummarizeEvent_ShapeIsGuarded(t *testing.T) {
 		// 27 since Subagent, which is TIMELINE data: it says which agent made the row. A
 		// scalar capped at maxClientLen, so the struct copy keeps it; asserted above.
 		// 28 since ParentSubagent, TIMELINE data for the same reason; asserted above.
-		{"SessionEvent", reflect.TypeOf(pipeline.SessionEvent{}), 28},
+		// 29 since Ttfb, which is kept as RequestedHost is: agentop's detail pane draws
+		// its timing: line from the projected event, splitting a response's duration
+		// into the origin's answer time and the body's (#1251). A scalar, so the struct
+		// copy keeps it; asserted above.
+		// 30 since DialAddr, which is kept: agentop's detail pane can draw the dialed
+		// address beside Host the way it draws redirected: — and the moca egress
+		// conformance reads it off the projected row. A scalar, so the struct copy
+		// keeps it.
+		// 33 since Proc, ClientProc and SessionHeader, TIMELINE data: agentop folds a session's
+		// linked process rows by them. Asserted above.
+		{"SessionEvent", reflect.TypeOf(pipeline.SessionEvent{}), 33},
 		// 25 since AgentRole, which is TIMELINE data: agentop's CONTEXT gauge reads it on every
 		// row the timeline serves. It needs no assertion of its own in the projection test
 		// beyond the equality one there — a scalar survives the struct copy, unlike the two

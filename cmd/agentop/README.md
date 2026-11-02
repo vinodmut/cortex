@@ -39,6 +39,16 @@ concluded the TUI was all agentop did — `agentop service` least visible of
 all, and that is what you need when Cortex is not running. Run
 `agentop --help` for the full list.
 
+To profile the viewer itself, set `AGENTOP_PPROF_ADDR` to a loopback address
+before starting it — `AGENTOP_PPROF_ADDR=127.0.0.1:47603 agentop observe` —
+and read the result with
+`go tool pprof http://127.0.0.1:47603/debug/pprof/heap`. Off unless set: the
+profiles expose the process's internals, and the viewer's heap holds the
+session content it is displaying. Requests carrying a browser `Origin`, or a
+`Host` other than `localhost` / `127.0.0.1` / `::1`, are refused — and so is a
+bind that does not land on loopback (`:47603`, `0.0.0.0:47603`), since those
+guards stop browsers, not a curl that names a loopback `Host`.
+
 You'll see a Namespaces pane listing each namespace that contains an
 AuthBridge agent. Enter drills into the Pods pane for that namespace;
 Enter on a pod starts a `kubectl port-forward` automatically and drops
@@ -789,12 +799,16 @@ agentop is for, and the other four are surfaces you visit and leave.
   `AGENT`; neither shows until `COST` and `SAVED` do, so widening the window never
   takes one away.
 
-  A **`pending:` bucket**, where an agent's calls that name no session collect
-  until one does, is listed after the real sessions. Its row shows the agent
-  under `SESSION` rather than the truncated id, and, when nothing else names it,
-  `calls outside any session · pid <n>` under `TITLE`. The pid is the process the
-  calls came from. Headers keep the full id, which is still what the API and `/`
-  match on.
+  A **`pending:` bucket** holds an agent's calls from before its process named a
+  session. When the process went on to name one, the bucket is folded into it: its
+  row is hidden, and its calls appear in that session's timeline at the time they
+  were made. A bucket whose process never named a session — or made calls after
+  its last one, or whose calls belong to two sessions — is listed after the real
+  sessions, under its agent. Its row shows
+  the agent under `SESSION` rather than the truncated id, and, when nothing else
+  names it, `calls outside any session · pid <n>` under `TITLE`. The pid is the
+  process the calls came from. Headers keep the full id, which is still what the
+  API and `/` match on.
 
   `CTX(1M)` is a gauge, not a figure: how full the **conversation's**
   context was on its latest turn, against a fixed one-million-token window. The
@@ -1119,6 +1133,18 @@ agentop is for, and the other four are surfaces you visit and leave.
   the same as a body of zero bytes: a body no plugin asked to buffer is relayed
   unmeasured and reads exactly as a body-less GET does.
 
+  A session with subagent traffic groups each subagent's rows under a
+  collapsible header at the subagent's first row: `▸─ <label> · N rows · tokens
+  · cost`, where the label is the subagent's description from Claude Code's own
+  records when the harvest can name it and the raw agent id otherwise. Blocks
+  are collapsed by default — the point is that an agent's fan-out stops drowning
+  the conversation — and `Enter` on the header opens it, showing its rows in
+  time order with a `│` gutter in the DIR column; `Enter` again closes it. The
+  main conversation's rows stay top-level between them, so the interleaving
+  stays honest. Blocks exist only while the table is chronological: a sort ranks
+  rows, and grouping would contradict the ranking. A search opens every block,
+  so a match inside a collapsed one is findable.
+
   Live-updates while in view — if the cursor is on the last row, it
   auto-follows new events.
 
@@ -1283,11 +1309,13 @@ agentop is for, and the other four are surfaces you visit and leave.
   ```
 
   An agent cell is a bar of how that cell's time divided, stacked from the
-  bottom: amber the agent's tools running, purple its model generating, red
-  retrying after a failed model call, teal waiting on its subagents or its
-  background shell jobs, grey waiting on you. Waiting is read from the gaps
-  between an agent's model calls: a gap that one of its subagents or background
-  jobs was running in, or that a subagent's result ended, is waiting on
+  bottom: amber the agent's tools running — a background shell job is a tool
+  still running, and counts here — purple its model generating, red
+  retrying after a failed model call, teal waiting on its subagents, grey
+  waiting on you, as is an `AskUserQuestion` the
+  agent put to you. Waiting is read from the gaps
+  between an agent's model calls: a gap that one of its subagents was running
+  in, or that a subagent's result ended, is waiting on
   subagents; a gap before a call that re-sent the same conversation is retrying;
   after a failed call it is retrying until the last failed request to the model
   host, then waiting on you, since Claude Code shows the error and stops. On the
@@ -1311,7 +1339,7 @@ agentop is for, and the other four are surfaces you visit and leave.
   (`+24m`) once squeezed, so the work keeps the width. Once it is not, an open
   call ends at the session's last event, the last moment anything was seen, and
   the window ends at its last activity. "all" squeezes each stretch over 30 minutes with
-  no model call or tool into a `┆`, coloured by the state that held most of it,
+  no model call or tool, an `AskUserQuestion` aside, into a `┆`, coloured by the state that held most of it,
   and the axis says how long it was; a host's `┆` is red when a request failed in
   it. `←`/`→` pick a moment, skipping those stretches, and the line under the
   chart lists the visible rows' tools that started then, and after them those
@@ -1442,7 +1470,7 @@ Layered on top of all of them:
 | `Enter` | pods | port-forward + connect |
 | `Esc` | pods | back to namespaces |
 | `r` | namespaces, pods | reload agent list from cluster |
-| `Enter` / `→` / `l` | sessions, events | drill into selection |
+| `Enter` / `→` / `l` | sessions, events | drill into selection; on a subagent block's header row in the events pane, collapse/expand the block instead |
 | `Esc` / `←` / `h` | detail, events | back out |
 | `Esc` | sessions | back to the agents picker when the list was reached by picking an agent there; otherwise (picker mode) tear down port-forward and back to pods. Sessions and the agents picker above it are the only panes that tear down — every key-opened surface returns to its caller instead |
 | `/` | any pane, and the key help | search what the pane shows, as in a text editor: every row stays, the matched characters are highlighted, and the cursor (or, in a text view, the view) jumps to the first match at or after where you pressed `/`, wrapping past the end, as you type. Case-insensitive substring of the text the pane displays: a table's columns that are turned on, at full width (a value cut to `…` matches in full, and so does a column the terminal had no room for); a message's or plugin's detail line by line, before it is wrapped; the key help's and the usage chart's lines as drawn. `deny` finds denied events because ACTION shows it. `Enter` keeps the place; `Esc` puts the place and the previous search back; `Enter` on an empty box clears the search. Each pane keeps its own search; the events pane's and a message's detail's last while you stay with one session (the detail's carries from message to message), and none is saved |
@@ -1477,7 +1505,7 @@ Layered on top of all of them:
 | `Esc` | pipeline | back to the pane `P` was pressed on |
 | `C` | any session-view pane (not the picker) | open the registered-plugin catalog. Was `P` until the pipeline took that letter |
 | `r` | catalog | refresh the catalog from `/v1/plugins` |
-| `A` | any session-view pane (not the picker) | open the per-agent cost breakdown — what each coding agent has spent today (`w` moves the window), plus a row of dashes for any agent that owns a listed session but has spent nothing in it, since the sessions list is not limited to today and every session in it needs a row to scope to. Capital `A` because lowercase `a` cycles the spend drawer's axis. Refetches on every press and opens however many agents it finds, one or none included; pressed on the agents pane it only refreshes the rows. Not in the footer, for width; the `?` overlay names it |
+| `A` | any session-view pane (not the picker) | open the per-agent breakdown — each coding agent's sessions, when it was last seen, and what it has spent today (`w` moves the window), plus a row for any agent that owns a listed session but has spent nothing in it, since the sessions list is not limited to today and every session in it needs a row to scope to. Capital `A` because lowercase `a` cycles the spend drawer's axis. Refetches on every press and opens however many agents it finds, one or none included; pressed on the agents pane it only refreshes the rows. Not in the footer, for width; the `?` overlay names it |
 | `↑↓` / `jk` | agents | move the cursor |
 | `↵` | agents | scope to the agent under the cursor and list its sessions, whichever pane `A` was pressed on — including the agent already scoped, which stays scoped. **The first row, All agents, clears the scope.** It reaches the sessions list, the usage pane, and the spend band and its drawer — except on the agents pane itself, where the band and the drawer follow the highlighted row instead of the committed scope; `agentop cost --agent` is a separate process |
 | `S` | agents | choose the inference server the highlighted agent's new sessions use: a picker over the pane, its cursor on what the agent has now. `↵` applies the highlighted entry, `Esc`/`q`/`Ctrl+C` close it, and an entry the config file already holds writes nothing. Opens only on an agent's row, when agentop is attached to this machine's Cortex and its `inference-router` routes; elsewhere a panel says why. See [Choosing an agent's server](#choosing-an-agents-server-s) |
@@ -1526,8 +1554,8 @@ proxy names an agent only from a User-Agent it recognises (`claude-code`, `bob`,
 `opencode`, `codex`, `pi`); anything else is reported under its raw
 User-Agent, and one program can send several — the IBM Bob IDE was three rows before
 it was recognised, and none of them could reach its session ([#1210]). Picking `Other`
-lists every session that names no recognised agent, including the `default` and
-`pending:` buckets and sessions only agentop's cache still holds, so every listed
+lists every session that names no recognised agent, including the `default`
+bucket and sessions only agentop's cache still holds, so every listed
 session belongs to exactly one row. An `Other` row that only sessions put there —
 no unrecognised traffic in the window — is shown when the picker opens, but never
 opens it by itself. Its figures are the pooled series, narrowed by agentop rather
@@ -1547,8 +1575,8 @@ all sessions, so under `Other`, within one session, or against a proxy too old
 to keep them, the metric reports that latency is unavailable per agent rather
 than plotting zeroes.
 
-Elsewhere, the sessions pane lists only that agent's sessions — the `default` and
-`pending:` buckets belong to no one agent and are listed under `Other` — and every pane's title
+Elsewhere, the sessions pane lists only that agent's sessions and its `pending:`
+buckets — the `default` bucket belongs to no one agent and is listed under `Other` — and every pane's title
 says `agent=`. Against a server that names no session's agent, the list stays whole
 and its footer says `list not scoped`. The spend band and its drawer show that
 agent's figures, asked of the server with `/v1/usage?agent=`; against a server too
@@ -1556,8 +1584,9 @@ old to answer that, agentop narrows the `group=agent` series itself, as the usag
 does. The drawer drops its agent axis and breaks the agent's spend down by model or
 endpoint in every window. It reads `BY NONE` under `Other`, and against an older proxy
 that cannot break the last hour down for one agent. Unscoped, the sessions pane gains an `AGENT` column when
-two agents are listed, and the agents pane a `SESSIONS` count once sessions name
-their agent.
+two agents are listed, and the agents pane `SESSIONS` and `LAST SEEN` once sessions
+name their agent. Those two describe the whole sessions list; `COST <window>` is the
+pane's only windowed column, and `w` moves it.
 
 ### Choosing an agent's server (`S`)
 

@@ -99,7 +99,7 @@ the model calls. It reads the dotenv file when it starts and never again, and it
 by every Codex window, so it is often days old. A daemon started before `enable` keeps
 calling OpenAI directly — the window's own startup checks and telemetry reach Cortex, its
 prompts do not, and agentop shows Codex only as a small `pending:codex@…` bucket under
-**Other**, with no tokens. `disable` has the mirror problem: the daemon keeps routing
+**codex**, with no tokens. `disable` has the mirror problem: the daemon keeps routing
 through Cortex, and Codex stops working if Cortex is then stopped.
 
 **So `enable` and `disable` restart a running daemon**, once, after writing the file, with
@@ -225,7 +225,7 @@ because it decides how many rows a run leaves:
 
 | | Carries `Session-Id` | Rows per run |
 |---|---|---|
-| `codex exec` | its **inference** requests; the plugin-list and MCP chatter does not | **two** — the conversation under its real id, plus a small `pending:codex@<pid>.<start>` bucket for the chatter that arrived before anything named the session (15 events against 113, measured) |
+| `codex exec` | its **inference** requests; the plugin-list and MCP chatter does not | **one** in agentop — the conversation under its real id. The chatter that arrived before anything named the session (15 events against 113, measured) is recorded in a `pending:codex@<pid>.<start>` bucket, which is linked to the session and shown inside it |
 | the TUI (plain `codex`) | **also its chatter** — a TUI session was named with *zero* inference requests in it | **one** — everything lands in the named session, no pending bucket |
 
 Either way the tokens and cost are in the named session. Note that once a session is
@@ -260,8 +260,10 @@ is one — so a consumer that parses `ToolCalls[].Arguments` as JSON must tolera
 for this dialect.
 
 **HTTPS, not WebSocket.** Codex prefers a WebSocket to the same `/responses` path, and
-Cortex cannot carry one: `Upgrade` is a hop-by-hop header a proxy must not forward, and
-the parser reads HTTP requests, not frames. So the forward proxy answers that handshake
+Cortex declines one on purpose: the proxy can carry a WebSocket (it forwards the
+upgrade and splices the 101, #1488), but the frames after it are opaque — the parsers
+read HTTP requests, not frames — so a Codex session moved onto a WebSocket stops
+being parseable: no token counts, no cost. The forward proxy answers that handshake
 itself with **426 Upgrade Required**, which Codex reads as "this endpoint wants HTTP" and
 switches to HTTPS straight away, for the rest of its session. That covers both of
 Codex's endpoints — `chatgpt.com` on a ChatGPT login and `api.openai.com` on an API key
@@ -285,7 +287,8 @@ hardcodes `supports_websockets = true` and Codex refuses a config that overrides
 built-in provider.
 
 The 426 is Cortex's setting, not Codex's, and it is on by default, so there is nothing to
-configure. To turn it off — which brings back the 405 and its retries — add the key to the
+configure. To turn it off — which forwards the upgrade for real, putting the session on
+a WebSocket the parsers cannot see — add the key to the
 `listener:` block that is already in `~/.cortex/config.yaml`:
 
 ```yaml

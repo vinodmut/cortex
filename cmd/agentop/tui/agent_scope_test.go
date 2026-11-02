@@ -147,7 +147,7 @@ func TestSessionsPane_ScopedTitleAndTheEmptyScope(t *testing.T) {
 func TestAgentsPane_SessionsColumnOnlyOnceSessionsNameAgents(t *testing.T) {
 	m := &model{agentsTbl: newAgentsTable(), agents: []agentRow{{label: "bob-shell/2.0.5"}, {label: "node"}}}
 	m.rebuildAgentsTable()
-	if !sameColumns(m.agentsTbl.Columns(), fitTableColumns(agentsColumns(), 0)) {
+	if !sameColumns(m.agentsTbl.Columns(), fitTableColumns(agentsColumns(m.agentsWindowLabel()), 0)) {
 		t.Errorf("no session names an agent and the columns changed: %v", m.agentsTbl.Columns())
 	}
 	m.sessions = sessionsFixture()
@@ -327,9 +327,9 @@ func TestSpendDrawer_ShowsOneAgentsBreakdownWhenServed(t *testing.T) {
 	}
 }
 
-// A cached pending bucket the server no longer lists is still retained history when nothing
-// adopted it — after an eviction, an expiry or a proxy restart — so it is listed.
-func TestSessionsPane_ListsACachedPendingBucketNothingAdopted(t *testing.T) {
+// A cached pending bucket the server no longer lists is still retained history — after an
+// eviction, an expiry or a proxy restart — so it is listed.
+func TestSessionsPane_ListsACachedPendingBucket(t *testing.T) {
 	m := &model{width: 200, sessions: sessionsFixture()[:1], events: map[string][]pipeline.SessionEvent{
 		session.PendingSessionID("bob-shell"): {{}},
 	}}
@@ -366,20 +366,5 @@ func TestSessionsPane_SanitisesTheAgentCell(t *testing.T) {
 				t.Errorf("a cell carries an escape: %q", c)
 			}
 		}
-	}
-}
-
-// A pending bucket a listed session adopted now heads that session, so its cached events are not
-// drawn as a session of their own; an evicted session's cached events still are.
-func TestSessionsPane_HidesAnAdoptedPendingBucket(t *testing.T) {
-	sessions := sessionsFixture()[:1]
-	sessions[0].Adopted = []string{session.PendingSessionID("bob-shell")}
-	m := &model{width: 200, sessions: sessions, events: map[string][]pipeline.SessionEvent{
-		session.PendingSessionID("bob-shell"): {{}},
-		"evicted-1":                           {{}},
-	}}
-	m.rebuildSessionsTable()
-	if got := strings.Join(m.sessionRowIDs, ","); got != "claude-1,evicted-1" {
-		t.Errorf("rows %q, want the cached eviction but not the adopted pending bucket", got)
 	}
 }

@@ -71,14 +71,14 @@ func cpexSessionID(pctx *pipeline.Context, source string) (id string, replaces b
 // in the authbridge-cpex sidecar it is always empty, so a dedicated header,
 // which the sender sets, is trusted as named.
 func trustedSessionID(pctx *pipeline.Context) string {
-	if id := pctx.ChainSession; id != "" && id != session.DefaultSessionID && !strings.HasPrefix(id, session.PendingPrefix) {
+	if id := pctx.ChainSession; session.IsConversation(id) {
 		return id
 	}
 	if pctx.Session == nil {
 		return ""
 	}
 	id := pctx.Session.ID
-	if id == "" || id == session.DefaultSessionID || strings.HasPrefix(id, session.PendingPrefix) {
+	if !session.IsConversation(id) {
 		return ""
 	}
 	switch pctx.SessionSource {
@@ -716,6 +716,9 @@ func inferenceToCMFParts(inf *pipeline.InferenceExtension) []cmfPart {
 	for _, m := range inf.Messages {
 		switch {
 		case m.Content == "":
+		case m.Role == roleTool && m.ToolUseID != "":
+			// A chat-completions result the parser also recorded in ToolResults; the
+			// loop below emits the id-carrying copy, so this one would count twice.
 		case m.Role == roleTool:
 			parts = append(parts, cmfPart{Kind: cmfPartToolResult, Content: m.Content})
 		default:

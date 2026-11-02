@@ -219,6 +219,12 @@ func TestModifyResponse_BufferedArmSurvivesAHangup(t *testing.T) {
 	if err := srv.modifyResponse(resp); err != nil {
 		t.Fatalf("modifyResponse: %v — a cancelled request context produced a Deny this arm cannot tell from a policy reject, so a complete response was rendered as a rejection", err)
 	}
+	// What ReverseProxy does next: relay the body. The unbuffered arm's row is
+	// deferred to the end of that copy (recordOnEOFBody), so drain the body as
+	// the relay would — a hung-up client's copy fails and Close fires the same
+	// record, which is the telemetry-survival claim under test.
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
 	if terminals, ctxErr, _, _ := probe.snapshot(); terminals != 1 || ctxErr != nil {
 		t.Errorf("terminal dispatches = %d, ctx.Err = %v, want 1 and nil: nothing finalized for a response that arrived complete", terminals, ctxErr)
 	}
@@ -227,6 +233,10 @@ func TestModifyResponse_BufferedArmSurvivesAHangup(t *testing.T) {
 	if calls, ctxErr := plain.seen(); calls != 1 || ctxErr != nil {
 		t.Errorf("response phases = %d, ctx.Err = %v, want 1 and nil: the phase was skipped or ran on a done context", calls, ctxErr)
 	}
+	// Waited rather than read: the response row is deferred to the end of
+	// ReverseProxy's copy (recordOnEOFBody), which can finish after the body
+	// was drained above.
+	waitForResponseEvent(t, store, session.DefaultSessionID)
 	v := store.View(session.DefaultSessionID)
 	if v == nil || len(v.Events) != 1 || v.Events[0].Phase != pipeline.SessionResponse {
 		t.Errorf("session events = %+v, want one response row: the early return took the telemetry with it", v)

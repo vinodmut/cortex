@@ -15,7 +15,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"strconv"
-	"strings"
+	"sync"
 	"time"
 
 	"github.com/rossoctl/cortex/core/listener/httpx"
@@ -191,7 +191,12 @@ func NewServer(inbound *pipeline.Holder, sessions *session.Store, backendURL str
 		// Accept-Encoding intact rather than force needless upstream→client
 		// decompression (matters for a remote backend or large non-streamed
 		// bodies; harmless on a localhost sidecar hop).
-		if inbound.NeedsBody() || inbound.HasStreamingResponders() {
+		// The handler stashed the request's pctx into the request context
+		// just before ServeHTTP, and the clone the stdlib hands the
+		// Director keeps it — so this probe answers for the pipeline the
+		// request ran on, like every post-Run probe (Holder.ForPctx).
+		pctx, _ := req.Context().Value(pctxKey{}).(*pipeline.Context)
+		if pinned := inbound.ForPctx(pctx); pinned.NeedsBody() || pinned.HasStreamingResponders() {
 			req.Header.Del("Accept-Encoding")
 		}
 	}
@@ -329,7 +334,7 @@ func (s *Server) handleRequest(w http.ResponseWriter, r *http.Request) {
 	if s.transparentInbound {
 		if _, ok := transparentproxy.OrigDstFromContext(r.Context()); !ok {
 			slog.Warn("reverse-proxy: rejecting request with no recovered destination",
-				"remote", r.RemoteAddr, "host", r.Host, "path", r.URL.Path)
+				"remote", r.RemoteAddr, "host", pipeline.SanitizeLogValue(r.Host), "path", pipeline.SanitizeLogValue(r.URL.Path))
 			http.Error(w, "no original destination recovered", http.StatusBadGateway)
 			return
 		}
@@ -390,7 +395,7 @@ func (s *Server) handleRequest(w http.ResponseWriter, r *http.Request) {
 		}
 		r.Body = io.NopCloser(bytes.NewReader(body))
 		pctx.Body = body
-		slog.Debug("reverse-proxy: buffered request body", "host", r.Host, "bodyLen", len(body))
+		slog.Debug("reverse-proxy: buffered request body", "host", pipeline.SanitizeLogValue(r.Host), "bodyLen", len(body))
 	}
 
 	action := s.InboundPipeline.Run(r.Context(), pctx)
@@ -404,10 +409,7 @@ func (s *Server) handleRequest(w http.ResponseWriter, r *http.Request) {
 	// the backend and clear Content-Encoding (same rationale as the
 	// response path — plugin may have decompressed).
 	if pctx.BodyMutated() {
-		r.Body = io.NopCloser(bytes.NewReader(pctx.Body))
-		r.ContentLength = int64(len(pctx.Body))
-		r.Header.Set("Content-Length", fmt.Sprintf("%d", len(pctx.Body)))
-		r.Header.Del("Content-Encoding")
+		httpx.SetRequestBody(r, pctx.Body)
 	}
 
 	// Propagate every header mutation the inbound pipeline made to the forwarded
@@ -416,27 +418,7 @@ func (s *Server) handleRequest(w http.ResponseWriter, r *http.Request) {
 	// Authorization used to be forwarded, silently dropping any other injected header
 	// (e.g. static-inject's x-api-key). Content-Length / Content-Encoding are managed
 	// by the body-rewrite block above and the transport, so leave them untouched.
-	skip := func(k string) bool {
-		return strings.EqualFold(k, "Content-Length") || strings.EqualFold(k, "Content-Encoding")
-	}
-	for k := range r.Header {
-		if skip(k) {
-			continue
-		}
-		if _, ok := pctx.Headers[k]; !ok {
-			r.Header.Del(k) // plugin removed it
-		}
-	}
-	for k, vv := range pctx.Headers {
-		if skip(k) {
-			continue
-		}
-		if len(vv) == 0 {
-			r.Header.Del(k) // pctx.Headers[k] = nil is a delete, same as Del(k)
-			continue
-		}
-		r.Header[k] = append([]string(nil), vv...) // set / overwrite
-	}
+	httpx.SyncRequestHeaders(r, pctx.Headers)
 
 	// Record the inbound request event whenever there is something
 	// observable: an A2A conversation, plugin invocations, or plugin-public
@@ -484,9 +466,23 @@ func (s *Server) modifyResponse(resp *http.Response) error {
 	if pctx == nil {
 		return nil
 	}
+	// Every capability probe below answers for the pipeline this request
+	// ran on, not whatever a mid-request reload left in the Holder: the
+	// buffering and streaming decisions must match the pipeline the
+	// response phases dispatch on, or a reload mid-request silently skips
+	// the pinned plugins (Holder.ForPctx).
+	pinned := s.InboundPipeline.ForPctx(pctx)
 
 	pctx.StatusCode = resp.StatusCode
 	pctx.ResponseHeaders = resp.Header.Clone()
+	// The forward proxy's handleRequest sets its ResponseHeadersAt at the same
+	// point in its own flow — the moment the delivered response's headers are
+	// in hand — so ttfb means the same thing on a row from either listener.
+	// Runs for the streaming arm too: modifyResponse executes before the body
+	// is relayed, which is exactly what makes this headers-arrival, not
+	// body-completion. Stays zero on errorHandler paths, where no headers
+	// arrived (#1251).
+	pctx.ResponseHeadersAt = time.Now()
 
 	// BytesDown for the response row (#1309), counted HERE and nowhere else — at
 	// the wire, before either arm below gets at the body. The streaming arm sees
@@ -496,9 +492,10 @@ func (s *Server) modifyResponse(resp *http.Response) error {
 	// bytes. The buffered arm's replacement of resp.Body with a reader over what it
 	// already read means nothing is counted twice. See bodycount.
 	//
-	// What this does NOT reach is the fully-unbuffered relay: ReverseProxy copies
-	// that body after modifyResponse returns, which is after the response row is
-	// appended below, so it stays at zero and renders blank rather than wrong.
+	// The fully-unbuffered relay gets its full count too: ReverseProxy copies
+	// that body after modifyResponse returns, and that arm's row is deferred to
+	// the end of the copy (recordOnEOFBody below), so the count is complete when
+	// the figure is read.
 	if resp.Body != nil {
 		resp.Body = bodycount.Wrap(resp.Body, &pctx.ResponseBytes)
 	}
@@ -514,11 +511,11 @@ func (s *Server) modifyResponse(resp *http.Response) error {
 	// WritesResponseBody is incompatible with streaming (we can't rewrite a
 	// body we've already started forwarding) — fall back to buffered
 	// with a warning.
-	if isEventStream(resp.Header.Get("Content-Type")) &&
-		s.InboundPipeline.HasStreamingResponders() &&
+	if httpx.IsEventStream(resp.Header.Get("Content-Type")) &&
+		pinned.HasStreamingResponders() &&
 		resp.Body != nil {
-		if s.InboundPipeline.WritesResponseBody() {
-			slog.Warn("reverse-proxy: text/event-stream response with WritesResponseBody plugin — falling back to buffered path", "host", pctx.Host)
+		if pinned.WritesResponseBody() {
+			slog.Warn("reverse-proxy: text/event-stream response with WritesResponseBody plugin — falling back to buffered path", "host", pipeline.SanitizeLogValue(pctx.Host))
 		} else {
 			s.installStreamingResponseBody(resp, pctx)
 			// Strip Content-Length — the framing reader doesn't know
@@ -530,7 +527,7 @@ func (s *Server) modifyResponse(resp *http.Response) error {
 		}
 	}
 
-	if s.InboundPipeline.NeedsBody() && resp.Body != nil {
+	if pinned.NeedsBody() && resp.Body != nil {
 		body, err := io.ReadAll(io.LimitReader(resp.Body, maxBodySize+1))
 		if err != nil {
 			// Wrapped so errorHandler keeps the backend's own status.
@@ -579,7 +576,7 @@ func (s *Server) modifyResponse(resp *http.Response) error {
 	// Streaming-aware plugins use a single code path for both shapes:
 	// for buffered application/json we deliver the body as one
 	// last=true frame so plugins can finalize via OnResponseFrame.
-	if s.InboundPipeline.HasStreamingResponders() && resp.Body != nil {
+	if pinned.HasStreamingResponders() && resp.Body != nil {
 		// Its own budget, per the rule above: the settle does not inherit what the phase spent.
 		finalCtx, cancelFinal := httpx.TeardownContext(resp.Request.Context())
 		defer cancelFinal()
@@ -623,9 +620,21 @@ func (s *Server) modifyResponse(resp *http.Response) error {
 	// SSE responses still get recorded — the body is whatever the
 	// pipeline saw at this point (may be empty for streamed bodies),
 	// but the status code and plugin invocations are always meaningful.
-	plugins := pipeline.SnapshotPlugins(pctx.Extensions.Custom)
-	// Always pair every inbound request with a response row (carries StatusCode).
-	if s.Sessions != nil {
+	//
+	// The buffered arm has the whole body in hand by the time it gets here, so
+	// its row is complete at this point. The unbuffered arm does not: ReverseProxy
+	// copies resp.Body after modifyResponse returns, and a row filed now would
+	// stop Duration at the headers — a body share of zero for a body still
+	// arriving, the exact misreading #1251's split exists to prevent. That arm
+	// defers the row to the end of the copy via recordOnEOFBody, which is also
+	// when ResponseBytes finishes counting (see the bodycount note above). The
+	// streaming arm returned earlier and records from its own onClose.
+	record := func() {
+		if s.Sessions == nil {
+			return
+		}
+		plugins := pipeline.SnapshotPlugins(pctx.Extensions.Custom)
+		// Always pair every inbound request with a response row (carries StatusCode).
 		sid := inboundSessionID(pctx)
 		// Inference is the token report, and it is what a cost consumer reads: without it
 		// this listener served a whole `configured` cost for zero tokens, because the cost
@@ -651,9 +660,21 @@ func (s *Server) modifyResponse(resp *http.Response) error {
 			StatusCode:     resp.StatusCode,
 			Error:          pipeline.DeriveError(pctx),
 			Duration:       pipeline.DurationSince(pctx.StartedAt),
+			Ttfb:           pipeline.DurationBetween(pctx.StartedAt, pctx.ResponseHeadersAt),
 			TLS:            eventTLS(pctx),
 		})
 	}
+	// A 101 is recorded here, not deferred: ReverseProxy never copies its body —
+	// it hands the connection to the upgraded protocol — so on a failed upgrade
+	// (protocol mismatch, failed hijack) nothing would ever fire the deferred
+	// record. The row is the 101 itself, and ErrorHandler must not add a second
+	// one after it.
+	if !pinned.NeedsBody() && resp.Body != nil &&
+		resp.StatusCode != http.StatusSwitchingProtocols {
+		resp.Body = &recordOnEOFBody{inner: resp.Body, onClose: record}
+		return nil
+	}
+	record()
 	return nil
 }
 
@@ -686,7 +707,7 @@ func (s *Server) errorHandler(w http.ResponseWriter, r *http.Request, err error)
 		// that is handleUpgradeResponse failing a 101 (a protocol mismatch, a
 		// failed hijack), and a second row would break the one-response-per-
 		// request pairing /v1/usage counts on.
-		slog.Warn("reverse-proxy: backend upgrade failed", "host", r.Host, "status", pctx.StatusCode, "error", err)
+		slog.Warn("reverse-proxy: backend upgrade failed", "host", pipeline.SanitizeLogValue(r.Host), "status", pctx.StatusCode, "error", err)
 		return
 	}
 
@@ -704,7 +725,7 @@ func (s *Server) errorHandler(w http.ResponseWriter, r *http.Request, err error)
 		status, fail = pipeline.ExchangeFailure(r.Context(), err)
 	}
 	if r.Context().Err() == nil {
-		slog.Warn("reverse-proxy: backend request failed", "host", r.Host, "method", r.Method, "kind", fail.Kind, "error", fail.Message)
+		slog.Warn("reverse-proxy: backend request failed", "host", pipeline.SanitizeLogValue(r.Host), "method", r.Method, "kind", fail.Kind, "error", fail.Message)
 	}
 	if pctx == nil {
 		return
@@ -844,8 +865,36 @@ func (s *Server) recordInboundResponseEvent(pctx *pipeline.Context, statusCode i
 		StatusCode:     statusCode,
 		Error:          pipeline.EventErrorOr(pctx, fail),
 		Duration:       pipeline.DurationSince(pctx.StartedAt),
+		Ttfb:           pipeline.DurationBetween(pctx.StartedAt, pctx.ResponseHeadersAt),
 		TLS:            eventTLS(pctx),
 	})
+}
+
+// recordOnEOFBody defers the response row of the fully-unbuffered relay to
+// the moment ReverseProxy finishes with the body. modifyResponse returns
+// before that copy starts, so a row appended there would stop Duration at the
+// headers and report a body share of zero for a body still arriving (#1251) —
+// and a ResponseBytes figure the bodycount wrapper had not finished counting.
+// Records exactly once, on EOF or Close, whichever arrives first: a copy that
+// runs to the end fires from Read, a client that hangs up mid-copy still gets
+// its row from ReverseProxy's Close.
+type recordOnEOFBody struct {
+	inner   io.ReadCloser
+	onClose func()
+	once    sync.Once
+}
+
+func (b *recordOnEOFBody) Read(p []byte) (int, error) {
+	n, err := b.inner.Read(p)
+	if err == io.EOF {
+		b.once.Do(b.onClose)
+	}
+	return n, err
+}
+
+func (b *recordOnEOFBody) Close() error {
+	b.once.Do(b.onClose)
+	return b.inner.Close()
 }
 
 // streamingResponseBody is the io.ReadCloser ReverseProxy ferries
@@ -977,19 +1026,6 @@ func (b *streamingResponseBody) Close() error {
 		b.onClose(b.statusCode)
 	}
 	return b.upstream.Close()
-}
-
-// isEventStream reports whether a Content-Type header value names the
-// SSE media type. Tolerates parameters and ASCII case differences.
-// Mirrors the forwardproxy helper of the same name.
-func isEventStream(contentType string) bool {
-	if contentType == "" {
-		return false
-	}
-	if idx := strings.IndexByte(contentType, ';'); idx >= 0 {
-		contentType = contentType[:idx]
-	}
-	return strings.EqualFold(strings.TrimSpace(contentType), "text/event-stream")
 }
 
 // inboundSessionID returns the bucket ID for an inbound event. Mirrors

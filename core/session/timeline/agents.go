@@ -14,9 +14,16 @@ import (
 
 // progressPrompt is the instruction Claude Code appends when it asks a model for a subagent's
 // 3-5 word status line. Those calls carry the subagent's whole context and tool list, so only
-// their last message tells them apart from the subagent's real turns. They are a third of all
-// subagent calls on real sessions, and drawing them would bury the turns that matter.
+// their last user message tells them apart from the subagent's real turns; Claude Code can send
+// system messages after it (a <total_tokens> count). They are a third of all subagent calls on
+// real sessions, and drawing them would bury the turns that matter.
 const progressPrompt = "Describe your most recent action in 3-5 words"
+
+// recapPrompt asks for the summary Claude Code shows when the user comes back to an idle
+// session. The same shape as a progress label: whole context and tool list, told apart only by
+// its last user message. Drawn as a turn it was the agent working while the user was away, and
+// two recaps of an unchanged conversation read as a retry: 74 hours of it on one session.
+const recapPrompt = "The user stepped away and is coming back"
 
 // The two ways a background subagent's result reaches the agent that started it. Both name the
 // subagent by the id Claude Code sends as X-Claude-Code-Agent-Id, the id the proxy records as
@@ -160,7 +167,7 @@ func buildAgents(t *Timeline, events []pipeline.SessionEvent) {
 		}
 		st.prev = msgs
 
-		turn := Turn{Agent: c.agent, Start: c.req.At, Resent: resent, Seq: c.req.Seq}
+		turn := Turn{Agent: c.agent, Start: c.req.At, Resent: resent, Seq: c.req.Seq, Model: inf.Model}
 		if c.resp == nil {
 			t.Turns = append(t.Turns, turn)
 			continue
@@ -349,8 +356,10 @@ func pairCalls(events []pipeline.SessionEvent) []call {
 	return calls
 }
 
-// agentOf names the agent that sent a request. Only Claude Code's requests are attributed:
-// AgentRole is set by its cc_is_subagent marker, and Subagent by its agent id header.
+// agentOf names the agent that sent a request. Claude Code's requests carry their own
+// markers: AgentRole from its cc_is_subagent header, Subagent from its agent id header.
+// Every other known client gets the single main row — nothing on the wire says which of
+// its calls belong together beyond that.
 func agentOf(e *pipeline.SessionEvent) (string, bool) {
 	switch {
 	case e.Subagent != "":
@@ -359,16 +368,26 @@ func agentOf(e *pipeline.SessionEvent) (string, bool) {
 		return UnseparatedAgent, true
 	case e.Inference.AgentRole == pipeline.AgentRoleMain:
 		return MainAgent, true
+	case e.Client != nil && pipeline.IsKnownAgent(e.Client.Name):
+		return MainAgent, true
 	}
 	return "", false
 }
 
+// isSideCall drops a call that is not an agent's work. The no-tools rule is Claude Code only
+// (AgentRole set): it holds because Claude always sends a manifest on real turns, while another
+// client's tool-less calls (Bob's security classifier) are real turns with real cost. The prompt
+// literals run for every client: they match Claude's own progress and recap prompt text, which
+// no other client sends, and a recap storm reads as turns on any session that carries one —
+// including pre-marker Claude Code traffic, attributed by client name alone.
 func isSideCall(inf *pipeline.InferenceExtension) bool {
-	if len(inf.Tools) == 0 && inf.ToolCount == 0 {
+	if inf.AgentRole != "" && len(inf.Tools) == 0 && inf.ToolCount == 0 {
 		return true
 	}
-	if n := len(inf.Messages); n > 0 {
-		return strings.Contains(inf.Messages[n-1].Content, progressPrompt)
+	for i := len(inf.Messages) - 1; i >= 0; i-- {
+		if m := inf.Messages[i]; m.Role != "system" {
+			return strings.Contains(m.Content, progressPrompt) || strings.Contains(m.Content, recapPrompt)
+		}
 	}
 	return false
 }

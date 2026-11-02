@@ -472,6 +472,19 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 
 	case "p":
 		m.paused = !m.paused
+		if m.paused {
+			return nil
+		}
+		// Resuming: everything streamed while paused was dropped, so refetch
+		// the watched session's tail rather than let the timeline quietly
+		// stop at the pause point (#1568). snapshotLoadedMsg merges by seq,
+		// so anything the refetch still misses can arrive off the stream
+		// without a duplicate. NOT while paged back: a snapshot ends the
+		// paging window, so this refetch would jump an operator reading an
+		// old page to the tail — [t] does that on purpose, [p] must not.
+		if id := m.watchingSessionID(); id != "" && !m.pagedBack(id) {
+			return m.snapshotCmd(id)
+		}
 		return nil
 
 	case "s":
@@ -546,6 +559,13 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 				m.pane = paneSessions
 			}
 			m.timeline.tickGen++
+			// The timeline's session is a #1542 retention key (watchingSession),
+			// so it must not outlive the pane: left set, it would keep streaming
+			// that session's events for the rest of the run. Cleared here rather
+			// than pane-checked in the predicate — the drill-down path
+			// (openEventsAtSeq) clears it too, the session staying watched
+			// through selectedSess.
+			m.timeline.session = ""
 		case paneUsage:
 			// Return to whichever pane opened it, from usageState's own field —
 			// model.previousPane is shared with the catalog overlay and gets
@@ -574,6 +594,12 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 				m.pipelineReturnPane = paneNone
 			} else {
 				m.pane = paneSessions
+			}
+			// A plugin opened from here drew into detailDoc and detailVp, which the event
+			// detail pane shares.
+			if m.pane == paneDetail && m.detailEvent != nil {
+				m.showDetail(m.detailRow, false)
+				m.moveDetailCursor(m.detailDoc.cursor)
 			}
 		case paneDetail:
 			m.pane = paneEvents
@@ -646,10 +672,13 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 			//
 			// The honest consequence: cached-only sessions are never released
 			// while agentop runs, so the cache grows by one entry per restart the
-			// user visited a session across. Measured, that is ~165 bytes per
-			// event and 1000 events per session, so ~161 KB per session and a
-			// few MB for a long debugging afternoon — worth it, given the
-			// alternative is deleting the only copy of what someone is reading.
+			// user visited a session across. There is no per-session event cap
+			// anymore, so the cost of one entry is whatever its interned
+			// snapshot cost — a 23.5MB document decoded to 2.31MB retained on
+			// the benchmark in apiclient/snapshot.go. A few visited sessions is
+			// megabytes; a long debugging afternoon across many restarts can be
+			// more — worth it, given the alternative is deleting the only copy
+			// of what someone is reading.
 			if id != m.selectedSess {
 				for cached := range m.events {
 					if cached != id && live[cached] {
@@ -690,7 +719,19 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 			}
 			// Snapshot in case the stream hasn't yet delivered history.
 			return m.snapshotCmd(id)
+		case paneDetail:
+			// Enter is the only fold key, so → and l stay as they were: nothing.
+			if msg.String() == "enter" {
+				m.toggleDetailFold()
+			}
+			return nil
 		case paneEvents:
+			// Enter on a subagent block's header collapses/expands it, the tree
+			// convention; on a message it stays the detail drill-down. One key,
+			// the row decides — same as the pickers.
+			if m.toggleSubagentBlock() {
+				return nil
+			}
 			er, ok := m.selectedEventRow()
 			if !ok {
 				return nil
@@ -701,7 +742,7 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 			m.showDetail(er, true)
 			m.pane = paneDetail
 			if m.needsFullEvent(er.event) && m.client != nil {
-				return fetchDetailEventCmd(m, m.selectedSess, er.event.Seq)
+				return fetchDetailEventCmd(m, eventSession(m.selectedSess, er.event), er.event.Seq)
 			}
 			return nil
 		case panePipeline:
@@ -960,7 +1001,10 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 		m.eventsTbl, cmd = m.eventsTbl.Update(msg)
 		m.selectedEventKey = keyOf(m.selectedEvent())
 		return cmd
-	case paneDetail, panePluginDetail:
+	case paneDetail:
+		m.detailCursorKey(msg.String())
+		return nil
+	case panePluginDetail:
 		var cmd tea.Cmd
 		m.detailVp, cmd = m.detailVp.Update(msg)
 		return cmd
@@ -1019,7 +1063,9 @@ func (m *model) goTop() {
 		m.setOpenAtOldest(true)
 	case panePipeline:
 		setCursorVisible(&m.pipelineTbl, 0)
-	case paneDetail, panePluginDetail:
+	case paneDetail:
+		m.detailCursorKey("g")
+	case panePluginDetail:
 		m.detailVp.GotoTop()
 	}
 }
@@ -1038,7 +1084,9 @@ func (m *model) goBottom() {
 		setCursorVisible(&m.pipelineTbl, len(m.pipelineTbl.Rows())-1)
 	case paneCatalog:
 		setCursorVisible(&m.catalogTbl, len(m.catalogTbl.Rows())-1)
-	case paneDetail, panePluginDetail:
+	case paneDetail:
+		m.detailCursorKey("G")
+	case panePluginDetail:
 		m.detailVp.GotoBottom()
 	}
 }
@@ -1072,7 +1120,9 @@ func (m *model) pageActivePane(msg tea.KeyMsg) tea.Cmd {
 		page(&m.pipelineTbl)
 	case paneCatalog:
 		page(&m.catalogTbl)
-	case paneDetail, panePluginDetail:
+	case paneDetail:
+		m.detailCursorKey(msg.String())
+	case panePluginDetail:
 		var cmd tea.Cmd
 		m.detailVp, cmd = m.detailVp.Update(msg)
 		return cmd
@@ -1254,7 +1304,7 @@ func (m *model) helpView() string {
 		}
 		return base + "  [?] keys  [q] quit"
 	case paneDetail:
-		return "[↑↓] scroll  [y] yank  [u] usage  " + m.searchHints(m.pane) + "  [esc] back  [?] keys  [q] quit"
+		return "[↑↓] move  [↵] fold  [y] yank  [u] usage  " + m.searchHints(m.pane) + "  [esc] back  [?] keys  [q] quit"
 	case panePipeline:
 		// ONE SPELLING NOW, where there used to be two. The picker/bypass split
 		// existed only because esc meant different things in the two modes — "back
@@ -1372,14 +1422,15 @@ func (m *model) layout() {
 	bodyH -= dividerLines
 	// And one for the spend strip, which View() draws directly under the title.
 	//
-	// BY HEIGHT ALONE, deliberately blind to the pane: layout() is called from exactly one
-	// place, the WindowSizeMsg handler, and no pane transition re-runs it. A reservation
-	// that read m.pane would go stale the moment the user moved between a picker and a data
-	// pane, leaving bodyHeight wrong until the next resize — which on a pane the strip DOES
-	// draw means a body one row too tall and a footer pushed off the bottom. The cost is
-	// that the two picker panes render one row shorter than they need, which is invisible
-	// next to that. See spendStripReservesRow and spendStripVisible for the same asymmetry
-	// stated from the other side.
+	// BY HEIGHT ALONE, deliberately blind to the pane: there is no setPane choke point to
+	// hook (the pane is assigned in twenty-odd places, and layout() runs on resizes, drawer
+	// toggles and pane transitions alike), so a reservation that read m.pane would go stale
+	// the moment the user moved between a picker and a data pane, leaving bodyHeight wrong
+	// until the next layout() — which on a pane the strip DOES draw means a body one row too
+	// tall and a footer pushed off the bottom. The cost is that the two picker panes render
+	// one row shorter than they need, which is invisible next to that. See
+	// spendStripReservesRow and spendStripVisible for the same asymmetry stated from the
+	// other side.
 	if m.spendStripReservesRow() {
 		// spendBandLines, not one row: the band stacks labels over values. paneView fills
 		// exactly this many, and the two must move together — see paneView.

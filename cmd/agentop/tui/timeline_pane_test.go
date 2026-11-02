@@ -911,6 +911,23 @@ func TestTimelinePane_FitsWithOneSideEmpty(t *testing.T) {
 	}
 }
 
+// A linked bucket's events sit in the session's rows numbered in their own bucket, so a seq
+// to reveal lands on the session's own event of that seq, never on a bucket's.
+func TestTimelineEnter_RevealSkipsALinkedBucketsEventOfTheSameSeq(t *testing.T) {
+	m := fitModel(t, paneEvents, 120, 40, []pipeline.SessionEvent{
+		{Seq: 8, At: tlAt(1), SessionID: "pending:claude-code@100.5", Direction: pipeline.Outbound, Phase: pipeline.SessionRequest, Host: "bucket"},
+		{Seq: 8, At: tlAt(2), SessionID: "sess-1", Direction: pipeline.Outbound, Phase: pipeline.SessionRequest, Host: "own"},
+	})
+	m.rebuildEventsTable()
+	m.revealSeq, m.revealSess = 8, "sess-1"
+	if !m.revealPendingSeq() {
+		t.Fatal("did not reveal sess-1's seq 8")
+	}
+	if m.selectedEventKey.at != tlAt(2).UnixNano() {
+		t.Errorf("revealed the linked bucket's seq 8, want the session's own")
+	}
+}
+
 // [↑↓] is advertised only when some agent rows do not fit.
 func TestTimelineFooter_ScrollHintOnlyWhenRowsAreHidden(t *testing.T) {
 	m := timelineModel(t, 140, 46)
@@ -1035,16 +1052,70 @@ func TestTimelineWaits_MainDefaultsToYouExceptAfterALostTool(t *testing.T) {
 	}
 }
 
-// A background job the main agent left running is waiting on subagents, not on the user.
-func TestTimelineWaits_BackgroundJobIsNotTheUsersTime(t *testing.T) {
+// A background job is a tool still running, and its agent is never waiting on the user while
+// one is: it is drawn as tools, not as waiting on subagents, which has a row to point at.
+func TestTimelineWaits_BackgroundJobIsATool(t *testing.T) {
 	tl := sampleTimeline() // main finishes a reply at 1200s; the user answers at 1500s
 	tl.Jobs = []timeline.Job{{Agent: timeline.MainAgent, ID: "bk1", Start: tlAt(1190), End: tlPtr(1400), Seq: 29}}
 	lay := buildTimelineLayout(tl, tlAt(0), tlAt(1800), 180, tlAt(3600))
-	if c := lay.agents[0].cells[cellOf(t, lay, 1300)]; !near(c.subs, 1) {
-		t.Errorf("while the job ran: %+v, want waiting on subagents", c)
+	if c := lay.agents[0].cells[cellOf(t, lay, 1300)]; !near(c.tool, 1) {
+		t.Errorf("while the job ran: %+v, want tools", c)
 	}
 	if c := lay.agents[0].cells[cellOf(t, lay, 1450)]; !near(c.user, 1) {
 		t.Errorf("after the job's notification: %+v, want waiting on the user", c)
+	}
+	// It is in the tools total too, by what the bar gives it: the job's first 10s fall inside the
+	// reply that ends at 1200s, so those are the model's, not tools'.
+	without := buildTimelineLayout(sampleTimeline(), tlAt(0), tlAt(1800), 180, tlAt(3600)).agents[0].toolTime
+	if got := lay.agents[0].toolTime - without; got != 200*time.Second {
+		t.Errorf("tools total grew by %v, want the job's 200s outside the reply", got)
+	}
+}
+
+// A job left running through a reply does not hide the model: the model claims its own time and
+// the job takes what is left.
+func TestTimelineWaits_BackgroundJobDoesNotHideTheModel(t *testing.T) {
+	tl := sampleTimeline() // main's turn 960-1200s, then the user answers at 1500s
+	tl.Jobs = []timeline.Job{{Agent: timeline.MainAgent, ID: "bk1", Start: tlAt(1150), End: tlPtr(1300), Seq: 29}}
+	lay := buildTimelineLayout(tl, tlAt(0), tlAt(1800), 180, tlAt(3600))
+	if c := lay.agents[0].cells[cellOf(t, lay, 1170)]; !near(c.model, 1) || !near(c.tool, 0) {
+		t.Errorf("job through a turn: %+v, want model only", c)
+	}
+	if c := lay.agents[0].cells[cellOf(t, lay, 1250)]; !near(c.tool, 1) {
+		t.Errorf("job after the turn: %+v, want tools", c)
+	}
+	// The tools total counts the time the bar gives the job: its 50s inside the reply is the
+	// model's.
+	without := buildTimelineLayout(sampleTimeline(), tlAt(0), tlAt(1800), 180, tlAt(3600)).agents[0].toolTime
+	if got := lay.agents[0].toolTime - without; got != 100*time.Second {
+		t.Errorf("tools total grew by %v, want the job's 100s outside the reply", got)
+	}
+}
+
+// A collapsed idle stretch is three cells sharing one span, and only the middle one is drawn: a
+// job inside it belongs in the tools total once.
+func TestTimelineWaits_BackgroundJobInACollapsedGapCountedOnce(t *testing.T) {
+	tl := &timeline.Timeline{
+		Start: tlAt(0), End: tlAt(7360),
+		Agents: []timeline.Agent{{ID: timeline.MainAgent, Label: "main"}},
+		Turns: []timeline.Turn{
+			{Agent: timeline.MainAgent, Start: tlAt(10), End: tlPtr(60), Finish: "end_turn", Seq: 1},
+			{Agent: timeline.MainAgent, Start: tlAt(7300), End: tlPtr(7360), Finish: "end_turn", Seq: 40},
+		},
+		Jobs: []timeline.Job{{Agent: timeline.MainAgent, ID: "bk1", Start: tlAt(120), End: tlPtr(5000), Seq: 2}},
+	}
+	lay := buildTimelineLayout(tl, time.Time{}, time.Time{}, 40, tlAt(7360))
+	markers := 0
+	for _, c := range lay.axis.cells {
+		if c.marker {
+			markers++
+		}
+	}
+	if markers == 0 {
+		t.Fatalf("axis has no collapsed gap, so this test reads nothing")
+	}
+	if got := lay.agents[0].toolTime; got != 4880*time.Second {
+		t.Errorf("tools total = %v, want the job's 4880s once", got)
 	}
 }
 
@@ -1248,5 +1319,64 @@ func TestTimelineAll_LongLiveWaitIsCapped(t *testing.T) {
 		if label := axisLabels(lay); tc.capped != strings.Contains(label, "+"+tlDuration(tc.after)) {
 			t.Errorf("%v on: axis %q, want the squeezed wait labelled only when squeezed", tc.after, label)
 		}
+	}
+}
+
+// A question the agent put to the user is the user's time: grey, not amber, and kept out of the
+// row's tool total.
+func TestTimelineWaits_AskUserQuestionIsWaitingOnYou(t *testing.T) {
+	tl := sampleTimeline() // main finishes a reply at 1200s; the user answers at 1500s
+	tl.Tools = append(tl.Tools, timeline.Tool{Agent: timeline.MainAgent, ID: "q1", Name: "AskUserQuestion", Start: tlAt(1200), End: tlPtr(1500), Seq: 35})
+	lay := buildTimelineLayout(tl, tlAt(0), tlAt(1800), 180, tlAt(3600))
+	if c := lay.agents[0].cells[cellOf(t, lay, 1300)]; !near(c.user, 1) || c.tool != 0 {
+		t.Errorf("while the question waited: %+v, want waiting on the user", c)
+	}
+	without := buildTimelineLayout(sampleTimeline(), tlAt(0), tlAt(1800), 180, tlAt(3600))
+	if got, want := lay.agents[0].toolTime, without.agents[0].toolTime; got != want {
+		t.Errorf("tool time = %s, want %s: the question is not tool time", got, want)
+	}
+
+	// At "all", a question left overnight collapses like any other wait on the user, so the work
+	// keeps the width; and one still open is the live wait's capped tail.
+	overnight := func(ask bool) *timeline.Timeline {
+		tl := sampleTimeline()
+		if ask {
+			tl.Tools = append(tl.Tools, timeline.Tool{Agent: timeline.MainAgent, ID: "q1", Name: "AskUserQuestion", Start: tlAt(1800), End: tlPtr(1800 + 7*3600), Seq: 45})
+		}
+		tl.Turns = append(tl.Turns, timeline.Turn{Agent: timeline.MainAgent, Start: tlAt(1800 + 7*3600), End: tlPtr(1800 + 7*3600 + 60), Finish: "end_turn", Seq: 50})
+		tl.End = tlAt(1800 + 7*3600 + 60)
+		return tl
+	}
+	work := func(tl *timeline.Timeline) int {
+		ax := buildTimelineLayout(tl, time.Time{}, time.Time{}, 180, tl.End.Add(time.Hour)).axis
+		return ax.width() - ax.cellsFrom(tlAt(1800))
+	}
+	if got, want := work(overnight(true)), work(overnight(false)); got != want {
+		t.Errorf("at all, the work before an overnight question got %d cells, want %d as before a plain wait", got, want)
+	}
+	open := sampleTimeline()
+	open.Tools = append(open.Tools, timeline.Tool{Agent: timeline.MainAgent, ID: "q1", Name: "AskUserQuestion", Start: tlAt(1800), Seq: 45})
+	if ax := buildTimelineLayout(open, time.Time{}, tlAt(1800+7*3600), 180, tlAt(1800+7*3600)).axis; ax.tail != timelineTailCells {
+		t.Errorf("an open question's wait has tail %d, want the capped %d", ax.tail, timelineTailCells)
+	}
+}
+
+// A cell inside a turn that carries a model names it, so a client running several models
+// side by side (Bob's classifier beside its main turns) reads apart.
+func TestTimelineStrip_NamesTheTurnModel(t *testing.T) {
+	m := timelineModel(t, 140, 46)
+	m.timeline.windowIdx = 3
+	lay, _ := m.timelineLayoutNow()
+	m.timeline.cursor = cellOf(t, lay, 5) // main's first model call: no tool yet
+	for i := range m.timeline.tl.Turns {
+		if tu := &m.timeline.tl.Turns[i]; tu.Agent == timeline.MainAgent && tu.Start.Equal(tlAt(0)) {
+			tu.Model = "premium-ide"
+		}
+	}
+	m.timeline.layoutKey = tlLayoutKey{}
+	lay, _ = m.timelineLayoutNow()
+	strip := stripANSI(m.cursorStrip(lay))
+	if !strings.Contains(strip, "premium-ide") {
+		t.Errorf("strip = %q, want the turn's model named", strip)
 	}
 }

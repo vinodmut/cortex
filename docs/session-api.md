@@ -34,7 +34,11 @@ tool results.
   "id": "…", "createdAt": "…", "updatedAt": "…", "eventCount": 42, "active": true,
   "title": "…", "agent": "claude-code", "totalTokens": 1186300, "costMicros": 254600,
   "avoidedMicros": 3700, "promptContext": {"tokens": 16384, "stated": true,
-  "at": "2026-10-15T20:01:02Z", "msgs": 12}, "inferenceHost": "api.anthropic.com"
+  "at": "2026-10-15T20:01:02Z", "msgs": 12}, "inferenceHost": "api.anthropic.com",
+  "procs": ["41963.1791718279766260000"], "lastRequestAt": "…"
+}, {
+  "id": "pending:claude-code@41963.1791718279766260000", "eventCount": 12, "…": "…",
+  "linkedTo": [{"session": "…", "first": "…", "last": "…"}], "linkedAll": true
 }]}
 ```
 
@@ -52,6 +56,20 @@ knowing by name:
   rather than the host the client named. `inferenceHostFromHistory` is `true`
   when that host came only from the archive's fold, because no request the
   proxy's current entry for the session holds has set it.
+- **`procs`** — the processes, `<pid>.<start>`, whose own session header named
+  this session. Recorded from each request's `proc` and `sessionHeader`, and
+  continued from the archive's fold like the other figures.
+- **Pending buckets.** A coding agent's calls before its process names a session
+  are recorded under `pending:<agent>@<pid>.<start>` (or `pending:<agent>` when
+  the process could not be looked up), carrying their `proc`. Nothing renames a
+  bucket. Instead, when the list is read, a bucket whose process later named a
+  session gets **`linkedTo`** — the sessions it named that its calls belong to,
+  each with the `first` and `last` request that named it; a call belongs to the
+  first session its process named at or after it — and **`linkedAll`** when every
+  request in it falls before one of them. A response goes where its request went. agentop hides a
+  `linkedAll` bucket that links to one session and shows its calls inside it; a
+  bucket linked to two sessions, or with calls after its process's last claim,
+  stays a row of its own.
 - **`?archived=true`** adds history where the proxy runs a session archive
   (`session.archive`, laptop only): every session the archive holds and memory
   does not, marked `resident: false`, plus a top-level `archive` object —
@@ -114,22 +132,34 @@ the whole list.
  "hosts":   [{"host": "api.github.com", "kind": "tunnel", "start": "…", "end": "…", "status": 200, "seq": 7}]}
 ```
 
-**Agents, turns, tools and returns are Claude Code only.** They come from the
-requests the inference parser attributed to a Claude Code agent (`agentRole`),
-and from the agent ids Claude Code sends (`subagent`, `parentSubagent`):
+**Turns and tools are attributed to any known client** (Claude Code, Bob, Codex,
+OpenCode, Pi — the canonical name parsed from the User-Agent); each gets a
+single `main` row, and every model call is a turn, including classifier side
+calls, labeled by `model`. Claude Code additionally gets its subagent tree,
+returns and background jobs — those key on the agent ids and marker strings
+(`agentRole`, `subagent`, `parentSubagent`) no other client sends. Requests
+from unknown clients render as host rows only.
 
-- A **turn** is one model call, request to end of response. Claude Code's
-  progress-label calls and tool-less side calls (titler, classifier) are left
-  out. `error` marks a call that failed: an upstream error, a refusal, the
-  client giving up, a finish of `content_filter`, `failed` or `cancelled`, or a
-  response that ended with no finish reason, which is a stream cut mid-reply.
-  `resent` marks a call that sent its agent's previous call's conversation again
-  unchanged: a retry.
+- A **turn** is one model call, request to end of response. Left out:
+  progress-label and away-recap calls (matched by their prompt text in the
+  last non-system message — Claude's own prompt strings, applied to every
+  client), and Claude Code's tool-less side calls (titler, classifier).
+  Another client's side calls are kept, cost and all. `error`
+  marks a call that failed: an upstream error, a refusal, the client giving up,
+  a finish of `content_filter`, `failed` or `cancelled`, or a response that
+  ended with no finish reason, which is a stream cut mid-reply. `resent` marks
+  a call that sent its agent's previous call's conversation again unchanged: a
+  retry.
 - A **tool** runs from the response that requested it to the agent's first
   request carrying its result (`inference.toolResults[].toolUseId`). A tool
   Claude Code started while the response was still streaming can have its
-  result recorded first; its end is clamped to its start. `preview` is up to
-  80 characters of the command, path or description.
+  result recorded first; its end is clamped to its start. A CONNECT to a model
+  host that could not be dialed, after the tool started and before its result,
+  ends it there unless its agent, or an agent below it, made a successful turn
+  in between: the agent tried to report back and the network was gone, so the
+  result arrived only when it came back, or never. A failure the agent recovered
+  from is a blip and ends nothing. A tool with neither has no `end` and is still
+  running. `preview` is up to 80 characters of the command, path or description.
 - An **agent** links to the `Agent` tool call that started it by the id the
   call's result names (`agentId: …`). A fork's result names none, so a fork
   takes its parent's earliest unmatched spawn. Requests recorded before the
@@ -142,8 +172,9 @@ and from the agent ids Claude Code sends (`subagent`, `parentSubagent`):
   `<task-notification>` naming that id. Its tool call ends at the
   acknowledgement, so the job is what shows it still running. A job with no
   `end` is one no notification named: still running, or never reported, as a
-  server left running when its agent exited is. Absent when the session
-  started none.
+  server left running when its agent exited is. A job whose agent was cut off
+  ends where its tools do: at the first failed dial to a model host after the
+  agent's last call. Absent when the session started none.
 
 **Hosts** are every outbound request paired with its response, every opaque
 tunnel, and every denial. `kind` is `llm`, `mcp`, `http` or `tunnel`, and
@@ -250,7 +281,47 @@ Every event on `/v1/sessions/{id}` and `/v1/events` carries:
   "upgrade_declined"` is the forward proxy's own answer to a WebSocket upgrade on
   OpenAI's Responses API (`chatgpt.com` or `api.openai.com`): nothing is forwarded,
   and a client such as Codex reads it as "use HTTPS" and retries at once over
-  HTTPS. It is not counted as an error in `/v1/usage`.
+  HTTPS. It is not counted as an error in `/v1/usage`. Every other WebSocket
+  upgrade is forwarded (#1488): the 101 the origin answers with is spliced onto
+  the client's connection, the frames after it are relayed uninspected, and the
+  session records the request row plus a **101 response row** paired to it by
+  `requestId`, carrying `bytesUp` and `bytesDown` for the whole WebSocket
+  session — the one response row besides a tunnel close that carries both —
+  with `durationMs` covering the session and `ttfbMs` the handshake. Because
+  that `durationMs` is a session lifetime rather than a request latency, the
+  101 row is **excluded from `/v1/usage`** exactly as a tunnel row is: folding
+  it would drag the latency mean toward WebSocket lifetimes (one 10-minute
+  session moved a host's mean from 500ms to 6.4s in testing), its frames are
+  opaque so there is no model, token or cost to attribute, and counting it
+  would add one Request whose latency is its whole lifetime. On the timeline
+  the lifetime is the point, so the field stays. **That exclusion is outbound
+  only.** The reverse proxy also records a 101, but at *handshake* time
+  (`ReverseProxy` hands off the connection instead of copying a body, so a
+  deferred record would never fire), so its `durationMs` is the handshake
+  latency — an ordinary request figure. An inbound WebSocket handshake is
+  therefore still counted as a Request. A relay that ended in an
+  error carries `error.kind: "proxy_error"` on the 101 row, so a session that
+  broke mid-stream is distinguishable from one that closed cleanly; an
+  ordinary close is not marked. A **403**
+  with `error.kind: "destination_private"` is the egress guard's refusal
+  (`listener.egress_guard`): the destination resolved into loopback,
+  link-local, private or this host's own address space and no permit covered
+  it. Also the proxy's own answer rather than the upstream's, and also not
+  counted as an error — the guard did what it was configured to.
+- `ttfbMs` — on a delivered response row, the wall time from request entry to
+  the upstream's response **headers** arriving. `durationMs` − `ttfbMs` is then
+  how long the body took — for a streamed completion, the stream time. The pair
+  separates a slow-to-answer origin from one that answered and then trickled,
+  which `durationMs` alone cannot (#1251). The row is recorded when the listener
+  is finished with the body — after the read on a buffered path, after the relay
+  on a streamed or unbuffered one — so the difference really is the body's time.
+  The one exception is the envoy-sidecar listener with a pipeline no plugin of
+  which reads bodies: the row is recorded at the headers while Envoy relays the
+  body unseen, and ttfb is left absent there rather than reported as a figure
+  equal to the whole duration. Absent when the exchange failed
+  before headers (the 502 cases above), on request rows, and on tunnel rows —
+  an opaque tunnel has no headers to time. agentop's detail pane renders the
+  split as a `timing:` line.
 - `requestedHost` — present only when a plugin redirected the request: the
   host the client asked for. `host` is where the request actually went, and
   usage, the cost ledger and pricing all follow `host`.
@@ -260,17 +331,32 @@ Every event on `/v1/sessions/{id}` and `/v1/events` carries:
 - `bytesUp`, `bytesDown` — **body** bytes, one direction per row: a request row
   carries `bytesUp`, the body as forwarded (so a rewrite is reflected); a
   response row carries `bytesDown`, the body as it came back from the
-  destination. Headers are not counted. A tunnel close is the one row carrying
-  both. **Zero means the listener counted nothing, not that the body was
+  destination. Headers are not counted. A tunnel close and a forwarded
+  WebSocket's 101 response row are the rows carrying both. **Zero means the
+  listener counted nothing, not that the body was
   empty** — every listener buffers bodies only when a plugin asks, so an
-  unbuffered request reports zero.
+  unbuffered request reports zero. A response relayed straight through is
+  counted, not zero: both proxies record the row after they finish relaying
+  it (#1251), so the bytes that crossed their own process are on the row. The
+  one arm that still reports zero is the envoy-sidecar listener with a
+  body-free pipeline — it asked Envoy not to send it the bytes, so zero there
+  means "not asked to see", not "not counted".
 - `tunnel`, `tunnelReason` — an opaque CONNECT (or transparent-redirect) tunnel
   records two rows sharing a `requestId`: the open (`phase: "request"`,
   `tunnelReason` saying why the bytes stayed opaque) and the close (`phase:
   "response"`), carrying the CONNECT's own status, the duration, and the bytes
   each way. It is not the destination's status: that travels inside the
   client's end-to-end TLS. Tunnel rows are kept out of `/v1/usage`: a tunnel's
-  lifetime is not a request latency.
+  lifetime is not a request latency. `tunnelReason: "dest-private"` is the
+  egress guard's refusal: the close row carries 403 and
+  `error.kind: "destination_private"`, and no tunnel was ever opened to the
+  destination — the same refusal a plain request gets, one layer down.
+- `dialAddr` — present on a tunnel's open row when the egress guard is on:
+  the address the guard checked and the proxy dialed, `"ip:port"`. Together
+  with `host` it is the audit trail against DNS rebinding — "asked for the
+  name, dialed this address" — because under the guard the proxy never dials
+  an address it did not check. Absent when the guard is off and on rows that
+  dialed nothing.
 - `httpMethod`, `httpPath` — the HTTP verb and query-stripped,
   percent-decoded path, so a request no parser recognized is still
   identifiable. On an opaque tunnel `httpMethod` is `CONNECT` and `httpPath`

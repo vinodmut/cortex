@@ -1,6 +1,7 @@
 package reverseproxy
 
 import (
+	"compress/gzip"
 	"context"
 	"fmt"
 	"io"
@@ -148,6 +149,94 @@ func TestReverseProxy_RewritesHostToBackend(t *testing.T) {
 	if gotHost != backendHost {
 		t.Errorf("backend received Host = %q, want %q (backend target host)", gotHost, backendHost)
 	}
+}
+
+// reloadDuringRequestPlugin declares ReadsBody (so the Director must strip
+// Accept-Encoding for the pipeline it runs in) and Stores a body-free
+// pipeline into the holder from OnRequest — a reload landing exactly
+// between Run and the Director, the tightest window a mid-request reload
+// has.
+type reloadDuringRequestPlugin struct {
+	holder *pipeline.Holder
+}
+
+func (p *reloadDuringRequestPlugin) Name() string { return "reload-during-request" }
+func (p *reloadDuringRequestPlugin) Capabilities() pipeline.PluginCapabilities {
+	return pipeline.PluginCapabilities{ReadsBody: true}
+}
+func (p *reloadDuringRequestPlugin) OnRequest(_ context.Context, _ *pipeline.Context) pipeline.Action {
+	plain, err := pipeline.New(nil)
+	if err != nil {
+		return pipeline.Action{Type: pipeline.Reject}
+	}
+	p.holder.Store(plain)
+	return pipeline.Action{Type: pipeline.Continue}
+}
+func (p *reloadDuringRequestPlugin) OnResponse(_ context.Context, _ *pipeline.Context) pipeline.Action {
+	return pipeline.Action{Type: pipeline.Continue}
+}
+
+// TestReverseProxy_DirectorProbeFollowsThePin: the Director's
+// Accept-Encoding strip is a post-Run capability probe and must answer
+// for the pipeline the request ran on. Reading the Holder directly made a
+// reload between Run and the Director leave the client's explicit
+// Accept-Encoding in place, which turns off the transport's transparent
+// gzip handling — the pinned pipeline's readers then got a gzipped body,
+// the same silent-skip shape the pin exists to prevent (#1561). The pctx
+// reaches the Director through the request context (pctxKey), the same
+// mechanism modifyResponse reads it by. Observable: with the strip applied
+// the transport decompresses the backend's gzip itself, so the client
+// receives plaintext and no Content-Encoding; without it the client
+// receives the gzip verbatim.
+func TestReverseProxy_DirectorProbeFollowsThePin(t *testing.T) {
+	const payload = "payload"
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Encoding", "gzip")
+		gz := gzip.NewWriter(w)
+		gz.Write([]byte(payload))
+		gz.Close()
+	}))
+	defer backend.Close()
+
+	holder := pipeline.NewHolder(mustReversePipeline(t))
+	plug := &reloadDuringRequestPlugin{holder: holder}
+	withReader, err := pipeline.New([]pipeline.Plugin{plug})
+	if err != nil {
+		t.Fatal(err)
+	}
+	holder.Store(withReader)
+
+	srv, err := NewServer(holder, nil, backend.URL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxy := httptest.NewServer(srv.Handler())
+	defer proxy.Close()
+
+	req, _ := http.NewRequest("GET", proxy.URL+"/api/data", nil)
+	// Explicit, so Go's transport does not do its own transparent gzip
+	// unless the Director strips it — that strip is the behavior under test.
+	req.Header.Set("Accept-Encoding", "gzip")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+
+	if resp.Header.Get("Content-Encoding") != "" || string(body) != payload {
+		t.Errorf("client received Content-Encoding = %q, body = %q, want decompressed %q: the pinned pipeline (ReadsBody) is the one the Director must answer for",
+			resp.Header.Get("Content-Encoding"), body, payload)
+	}
+}
+
+func mustReversePipeline(t *testing.T) *pipeline.Pipeline {
+	t.Helper()
+	p, err := pipeline.New(nil)
+	if err != nil {
+		t.Fatalf("pipeline.New: %v", err)
+	}
+	return p
 }
 
 // --- Header Propagation Tests ---
@@ -688,11 +777,13 @@ func TestReverseProxy_ModifyResponse_RekeyAndResponseEvent(t *testing.T) {
 
 	// After the response: the `default` bucket should be gone (rekeyed
 	// to ctxID) and the ctxID bucket should hold both events from this
-	// turn (request + response).
+	// turn (request + response). The response row lands when ReverseProxy
+	// finishes relaying the body, which can be after the client has its
+	// response, so wait for it rather than race it.
+	view := waitForEvents(t, store, ctxID, 2)
 	if v := store.View(session.DefaultSessionID); v != nil {
 		t.Errorf("default bucket still exists with %d events; expected rekey to %q", len(v.Events), ctxID)
 	}
-	view := store.View(ctxID)
 	if view == nil {
 		t.Fatalf("session %q not found; rekey did not run", ctxID)
 	}
@@ -717,6 +808,76 @@ func TestReverseProxy_ModifyResponse_RekeyAndResponseEvent(t *testing.T) {
 	}
 	if respEvent.Invocations == nil || len(respEvent.Invocations.Inbound) == 0 {
 		t.Errorf("response event has no Invocations; expected one a2a-stamp observe entry")
+	}
+}
+
+// TestReverseProxy_ResponseEventDurationIncludesUnbufferedBody pins the arm the
+// buffered tests cannot reach: when no inbound plugin asks for the body,
+// modifyResponse returns before ReverseProxy copies it, and the row used to be
+// appended right there — Duration stopped at the headers, so duration−ttfb read
+// as a zero body while the body was still being relayed (#1251's misreading).
+// The row is now deferred to the end of the copy (recordOnEOFBody), which also
+// completes BytesDown for the same arm.
+func TestReverseProxy_ResponseEventDurationIncludesUnbufferedBody(t *testing.T) {
+	store := session.New(5*time.Minute, 100, 0)
+	defer store.Close()
+
+	const drip = 60 * time.Millisecond
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		// Plain JSON, not event-stream, and the pipeline below is empty: nothing
+		// buffers the body, so ReverseProxy's own copy is the relay.
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush()
+		time.Sleep(drip)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer backend.Close()
+
+	p, err := pipeline.New([]pipeline.Plugin{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv, err := NewServer(pipeline.NewHolder(p), store, backend.URL, nil)
+	if err != nil {
+		t.Fatalf("NewServer: %v", err)
+	}
+	proxy := httptest.NewServer(srv.Handler())
+	defer proxy.Close()
+
+	resp, err := http.DefaultClient.Get(proxy.URL + "/api")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+
+	// The row is deferred to the end of ReverseProxy's copy, which can finish
+	// after the client has read the body and returned — wait for it rather
+	// than racing the recording (see recording_test.go for the flake this
+	// shape produced in CI).
+	waitForResponseEvent(t, store, session.DefaultSessionID)
+
+	v := store.View(session.DefaultSessionID)
+	if v == nil || len(v.Events) != 2 {
+		t.Fatalf("expected 2 events (request + response) in the default bucket, got %+v", v)
+	}
+	respEv := v.Events[1]
+	if respEv.Phase != pipeline.SessionResponse {
+		t.Fatalf("second event phase = %v, want SessionResponse", respEv.Phase)
+	}
+	if respEv.Ttfb <= 0 {
+		t.Errorf("response event ttfb = %v, want > 0 — headers arrived, so the figure exists", respEv.Ttfb)
+	}
+	// The drip happens entirely after the flush, so the body's share is at least
+	// most of it. Loose bound on purpose: the claim is the ORDER of the two
+	// phases, not a stopwatch.
+	if body := respEv.Duration - respEv.Ttfb; body < drip/2 {
+		t.Errorf("duration−ttfb = %v, want ≥ %v — the body dripped for %v after the headers flushed",
+			body, drip/2, drip)
+	}
+	if respEv.BytesDown == 0 {
+		t.Errorf("response event BytesDown = 0, want the relayed body counted — the row is recorded after the copy")
 	}
 }
 

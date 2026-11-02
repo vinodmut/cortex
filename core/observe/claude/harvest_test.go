@@ -187,7 +187,9 @@ func TestHarvest_IncrementalParsesWhatItCannotValidate(t *testing.T) {
 				t.Fatal(err)
 			}
 			seed := map[string]SessionMetadata{}
-			if tc.entry != (SessionMetadata{}) {
+			// Not != (SessionMetadata{}): the Subagents map makes the struct
+			// non-comparable, and the cases only ever populate these two fields.
+			if tc.entry.Title != "" || tc.entry.LogFile != "" {
 				seed["s1"] = tc.entry
 			}
 			if err := SaveMetadata(path, seed); err != nil {
@@ -2854,6 +2856,74 @@ func TestTitleFromTranscript_CwdIsBounded(t *testing.T) {
 	}
 }
 
+// SaveMetadata fsyncs the data to disk before Rename swaps it in, so a crash leaves either
+// the old file or the new one.
+func TestSaveMetadata_FsyncsBeforeRename(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "session-metadata.json")
+	const keep = `{"old":{"title":"keep me"}}`
+	if err := os.WriteFile(path, []byte(keep), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var atPath, atTmp []byte
+	was := syncFile
+	syncFile = func(f *os.File) error {
+		atPath, _ = os.ReadFile(path)
+		atTmp, _ = os.ReadFile(f.Name())
+		return f.Sync()
+	}
+	t.Cleanup(func() { syncFile = was })
+
+	if err := SaveMetadata(path, map[string]SessionMetadata{"a": {Title: "t"}}); err != nil {
+		t.Fatal(err)
+	}
+	if string(atPath) != keep {
+		t.Fatalf("at Sync time, path = %q; want the pre-Rename %q", atPath, keep)
+	}
+	var got map[string]SessionMetadata
+	if err := json.Unmarshal(atTmp, &got); err != nil {
+		t.Fatalf("temp at Sync time is invalid: %v (%q)", err, atTmp)
+	}
+	if len(got) != 1 || got["a"].Title != "t" {
+		t.Fatalf("temp at Sync time = %#v; want the new metadata", got)
+	}
+}
+
+// A Sync failure returns an error and leaves the old file in place.
+func TestSaveMetadata_AFailedSyncKeepsTheOldFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "session-metadata.json")
+	const keep = `{"old":{"title":"keep me"}}`
+	if err := os.WriteFile(path, []byte(keep), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	was := syncFile
+	syncFile = func(*os.File) error { return errors.New("power lost") }
+	t.Cleanup(func() { syncFile = was })
+
+	if err := SaveMetadata(path, map[string]SessionMetadata{"new": {Title: "t"}}); err == nil {
+		t.Fatal("SaveMetadata returned nil after Sync failed")
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(b) != keep {
+		t.Errorf("file = %q, want the original %q", b, keep)
+	}
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range ents {
+		if strings.HasSuffix(e.Name(), ".tmp") {
+			t.Errorf("temp file %s was left behind", e.Name())
+		}
+	}
+}
+
 // A short write must not be renamed over the good file. This is the seam writeAll exists for:
 // the failure is a write error that Close and Rename both survive, which no real filesystem
 // produces, and the bug it guards — `err :=` shadowing inside SaveMetadata — is invisible to
@@ -2890,5 +2960,54 @@ func TestSaveMetadata_AFailedWriteKeepsTheOldFile(t *testing.T) {
 		if strings.HasSuffix(e.Name(), ".tmp") {
 			t.Errorf("temp file %s was left behind", e.Name())
 		}
+	}
+}
+
+// A session's subagent labels are harvested from its subagents/agent-<id>.meta.json files,
+// keyed by the bare id — the same id the proxy records on a subagent's rows. The transcripts
+// beside them are not read, a missing subagents directory costs nothing, and one bad meta
+// file costs only its own label.
+func TestHarvest_ReadsSubagentMetaFiles(t *testing.T) {
+	metadataHome(t)
+	cfg := filepath.Join(t.TempDir(), "claude")
+	proj := filepath.Join(cfg, "projects", "-p")
+	writeSessionTranscript(t, proj, "s1.jsonl", `{"type":"ai-title","aiTitle":"t"}`)
+	subs := filepath.Join(proj, "s1", "subagents")
+	writeSessionTranscript(t, subs, "agent-a0974b0b8591dc76b.meta.json",
+		`{"agentType":"general-purpose","description":"PR review (execution-first)"}`)
+	writeSessionTranscript(t, subs, "agent-bad.meta.json", `{"agentType":`) // malformed JSON
+	writeSessionTranscript(t, subs, "agent-a2172bb34d27cb12.jsonl", `{}`)   // a transcript, not a meta file
+
+	res, err := Harvest(Options{ConfigDir: cfg, Merge: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := readMetadataFile(t, res.Path)["s1"].Subagents
+	if len(got) != 1 {
+		t.Fatalf("Subagents = %v, want exactly the one parseable meta file", got)
+	}
+	info, ok := got["a0974b0b8591dc76b"]
+	if !ok {
+		t.Fatalf("keyed by the bare id; got %v", got)
+	}
+	if info.AgentType != "general-purpose" || info.Description != "PR review (execution-first)" {
+		t.Errorf("info = %+v", info)
+	}
+}
+
+// A session with no subagents carries no Subagents map at all, so the JSON spells nothing
+// out for the sessions that have none — which is most of them.
+func TestHarvest_SessionWithoutSubagentsHasNoMap(t *testing.T) {
+	metadataHome(t)
+	cfg := filepath.Join(t.TempDir(), "claude")
+	proj := filepath.Join(cfg, "projects", "-p")
+	writeSessionTranscript(t, proj, "s1.jsonl", `{"type":"ai-title","aiTitle":"t"}`)
+
+	res, err := Harvest(Options{ConfigDir: cfg, Merge: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := readMetadataFile(t, res.Path)["s1"].Subagents; got != nil {
+		t.Errorf("Subagents = %v, want nil", got)
 	}
 }

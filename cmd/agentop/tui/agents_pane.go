@@ -11,6 +11,7 @@ import (
 	"github.com/rossoctl/cortex/cmd/agentop/money"
 	"github.com/rossoctl/cortex/cmd/agentop/tui/table"
 	"github.com/rossoctl/cortex/core/cost/usage"
+	"github.com/rossoctl/cortex/core/session"
 )
 
 // agentRow is one coding agent's totals for the whole window, as the AGENTS pane shows them.
@@ -112,11 +113,12 @@ func agentsPaneApplies(rows []agentRow) bool {
 func (m *model) agentChoices() []agentRow {
 	var extra []string
 	for _, s := range m.sessions {
-		if !knownAgentLabel(s.Agent) || slices.Contains(extra, s.Agent) ||
-			slices.ContainsFunc(m.agents, func(a agentRow) bool { return a.label == s.Agent }) {
+		agent := sessionAgent(s)
+		if !knownAgentLabel(agent) || slices.Contains(extra, agent) ||
+			slices.ContainsFunc(m.agents, func(a agentRow) bool { return a.label == agent }) {
 			continue
 		}
-		extra = append(extra, s.Agent)
+		extra = append(extra, agent)
 	}
 	if len(extra) == 0 {
 		return m.agents
@@ -263,13 +265,16 @@ func (m *model) fetchAgentRowsCmd(open agentsOpen, from paneID) tea.Cmd {
 // compounds each narrowing, so widening the terminal back up never restores what it took away.
 //
 // COST is widest because it is the column the pane exists for, and it holds "—" for an agent
-// nothing could price, which is every Bob row until the billing-unit work lands.
-func agentsColumns() []table.Column {
+// nothing could price, which is every Bob row until the billing-unit work lands. ITS TITLE NAMES
+// THE WINDOW, because it is the pane's only windowed column: SESSIONS and LAST SEEN describe the
+// whole list, which is not limited to the window, and SERVER is the routing now. REQUESTS and
+// TOKENS were dropped for that reason — two more window figures beside two that are not read as
+// one denominator, and the usage pane and `agentop cost --by agent` carry them.
+func agentsColumns(window string) []table.Column {
+	title := "COST " + strings.ToUpper(window)
 	return []table.Column{
 		{Title: "AGENT", Width: 34},
-		{Title: "REQUESTS", Width: 10},
-		{Title: "TOKENS", Width: 10},
-		{Title: "COST", Width: agentsCostWidth},
+		{Title: title, Width: max(agentsCostWidth, len(title))},
 	}
 }
 
@@ -301,7 +306,7 @@ func (m *model) startupAgentsGateCmd() tea.Cmd {
 // newAgentsTable builds an empty per-agent breakdown table.
 func newAgentsTable() table.Model {
 	t := table.New(
-		table.WithColumns(agentsColumns()),
+		table.WithColumns(agentsColumns(spendSpanDefs[spanToday].label)),
 		table.WithFocused(true),
 	)
 	t.SetStyles(tableStyles())
@@ -319,9 +324,11 @@ func (m *model) rebuildAgentsTable() {
 	if hadPrev {
 		prev = m.agentRowLabels[cursor]
 	}
-	cols := agentsColumns()
+	cols := agentsColumns(m.agentsWindowLabel())
 	if withSessions {
-		cols = append(cols[:1:1], append([]table.Column{{Title: "SESSIONS", Width: 8}}, cols[1:]...)...)
+		cols = slices.Insert(cols, 1,
+			table.Column{Title: "SESSIONS", Width: 8},
+			table.Column{Title: "LAST SEEN", Width: agentsLastSeenWidth})
 	}
 	// SERVER, last, only while the proxy runs an inference-router that routes — not one under
 	// on_error: observe, which keeps its config but moves nothing (see routerStatus). Without
@@ -329,8 +336,8 @@ func (m *model) rebuildAgentsTable() {
 	//
 	// SQUEEZING AGENT ON A NARROW TERMINAL, NOT DROPPED AS THE SESSIONS TABLE'S IS, and on
 	// purpose: this column is the one place the pane shows where each agent's new sessions go.
-	// AGENT is the widest, so the fitter takes the room from it — 30 to 16 at 80 columns with
-	// SESSIONS up, whole again from 98 — and what survives is the agent's name and minor version,
+	// AGENT is the widest, so the fitter takes the room from it — 34 to 26 at 80 columns with
+	// SESSIONS and LAST SEEN up — and what survives is at least the agent's name and minor version,
 	// "claude-code/2.1…". That name is what SERVER and S act on, so two patch versions' rows that
 	// read alike there are one agent with one server
 	// (TestAgentsPane_TheAgentsNameSurvivesTheServerColumnAt80).
@@ -346,9 +353,9 @@ func (m *model) rebuildAgentsTable() {
 	rows := make([]table.Row, 0, len(picker)+1)
 	// Its figures are left blank: the band above already carries the window's total, and summed
 	// across agents billing in different units it would only read as mixed.
-	all := table.Row{allAgentsLabel, "", "", ""}
+	all := table.Row{allAgentsLabel, ""}
 	if withSessions {
-		all = append(all, "")
+		all = slices.Insert(all, 1, "", "")
 	}
 	// Nothing under SERVER either: routing is chosen per agent, and S on this row says so.
 	if routed {
@@ -357,31 +364,23 @@ func (m *model) rebuildAgentsTable() {
 	rows = append(rows, all)
 	labels := make([]string, 0, len(picker)+1)
 	labels = append(labels, "")
+	now := m.clock()
 	for _, a := range picker {
 		labels = append(labels, a.label)
-		requests, tokens := formatCount(int(a.Requests)), humanizeCount(a.Tokens)
-		if a.Requests == 0 {
-			// A row listed for its sessions, with no traffic in the window: agentChoices' added
-			// agents and pickerRows' Other. Dashes, as SESSIONS shows for none, because "0"
-			// beside the cost cell's "—" reads as a measured zero with an unknown price.
-			requests, tokens = emptyCell, emptyCell
-		}
-		rows = append(rows, table.Row{
+		row := table.Row{
 			// SANITISED AT RENDER TIME. The label is a User-Agent, so it is
 			// request-controlled; tui.sanitizeLabel is the package's render-time copy of the
 			// rule, named as such in ledger's own comment.
 			sanitizeLabel(a.label),
-			requests,
-			tokens,
 			agentCostCellIn(a.Counts, a.units, agentsCostWidth),
-		})
+		}
 		if withSessions {
-			r := rows[len(rows)-1]
-			rows[len(rows)-1] = append(r[:1:1], append(table.Row{m.agentSessionsCell(a.label)}, r[1:]...)...)
+			row = slices.Insert(row, 1, m.agentSessionsCell(a.label), relTime(now, m.agentLastSeen(a.label)))
 		}
 		if routed {
-			rows[len(rows)-1] = append(rows[len(rows)-1], agentServerCell(router, a.label))
+			row = append(row, agentServerCell(router, a.label))
 		}
+		rows = append(rows, row)
 	}
 	m.agentsTbl.SetRows(rows)
 	m.agentRowLabels = labels
@@ -542,7 +541,7 @@ func (m *model) agentSessionsCell(label string) string {
 		n = m.otherSessionsCount()
 	} else {
 		for _, s := range m.sessions {
-			if s.Agent == label {
+			if agentRowLists(s, label) {
 				n++
 			}
 		}
@@ -553,10 +552,40 @@ func (m *model) agentSessionsCell(label string) string {
 	return formatCount(n)
 }
 
+// agentsLastSeenWidth fits relTime's widest form, a two-digit day: "Oct 23 15:04".
+const agentsLastSeenWidth = len("Oct 23 15:04")
+
+// agentLastSeen is the newest UpdatedAt among the listed sessions agentSessionsCell counts for
+// label, or zero when it lists none. Other's cached-only rows carry no summary and add no time.
+func (m *model) agentLastSeen(label string) time.Time {
+	var last time.Time
+	for _, s := range m.sessions {
+		if agentRowLists(s, label) {
+			if s.UpdatedAt.After(last) {
+				last = s.UpdatedAt
+			}
+		}
+	}
+	return last
+}
+
+// agentRowLists reports whether s is one of the rows the agent label lists: its own sessions and
+// pending buckets — or, for Other, every row naming no recognised agent — less the buckets folded
+// into a session.
+func agentRowLists(s session.SessionSummary, label string) bool {
+	if foldedInto(s) != "" {
+		return false
+	}
+	if label == otherAgents {
+		return inOtherAgents(s)
+	}
+	return sessionAgent(s) == label
+}
+
 // sessionsNameAgents reports whether any listed session names its agent.
 func (m *model) sessionsNameAgents() bool {
 	for _, s := range m.sessions {
-		if s.Agent != "" {
+		if sessionAgent(s) != "" {
 			return true
 		}
 	}

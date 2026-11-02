@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"net/http"
 	"reflect"
 	"strings"
 	"testing"
@@ -549,6 +550,32 @@ func TestRecord_DeclinedUpgradeIsNotAnError(t *testing.T) {
 	}
 }
 
+// Same shape for the egress guard: its 403 is the guard doing what the operator
+// configured, so a refusal must not read as a failing proxy. The exemption is the
+// kind, not the status — an origin's own 403 is still an error.
+func TestRecord_DestinationPrivateIsNotAnError(t *testing.T) {
+	now := time.Date(2026, 9, 4, 23, 30, 30, 0, time.UTC)
+	a := New(WithClock(fixedClock(now)))
+
+	refused := respEvent(now, 403, 0, "", 0)
+	refused.Error = &pipeline.EventError{Kind: pipeline.ErrorKindDestinationPrivate}
+	a.Record("s1", refused)
+	origin403 := respEvent(now, 403, 0, "", 0)
+	origin403.Error = &pipeline.EventError{Kind: "backend_error", Code: "403"}
+	a.Record("s1", origin403)
+
+	b := a.Snapshot(time.Minute, BucketWidth, "", GroupStatus).Buckets[0]
+	if b.Requests != 2 {
+		t.Errorf("requests = %d, want 2", b.Requests)
+	}
+	if b.Errors != 1 {
+		t.Errorf("errors = %d, want 1 — the origin's 403 only, not the guard's refusal", b.Errors)
+	}
+	if _, ok := b.Series["403"]; !ok {
+		t.Errorf("both 403s still belong under their status; got keys %v", keys(b.Series))
+	}
+}
+
 // Request events carry no status, duration or usage. Counting them would double
 // every request.
 func TestRecord_IgnoresRequestPhase(t *testing.T) {
@@ -587,6 +614,91 @@ func TestRecord_IgnoresTunnelRows(t *testing.T) {
 	if b.Errors != 0 {
 		t.Errorf("errors = %d, want 0 — a failed dial is a tunnel row, not a failed request", b.Errors)
 	}
+}
+
+// A forwarded WebSocket's 101 row is the same shape as a tunnel close and gets the
+// same treatment (#1488, #1549 review). The row is recorded after both splice
+// directions end, so its Duration is the WebSocket SESSION's lifetime — minutes or
+// hours — and folding it as a request latency is exactly the error the tunnel
+// exclusion above exists to prevent.
+//
+// The numbers are the point: a hundred ordinary 500ms requests against one host,
+// plus ONE ten-minute WebSocket, used to report a 6.4-SECOND mean. That is the
+// figure an operator reads off /v1/usage and agentop's per-server latency.
+func TestRecord_WebSocket101IsNotARequestLatency(t *testing.T) {
+	now := time.Date(2026, 9, 4, 23, 30, 30, 0, time.UTC)
+	a := New(WithClock(fixedClock(now)))
+	for i := 0; i < 100; i++ {
+		a.Record("s1", respEvent(now, 200, 500*time.Millisecond, "", 0))
+	}
+	before := a.Snapshot(time.Minute, BucketWidth, "", GroupNone)
+
+	// The 101 a ten-minute WebSocket session leaves behind, byte counts and all.
+	ws := respEvent(now, http.StatusSwitchingProtocols, 10*time.Minute, "", 0)
+	ws.BytesUp, ws.BytesDown = 1234, 5678
+	a.Record("s1", ws)
+	after := a.Snapshot(time.Minute, BucketWidth, "", GroupNone)
+
+	if got := after.Totals.Requests; got != before.Totals.Requests {
+		t.Errorf("requests = %d, want %d — a WebSocket session is not one more request",
+			got, before.Totals.Requests)
+	}
+	bl, al := weightedLatMean(before), weightedLatMean(after)
+	if al != bl {
+		t.Errorf("latency mean moved %.1fms -> %.1fms; a 101 row carries the session's "+
+			"lifetime, not a request latency", bl, al)
+	}
+	if bl == 0 {
+		t.Fatal("the ordinary requests recorded no latency; the test would pass vacuously")
+	}
+}
+
+// The exclusion above is scoped to OUTBOUND, and this is why. The reverse proxy
+// records a 101 row too (its ModifyResponse's StatusSwitchingProtocols arm,
+// Direction: Inbound) — but it records it AT HANDSHAKE TIME, because
+// ReverseProxy never copies an upgraded body, so that row's Duration is the
+// handshake latency and not the session's lifetime. The lifetime is the only
+// thing the exclusion exists to keep out of the mean.
+//
+// So an inbound 101 is an ordinary request with a sensible latency, and dropping
+// it would silently change what Requests MEANS on every inbound listener — the
+// very thing the exclusion's own comment warns against, in the other direction
+// (#1549 review).
+func TestRecord_InboundWebSocket101IsStillARequest(t *testing.T) {
+	now := time.Date(2026, 9, 4, 23, 30, 30, 0, time.UTC)
+	a := New(WithClock(fixedClock(now)))
+	before := a.Snapshot(time.Minute, BucketWidth, "", GroupNone)
+
+	// The reverse proxy's 101: inbound, and its duration is the HANDSHAKE, so it
+	// is a normal-looking latency rather than a session lifetime.
+	ws := respEvent(now, http.StatusSwitchingProtocols, 12*time.Millisecond, "", 0)
+	ws.Direction = pipeline.Inbound
+	a.Record("s1", ws)
+	after := a.Snapshot(time.Minute, BucketWidth, "", GroupNone)
+
+	if got, want := after.Totals.Requests, before.Totals.Requests+1; got != want {
+		t.Errorf("requests = %d, want %d — an inbound 101 is a handshake, and was "+
+			"counted as a request before the outbound exclusion was added", got, want)
+	}
+	if m := weightedLatMean(after); m == 0 {
+		t.Error("inbound 101 contributed no latency; its handshake time is a real request latency")
+	}
+}
+
+// weightedLatMean is the sample-weighted latency mean across a snapshot's buckets,
+// which is how a client showing one window-wide figure has to compute it (see
+// Bucket.LatSamples).
+func weightedLatMean(s Snapshot) float64 {
+	var sum float64
+	var n int64
+	for _, b := range s.Buckets {
+		sum += b.LatMeanMs * float64(b.LatSamples)
+		n += b.LatSamples
+	}
+	if n == 0 {
+		return 0
+	}
+	return sum / float64(n)
 }
 
 // All three groupings accumulate simultaneously, so an operator cycling the

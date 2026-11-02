@@ -867,6 +867,8 @@ curl http://localhost:9093/config               # now-active config
 | `session.*` (TTL, MaxEvents, MaxSessions, ID headers) | ❌ | Every consumer reads the block once at startup — `session.New(...)` in each `cmd` main, `forwardproxy.Server.SessionIDHeaders` assigned before `ListenAndServe`. There is no live object to reach; refuse reload |
 | `cost_ledger.*` (`enabled`, `dir`, `retention_days`) | ❌ | The ledger is a `*ledger.Writer` opened once at startup and handed to the session store as a `Recorder`. Refuse reload |
 | `mtls.*` (the block's presence and `mode`, the only field it carries) | ❌ | The inbound TLS listener and, under `strict`, the forward proxy's mTLS dialer are built once at startup, and the outbound chain is built for `forwardproxy.Support` of that state; refuse reload. Legacy `cert_file` / `key_file` / `bundle_file` keys are dropped at load, so an edit to them is neither applied nor refused |
+| `tls_bridge.*` (mode, ca_dir, passthrough_hosts, ports, …) | ❌ | The bridge engine is built once at boot in each `cmd` main and nothing re-reads the block; refuse reload. An accepted-but-ineffective edit here is the dangerous shape: an operator adding a host to `passthrough_hosts` reads the successful reload as confirmation it stopped being intercepted |
+| `spiffe.*` (socket, mirror settings, …) | ❌ | The in-process Provider is constructed once at boot and handed to plugins through `Deps` at build time; refuse reload |
 
 **Why `session.*` and `cost_ledger.*` are refused rather than "reloaded but ineffective".**
 Both used to be accepted: the reload succeeded, `ReloadsOK` incremented,
@@ -905,6 +907,52 @@ or token-exchange policy applied — bypass means bypass. It exists for traffic
 whose recording floods the session store and crowds out the user intent a
 guardrail needs (see the intent-pin note in [`laptop-service.md`](laptop-service.md)).
 
+#### Forwarding WebSocket upgrades
+
+Every WebSocket upgrade the forward proxy does not decline is forwarded (#1488), plain
+and TLS-bridged alike. `Upgrade` is hop-by-hop, which is why it is stripped from
+ordinary requests — but an upgrade exchange makes the proxy an endpoint of the hop
+instead of a reader between two: everything after the 101 is opaque to it, so the
+header must cross or the origin never sees an upgrade request at all. The forwarded
+pair is normalized to `Connection: Upgrade` / `Upgrade: websocket` (the one protocol
+forwarded, mirroring `httputil.ReverseProxy`), which also pins the exchange to
+HTTP/1.1 — net/http does that by itself (`Request.requiresHTTP1`), so the bridge's
+h2-negotiating upstream client needs no HTTP/1.1-only twin for upgrades. An upgrade
+GET on a bridged tunnel is held to the CONNECT-host check like any bridged request
+(421 otherwise); on a bridged tunnel the splice is doubled, agent↔bridge and
+bridge↔origin.
+
+**What counts as an upgrade is both headers, on both sides, and neither check is a
+formality** — because the proxy *writes* the normalized pair, a predicate that is too
+loose does not merely miss a forward, it manufactures one:
+
+- **The request** needs `Connection: upgrade` as well as `Upgrade: websocket` (RFC
+  9110 §7.8: a recipient ignores `Upgrade` unless `Connection` lists it — the same
+  test `Request.requiresHTTP1` and ReverseProxy's `upgradeType` make). A bare
+  `Upgrade: websocket` with no `Connection` token takes the ordinary path and is
+  stripped. Honouring it would have the proxy forge a handshake the client never
+  sent and splice the origin's 101 onto a connection whose client is waiting for an
+  ordinary HTTP response — an opaque byte pipe no plugin inspects, from a request
+  that was not an upgrade.
+- **The response** must switch to the protocol that was asked for. A 101 only says
+  "switching"; its own `Upgrade` header says to what. An origin answering `101
+  Upgrade: h2c` to a WebSocket handshake is refused with 502 *before* the hijack —
+  while a status is still writable — rather than spliced, matching
+  `handleUpgradeResponse`, which rejects a `resUpType`/`reqUpType` mismatch.
+
+The 101 is hijacked and spliced onto the client's connection
+(`relayUpgradedWebSocket`, modelled on ReverseProxy's `handleUpgradeResponse`), and
+the session records the request row plus a paired 101 response row carrying both
+directions' byte counts, recorded after both splice directions end — `durationMs`
+covers the whole WebSocket session, `ttfbMs` the handshake. The frames after the 101
+are relayed byte for byte and never inspected or buffered, so no response plugin runs
+on a 101 and a body parser sees only the upgrade GET. A non-101 answer (an origin
+serving the bare GET, refusing the upgrade) takes the ordinary response path.
+
+Out of scope: WebSocket over HTTP/2 downstream (RFC 8441 Extended CONNECT) — a client
+that wants h2 websockets through the proxy gets its fallback path, same as before
+forwarding existed.
+
 #### Declining Responses API WebSockets (`listener.decline_responses_websockets`)
 
 The forward proxy answers a WebSocket upgrade on OpenAI's Responses API — a `GET` with
@@ -914,22 +962,70 @@ deployment.
 
 ```yaml
 listener:
-  decline_responses_websockets: false   # forward the upgrade instead, as before
+  decline_responses_websockets: false   # forward the upgrade for real
 ```
 
-The proxy cannot carry the WebSocket either way: `Upgrade` is hop-by-hop, so a
-forwarded handshake reaches the origin as a bare `GET`, which OpenAI's endpoint answers
-405. Codex — the one client known to use this transport — retries a 405 five times over
-about six seconds before falling back to HTTPS, and reads a 426 as "use HTTP" and falls
-back at once. `false` restores the forwarding byte for byte, for a client that reads a
-426 some other way. Every other WebSocket is forwarded whatever this says, including
-one to another host serving the same API (a LiteLLM gateway, OpenCode Zen, a local
-server): what a 426 means is only known for Codex against OpenAI, and another client
-might stop where today it falls back. Restart to
+The decline is a steer, not a capability gap: a forwarded Responses WebSocket works
+(the section above), but its frames are opaque to every plugin, so a Codex session
+moved onto one stops being parseable — no token counts, no cost. A 426 sends Codex
+straight to HTTPS, where its traffic stays observable; before forwarding existed the
+calculation was harsher still, because the stripped handshake drew a 405 that Codex
+retried for ~6s. `false` forwards the upgrade for real instead. The scope is exact —
+OpenAI's own hosts only — because what a 426 means is only known for Codex against
+OpenAI, and another client (or another host serving the same API: a LiteLLM gateway,
+OpenCode Zen, a local server) is forwarded whatever this says. Restart to
 apply, like every `listener.*` field. The key goes in the runtime config: on a laptop,
 `~/.cortex/config.yaml`, then `agentop service restart`; in a cluster, the
 `authbridge-runtime-config` ConfigMap, then a pod restart. See
 [`agents/codex.md`](agents/codex.md#what-cortex-shows-for-it) for the measured difference.
+
+#### Refusing private destinations (`listener.egress_guard`)
+
+Arms the forward proxy's SSRF dial guard (#1484): every destination the proxy
+dials — CONNECT tunnels, plain and bridged requests, transparent redirects,
+and `skip_hosts` traffic too, because a bypass must not become an SSRF bypass
+— is resolved **once**, refused with **403 `destination_private`** when the
+address is loopback, link-local (including the cloud metadata address
+`169.254.169.254`), RFC 1918 / unique-local space, RFC 6598 CGNAT shared
+space (`100.64.0.0/10`, where Alibaba's metadata service lives), or one of
+this host's own interface addresses — the addresses themselves, not their
+on-link subnets, so a LAN neighbour or a public neighbour on a large on-link
+prefix is not caught by that clause — and then **dialed at the checked
+address**. That last part is the DNS-rebinding defense: the address the guard
+checked and the address the proxy connects to are the same value by
+construction, so a second lookup can never re-answer between check and
+connect. A well-known-prefix NAT64 address (`64:ff9b::/96`) is judged by the
+IPv4 address it embeds, so `[64:ff9b::7f00:1]` is refused as the `127.0.0.1`
+it carries.
+
+```yaml
+listener:
+  egress_guard:
+    enabled: true
+    permit_cidrs: ["127.0.0.1/32"]   # prefixes within the refused space
+```
+
+**Off by default, deliberately.** A sidecar's ordinary upstreams — Keycloak,
+in-cluster services, a laptop's local model — live in exactly the refused
+space, so defaulting this on would break every existing deployment. Enable it
+where the sandbox's egress is meant to be public-only, and list the private
+prefixes still needed in `permit_cidrs`.
+
+`permit_cidrs` covers prefixes within the refused space only. Link-local,
+unspecified, multicast and the AWS IPv6 metadata address (`fd00:ec2::254`)
+are **never** permitted, whatever the list says: `0.0.0.0` reaches loopback
+on every mainstream stack, `169.254.169.254` is the metadata service this
+guard exists among other things to protect — a permit of `0.0.0.0/0` does not
+open it — and `fd00:ec2::254` is that service's IPv6 form, which would
+otherwise sit in the permit-able ULA space.
+
+A refused CONNECT leaves its two tunnel rows with
+`tunnelReason: "dest-private"` and `error.kind: "destination_private"`; a
+refused request leaves an ordinary response row with the same error kind.
+A permitted tunnel's open row carries `dialAddr`, the checked address that
+was dialed — the audit trail that pairs the name the client asked for with
+the address the proxy reached. Restart to apply, like every `listener.*`
+field. See `core/listener/egressguard` for the refusal set's exact rules.
 
 ---
 

@@ -169,6 +169,18 @@ type SessionEvent struct {
 	// it has a duration even though no response was ever recorded.
 	Duration time.Duration
 
+	// Ttfb is the wall-clock time from request entry into the listener
+	// (pctx.StartedAt) to the upstream's response HEADERS arriving — not to
+	// the first body byte, which no listener measures. Zero when the exchange
+	// failed before headers (and on every request-phase event), so Duration −
+	// Ttfb on a delivered response is how long the body took: for a streamed
+	// completion, the stream time. Duration alone cannot separate an origin
+	// that was slow to answer from one that answered and then streamed slowly
+	// (#1251) — an 11-minute response with a small ttfb says "the origin
+	// answered, then trickled", which is a different problem than a large one.
+	// Tunnel rows carry none: an opaque tunnel has no headers to time.
+	Ttfb time.Duration
+
 	// TLS, when non-nil, carries connection-level identity for events
 	// that arrived over TLS: negotiated version, cipher, and the peer's
 	// SPIFFE ID extracted from the URI SAN. Nil for plaintext events
@@ -239,6 +251,21 @@ type SessionEvent struct {
 	// previously required the proxy log, the CA's NotBefore and a process
 	// listing — none of which the timeline hinted at.
 	TunnelReason TunnelReason
+
+	// DialAddr is the address the proxy actually dialed for this event's
+	// destination, "ip:port", set by the listener when the egress guard is
+	// enabled (listener.egress_guard). It differs from Host whenever the
+	// destination was named: Host is what the request said, DialAddr is the
+	// resolved address the guard checked and the only address the connection
+	// can reach. On a DNS-rebindable name the two together are the audit trail
+	// — "asked for example.com, dialed 203.0.113.7" — and moca's egress
+	// conformance reads this field (its dial_addr) off the tunnel open row.
+	//
+	// Present only on a tunnel's open row: a plain or bridged request dials
+	// through the guarded transport too, but nothing threads the checked
+	// address back to its pctx, so its rows carry Host alone. Absent when the
+	// guard is off. Set only by the listener, never by a plugin.
+	DialAddr string
 
 	// UpgradeStripped names the protocol a client asked to switch to on a request
 	// whose Upgrade header the forward proxy removed — see
@@ -340,6 +367,25 @@ type SessionEvent struct {
 	//
 	// Client-asserted, with the same caveat as Client above.
 	ParentSubagent string
+
+	// Proc is the agent process the request belongs to, "<pid>.<start>", as process
+	// attribution named it (attribution.Attribution.Proc): the agent root of the client's
+	// chain, so a launcher and its worker are one. Empty where the listener could not name
+	// the process, which is everywhere but a loopback-bound install. It is what links a
+	// process's calls from before it named a session to that session when the list is read
+	// (session.Link), so it is recorded on rows in a session as well as on pending ones.
+	Proc string
+
+	// ClientProc is the client process itself when it differs from Proc: a worker naming the
+	// session its launcher (Proc) is attributed with. Only on a request that named its
+	// session. The fold records a span for it too, so the worker's own pending bucket links.
+	ClientProc string
+
+	// SessionHeader is the session-id header that named this row's session, "" when the
+	// session was not named by the request (process, affinity, ActiveSession). Recorded so
+	// the fold can tell which processes NAMED a session from those merely filed into it,
+	// which Link needs and the session's agent is decided by.
+	SessionHeader string
 }
 
 // TunnelReason is why an opaque tunnel stayed opaque.
@@ -423,13 +469,25 @@ const (
 	TunnelPassthroughHost   TunnelReason = "passthrough-host"
 	// TunnelDialFailed — the proxy could not reach the destination at all, so no
 	// tunnel ever opened. Recorded with a 502 close row carrying the dial error, so
-	// an unreachable destination shows in the timeline instead of leaving no trace.
+	// an unreachable destination shows in the timeline instead of leaving no trace —
+	// except where the TLS bridge is enabled for the connection's port: there the
+	// CONNECT is answered 200 first (a redirect can still send the request to a
+	// live server, #1595), and a bridge that then declines or falls open closes
+	// with that 200 and the dial error.
 	TunnelDialFailed TunnelReason = "dial-failed"
 	// TunnelPassthroughUnknown is the fallback when a lower layer declines to
 	// intercept for a reason this vocabulary does not yet name. It exists so that
 	// case can never produce the EMPTY string, which a consumer reads as "bridged" —
 	// the exact opposite of what happened, and invisible in a timeline.
 	TunnelPassthroughUnknown TunnelReason = "passthrough-unknown"
+	// TunnelDestPrivate — the egress guard refused the destination before any
+	// dial: it resolved to loopback, link-local (cloud metadata), RFC 1918 /
+	// unique-local space, or one of this host's own addresses, and no permit
+	// covered it (link-local is never permit-able). Recorded with a 403 close
+	// row carrying error.kind "destination_private" — the MOCA egress contract's
+	// identifier, used verbatim. Never confused with dial-failed: a refused
+	// destination was never attempted.
+	TunnelDestPrivate TunnelReason = "dest-private"
 )
 
 // EventTLS describes the TLS state of a connection that produced a
@@ -514,10 +572,17 @@ type sessionEventWire struct {
 	Host        string                     `json:"host,omitempty"`
 	// omitempty for the same skew reason as TunnelReason: an old agentop ignores the
 	// key, and an event from a proxy that predates redirects decodes to "".
-	RequestedHost string    `json:"requestedHost,omitempty"`
-	DurationMs    int64     `json:"durationMs,omitempty"`
-	TLS           *EventTLS `json:"tls,omitempty"`
-	Tunnel        bool      `json:"tunnel,omitempty"`
+	RequestedHost string `json:"requestedHost,omitempty"`
+	DurationMs    int64  `json:"durationMs,omitempty"`
+	// TtfbMs omitempty, like DurationMs: absence is the meaningful value. Zero
+	// means the exchange never got as far as response headers — the upstream
+	// timed out, was refused, or failed TLS — and a ttfb of 0ms would read as
+	// an instant answer instead. Same wire-skew safety as DurationMs: an old
+	// agentop ignores the key, and an event from a proxy that predates the
+	// field decodes to zero and omits.
+	TtfbMs int64     `json:"ttfbMs,omitempty"`
+	TLS    *EventTLS `json:"tls,omitempty"`
+	Tunnel bool      `json:"tunnel,omitempty"`
 	// omitempty so both skew directions are safe: an old agentop ignores an unknown
 	// key, and a new agentop against an old proxy sees "" and renders exactly what it
 	// renders today.
@@ -547,6 +612,15 @@ type sessionEventWire struct {
 	Subagent string `json:"subagent,omitempty"`
 	// omitempty: absent on every row but those of an agent another agent started.
 	ParentSubagent string `json:"parentSubagent,omitempty"`
+	// omitempty: absent wherever the listener could not name the client's process, and on
+	// every event recorded before the field existed.
+	Proc          string `json:"proc,omitempty"`
+	ClientProc    string `json:"clientProc,omitempty"`
+	SessionHeader string `json:"sessionHeader,omitempty"`
+	// omitempty: absent on every row the egress guard did not dial for — it is
+	// off by default, so the common row costs nothing — and the same skew
+	// reason as TunnelReason above.
+	DialAddr string `json:"dialAddr,omitempty"`
 }
 
 func (e SessionEvent) MarshalJSON() ([]byte, error) {
@@ -568,6 +642,7 @@ func (e SessionEvent) MarshalJSON() ([]byte, error) {
 		Host:            e.Host,
 		RequestedHost:   e.RequestedHost,
 		DurationMs:      e.Duration.Milliseconds(),
+		TtfbMs:          e.Ttfb.Milliseconds(),
 		TLS:             e.TLS,
 		Tunnel:          e.Tunnel,
 		TunnelReason:    e.TunnelReason,
@@ -579,6 +654,10 @@ func (e SessionEvent) MarshalJSON() ([]byte, error) {
 		Client:          e.Client,
 		Subagent:        e.Subagent,
 		ParentSubagent:  e.ParentSubagent,
+		Proc:            e.Proc,
+		ClientProc:      e.ClientProc,
+		SessionHeader:   e.SessionHeader,
+		DialAddr:        e.DialAddr,
 	})
 }
 
@@ -608,6 +687,7 @@ func (e *SessionEvent) UnmarshalJSON(data []byte) error {
 		Host:            w.Host,
 		RequestedHost:   w.RequestedHost,
 		Duration:        time.Duration(w.DurationMs) * time.Millisecond,
+		Ttfb:            time.Duration(w.TtfbMs) * time.Millisecond,
 		TLS:             w.TLS,
 		Tunnel:          w.Tunnel,
 		TunnelReason:    w.TunnelReason,
@@ -619,6 +699,10 @@ func (e *SessionEvent) UnmarshalJSON(data []byte) error {
 		Client:          w.Client,
 		Subagent:        w.Subagent,
 		ParentSubagent:  w.ParentSubagent,
+		Proc:            w.Proc,
+		ClientProc:      w.ClientProc,
+		SessionHeader:   w.SessionHeader,
+		DialAddr:        w.DialAddr,
 	}
 	return nil
 }
@@ -645,6 +729,15 @@ type EventError struct {
 // usage does not count it as an error, and the Finisher sees an allow.
 const ErrorKindUpgradeDeclined = "upgrade_declined"
 
+// ErrorKindDestinationPrivate is the egress guard refusing a destination that
+// resolved into loopback, link-local, private or this host's own address space
+// (listener.egress_guard), rendered as 403 destination_private. Like
+// upgrade_declined it rides on an EventError to say whose answer a 4xx is, and
+// usage does not count it as an error: the guard did what it was configured to.
+// The string is the MOCA egress contract's identifier, used verbatim so the
+// shared conformance suite matches without a translation table.
+const ErrorKindDestinationPrivate = "destination_private"
+
 // SessionSource is how a listener resolved Context.Session.
 type SessionSource string
 
@@ -663,6 +756,11 @@ const (
 	SessionSourceAffinity SessionSource = "affinity"
 	// SessionSourceActive: the most recently active session.
 	SessionSourceActive SessionSource = "active"
+	// SessionSourceConnection: the listener's own trusted answer, resolved
+	// from how the connection arrived rather than anything the client sent
+	// (which per-VM socket accepted it, vmcontrol). Client-asserted headers
+	// cannot override it.
+	SessionSourceConnection SessionSource = "connection"
 )
 
 // SessionView is a read-only snapshot of a session, safe to pass to plugins.

@@ -23,6 +23,9 @@ import (
 	"time"
 
 	"errors"
+	"github.com/rossoctl/cortex/core/attribution"
+	"github.com/rossoctl/cortex/core/listener/egressallow"
+	"github.com/rossoctl/cortex/core/listener/egressguard"
 	"github.com/rossoctl/cortex/core/listener/httpx"
 	"github.com/rossoctl/cortex/core/listener/internal/bodycount"
 	"github.com/rossoctl/cortex/core/listener/internal/bodyread"
@@ -115,6 +118,19 @@ type Server struct {
 	// motivation.
 	SkipHosts *skiphost.Matcher
 
+	// EgressAllow, when non-nil, is the deny-by-default destination allow
+	// list (#1483, MOCA MI1 §8.5): an outbound destination not on the list
+	// is refused with 403 destination_denied naming the host, before the
+	// pipeline and before DNS resolution or any dial — the moca egress
+	// conformance contract's refusal shape (header X-Moca-Egress-Error,
+	// text/plain body "destination_denied: <host>\n"). Applied to CONNECT
+	// targets, absolute-form http:// hosts, and the target a plugin's
+	// redirect moved a request to. Checked BEFORE SkipHosts: when the list
+	// is on it is the outer boundary, and a skip_hosts entry for an off-list
+	// host must not turn a bypass into an egress bypass. nil keeps the
+	// listener's behavior unchanged; see config.ListenerConfig.EgressAllowHosts.
+	EgressAllow *egressallow.Matcher
+
 	TLSBridge *tlsbridge.Engine // nil = disabled; set by caller after NewServer
 
 	// SessionIDHeaders are the request headers consulted, in order, for a
@@ -139,14 +155,50 @@ type Server struct {
 	// for byte.
 	DeclineResponsesWebSockets bool
 
+	// EgressGuard, when non-nil, checks every destination this proxy dials —
+	// CONNECT tunnels, plain and bridged requests, transparent redirects, and
+	// skip_hosts traffic included, because a bypass must not become an SSRF
+	// bypass — against the refusal set in core/listener/egressguard: resolved
+	// once, refused with 403 destination_private when the address is loopback,
+	// link-local, RFC 1918 / unique-local, or one of this host's own addresses
+	// and no permit covers it, and dialed at the checked address so a second
+	// resolution can never re-answer (the DNS-rebinding window). nil keeps the
+	// listener's dial behavior unchanged; see WithEgressGuard and
+	// config.ListenerConfig.EgressGuard.
+	EgressGuard *egressguard.Guard
+
 	// Processes, when non-nil, names the process behind each client connection, and a
 	// request with no session header is filed under that process's session — or its
-	// nearest ancestor's — before client affinity is consulted; see
-	// session.Store.SessionForProcess. Set only where every client is a process on this
+	// nearest ancestor's — before client affinity is consulted; see core/attribution. Set only where every client is a process on this
 	// host (session.process_attribution) and only from a resolver whose self-test passed
 	// (peerproc.New). The http.Server must carry ConnContext. nil keeps today's
 	// resolution byte for byte.
 	Processes peerproc.Resolver
+
+	// TrustedSessionID, when set, is the listener's own answer to "which
+	// session is this request on" — resolved from how the connection arrived
+	// (which per-VM socket accepted it, vmcontrol), not from anything the
+	// client sent. A non-empty answer wins over every header- and
+	// process-derived id, and the client's own session headers never override
+	// it. #1476 will generalise this into full connection-derived identity;
+	// this is deliberately the narrow seam it needs.
+	TrustedSessionID func(r *http.Request) string
+
+	// AdoptBridgedRequest, when set, re-applies a connection-derived identity
+	// to each request a TLS-bridged tunnel decrypts, given the CONNECT that
+	// opened it. It exists because a bridged request is NOT the CONNECT: the
+	// bytes are re-parsed into fresh *http.Requests inside tlsbridge.ServeConn's
+	// own http.Server, so neither the CONNECT's context nor any header the
+	// accepting listener stripped survives into them. A listener that derives
+	// identity from the connection (vmcontrol: which per-VM socket accepted it)
+	// must therefore be given a second chance to stamp it, or TrustedSessionID
+	// answers "" on the decrypted request and resolution falls through to the
+	// guest's own session headers — which is the whole seam inverted.
+	//
+	// connect is the CONNECT request as the listener's wrapper saw it, so a
+	// hook can read the identity it stamped there; r is the decrypted request
+	// to decorate. The returned request replaces r.
+	AdoptBridgedRequest func(connect, r *http.Request) *http.Request
 
 	// bufferedFallbackOnce keeps the SSE-buffered-path notice to one line per
 	// process; the condition is a supported chain shape, not an error.
@@ -158,6 +210,10 @@ type Server struct {
 	// chainOverrideLogged holds the session header names hydrateSession has
 	// reported naming a session other than the process chain's.
 	chainOverrideLogged sync.Map
+
+	// attr is the Server's attribution, built once by attributor.
+	attributorOnce sync.Once
+	attr           *attribution.Attributor
 
 	// Bridge-health counters. When the TLS bridge is enabled but the client
 	// does not trust its CA, every HTTPS request opens a CONNECT tunnel and
@@ -177,6 +233,11 @@ type Server struct {
 	caFingerprintStr  string
 	bridgeWarnOnce    sync.Once
 	bridgeWarned      atomic.Bool
+
+	// dialMu guards dialFails, the memo of failed CONNECT pre-dials (dialUpstream).
+	// Lazy: the Server can be built as a literal in tests.
+	dialMu    sync.Mutex
+	dialFails map[string]dialFailMemo
 }
 
 // MTLSOptions configures outbound mTLS for the forward proxy. When
@@ -202,14 +263,44 @@ type MTLSOptions struct {
 	Metrics *authtls.Metrics
 }
 
+// Option configures optional forward-proxy behavior in NewServer. Variadic so
+// the core constructor signature — and every existing caller — is unchanged.
+type Option func(*options)
+
+type options struct {
+	egress *egressguard.Guard
+}
+
+// WithEgressGuard arms the SSRF dial guard (#1484): every destination the
+// proxy dials is resolved once, refused with 403 destination_private when it
+// lands in loopback / link-local / private / this host's own address space
+// uncovered by a permit, and dialed at the checked address so DNS rebinding
+// cannot re-answer between the check and the connect. Applies to CONNECT
+// tunnels (Server.EgressGuard, checked in handleConnect and the transparent
+// listener) and to every request the transport dials, mTLS included — under
+// mTLS the check runs before the TCP connect, so the TLS handshake never
+// reaches a refused address. A nil guard is accepted and keeps the dial
+// behavior unchanged.
+func WithEgressGuard(g *egressguard.Guard) Option {
+	return func(o *options) { o.egress = g }
+}
+
 // NewServer creates a forward proxy server with a default HTTP client.
 // When mtls is non-nil, every outbound dial does TLS-or-fail using the
 // local SVID; see MTLSOptions for semantics.
-func NewServer(outbound *pipeline.Holder, sessions *session.Store, mtls *MTLSOptions) (*Server, error) {
+func NewServer(outbound *pipeline.Holder, sessions *session.Store, mtls *MTLSOptions, opts ...Option) (*Server, error) {
+	var o options
+	for _, opt := range opts {
+		opt(&o)
+	}
+
 	transport := &http.Transport{
 		// Sane Go defaults for everything except DialContext, which we
 		// customize when mTLS is on.
-		MaxIdleConns:          100,
+		MaxIdleConns: 100,
+		// Go's default is 2, which churns connections when more than two
+		// callers share an h1-only upstream (LiteLLM, Keycloak).
+		MaxIdleConnsPerHost:   100,
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
@@ -232,12 +323,17 @@ func NewServer(outbound *pipeline.Holder, sessions *session.Store, mtls *MTLSOpt
 		if err != nil {
 			return nil, fmt.Errorf("forwardproxy: build client tls config: %w", err)
 		}
-		transport.DialContext = mtlsDialer(tlsCfg, mtls.Metrics).DialContext
+		// The guard sits INSIDE the mTLS dialer: check first, then connect,
+		// then handshake — a refused address never gets a TLS ClientHello.
+		transport.DialContext = mtlsDialer(tlsCfg, mtls.Metrics).withGuard(o.egress).DialContext
+	} else if o.egress != nil {
+		transport.DialContext = o.egress.DialContext
 	}
 
 	return &Server{
 		OutboundPipeline: outbound,
 		Sessions:         sessions,
+		EgressGuard:      o.egress,
 		Client: &http.Client{
 			// No Client.Timeout — Go applies that to the entire
 			// request lifecycle including body read, which kills
@@ -259,6 +355,10 @@ type mtlsDialFunc struct {
 	plain   *net.Dialer
 	tlsCfg  *cryptotls.Config
 	metrics *authtls.Metrics
+	// egress, when non-nil, checks the destination before the plain dial —
+	// the TLS handshake is the step after the connect, so it never reaches an
+	// address the guard refused. nil keeps the unguarded dial.
+	egress *egressguard.Guard
 }
 
 func mtlsDialer(cfg *cryptotls.Config, metrics *authtls.Metrics) *mtlsDialFunc {
@@ -269,8 +369,27 @@ func mtlsDialer(cfg *cryptotls.Config, metrics *authtls.Metrics) *mtlsDialFunc {
 	}
 }
 
+// withGuard returns d with the egress guard set. A nil guard is fine: the
+// dialer then behaves exactly as without it, which is why NewServer can pass
+// o.egress unconditionally under mTLS.
+func (d *mtlsDialFunc) withGuard(g *egressguard.Guard) *mtlsDialFunc {
+	d.egress = g
+	return d
+}
+
 func (d *mtlsDialFunc) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
-	plain, err := d.plain.DialContext(ctx, network, addr)
+	// SNI below reads the ORIGINAL addr, so the name the request used stays
+	// the handshake's ServerName; only the TCP connect follows the checked
+	// address. A literal destination is its own checked address.
+	dialAddr := addr
+	if d.egress != nil {
+		checked, err := d.egress.CheckAddr(ctx, network, addr)
+		if err != nil {
+			return nil, err
+		}
+		dialAddr = checked
+	}
+	plain, err := d.plain.DialContext(ctx, network, dialAddr)
 	if err != nil {
 		// TCP failure — separate bug class from "peer doesn't speak TLS".
 		// Returned as-is so callers see the underlying dial error.
@@ -325,6 +444,9 @@ func (s *Server) serveOutbound(w http.ResponseWriter, r *http.Request, tl *tunne
 	if isBridge {
 		s.bridgedRequests.Add(1)
 	}
+	// Before anything reads the headers: a client must not assert its own attribution, and
+	// no hop in front of this listener is trusted to (attribution.Strip).
+	attribution.Strip(r.Header)
 	pctx := &pipeline.Context{
 		Direction: pipeline.Outbound,
 		Method:    r.Method,
@@ -345,6 +467,19 @@ func (s *Server) serveOutbound(w http.ResponseWriter, r *http.Request, tl *tunne
 	// — and silent on the day one does, which is why it is pinned rather than watched.
 	pctx.ResolveClient()
 
+	// The connection's own answer to "which session", resolved HERE rather than at
+	// hydration, because a request can be refused before it ever reaches hydration
+	// — an off-list egress destination, a body too large to buffer, a bridged
+	// request whose Host is not its tunnel's. Each of those records a row, and a
+	// row filed by header/process/ActiveSession() for a VM whose identity the
+	// connection already settled lands in another VM's session or in `default`:
+	// the denied-egress event you most want attributed correctly, attributed to
+	// someone else. Resolving once up here and threading it into every recording
+	// site is what makes "identity from the connection wins over every header- and
+	// process-derived id" true for refusals too, not just for requests that make
+	// it to the pipeline (#1569 review).
+	trusted := s.trustedSessionOf(r)
+
 	// A bridged request is dialed to the tunnel's authority, so policy must judge that
 	// host. The client chose both the CONNECT target and the Host header, and a Host
 	// naming anywhere else would have every host-keyed plugin, skip_hosts included,
@@ -358,6 +493,31 @@ func (s *Server) serveOutbound(w http.ResponseWriter, r *http.Request, tl *tunne
 			s.refuseMisdirected(w, r, pctx, tl)
 			return
 		}
+	}
+
+	// Egress allow list (#1483), the request-path half: a plain (non-bridged)
+	// absolute-form request is judged on its dial target, r.URL.Host, the same
+	// boundary the CONNECT gate holds — before SkipHosts (the allowlist is the
+	// outer boundary; a skip entry must not turn a bypass into an egress
+	// bypass), before the pipeline, and before the transport resolves or dials
+	// anything. A bridged request is not re-judged here: its destination was
+	// gated at its CONNECT, and the misdirected check above pins its Host to
+	// that same authority. Plain WriteRejection for the same reason as there:
+	// the named 403 is the contract, not something to re-frame for MCP.
+	if !isBridge && s.EgressAllow != nil && r.URL.Host != "" && !s.EgressAllow.Allows(r.URL.Host, r.URL.Scheme) {
+		host := hostOnly(r.URL.Host)
+		action := egressAllowRefusal(pctx, host)
+		chain := s.clientChain(r)
+		s.recordOutboundRejectIn(tl, pctx, action, s.recordingSessionID(trusted, r.Header, chain))
+		// Sanitized: host (the URL authority), Method and Path are all client-controlled,
+		// and a control rune forged into any of them would forge a log entry — the same
+		// CWE-150 shape #1539's egress guard was flagged for.
+		slog.Info("forward-proxy: destination refused by egress allow list",
+			"host", pipeline.SanitizeLogValue(host),
+			"method", pipeline.SanitizeLogValue(r.Method),
+			"path", pipeline.SanitizeLogValue(r.URL.Path))
+		httpx.WriteRejection(w, action)
+		return
 	}
 
 	// Every request that reaches here is re-originated from pctx below, plain or
@@ -382,12 +542,12 @@ func (s *Server) serveOutbound(w http.ResponseWriter, r *http.Request, tl *tunne
 	pat, skipped := s.SkipHosts.MatchPattern(pctx.Host)
 	if skipped {
 		slog.Info("forward-proxy: skip_hosts match — bypassing pipeline + session recording",
-			"host", pctx.Host, "pattern", pat, "method", r.Method, "path", r.URL.Path)
+			"host", pipeline.SanitizeLogValue(pctx.Host), "pattern", pat, "method", r.Method, "path", pipeline.SanitizeLogValue(r.URL.Path))
 	}
 
 	// The client's process, looked up once per connection; nil when process attribution
 	// is off or the lookup failed, and then resolution is exactly as without it.
-	var chain []session.Proc
+	var chain []attribution.Proc
 	if !skipped {
 		chain = s.clientChain(r)
 	}
@@ -421,7 +581,7 @@ func (s *Server) serveOutbound(w http.ResponseWriter, r *http.Request, tl *tunne
 		}
 		r.Body = io.NopCloser(bytes.NewReader(body))
 		pctx.Body = body
-		slog.Debug("forward-proxy: buffered request body", "host", r.Host, "bodyLen", len(body))
+		slog.Debug("forward-proxy: buffered request body", "host", pipeline.SanitizeLogValue(r.Host), "bodyLen", len(body))
 	}
 
 	// Establish the session identity ONCE, here, and keep it in a local: the
@@ -437,9 +597,15 @@ func (s *Server) serveOutbound(w http.ResponseWriter, r *http.Request, tl *tunne
 	// its paired response — which resolveOutboundSessionID's own contract forbids,
 	// and which would fail invisibly. The listener's answer wins; the pin is
 	// assigned from this local after the pipeline has run.
+	// The store's absence gates the header/process resolution, not the trusted
+	// answer: that one costs no store (sessionViewFor falls back to an ID-only
+	// view) and is the VM's identity, which plugins must see whether or not
+	// anyone is recording events. Throwing it away under `session.enabled:
+	// false` would quietly un-identify every VM in a MOCA deployment that turned
+	// the store off (#1569 review).
 	var sessionID string
-	if !skipped && s.Sessions != nil {
-		sessionID = s.hydrateSession(pctx, r.Header, chain)
+	if !skipped && (s.Sessions != nil || trusted != "") {
+		sessionID = s.hydrateSession(pctx, trusted, r.Header, chain)
 	}
 
 	if !skipped {
@@ -480,13 +646,25 @@ func (s *Server) serveOutbound(w http.ResponseWriter, r *http.Request, tl *tunne
 		}
 	}
 
+	// A WebSocket upgrade is the one hop-by-hop request this proxy forwards
+	// (#1488): the CONNECT-host check above has already held a bridged request to
+	// its tunnel's destination, the pipeline has run, and what is left is to hand
+	// the header across and splice the 101. Every other protocol named in Upgrade
+	// keeps the strip, and so does the one WebSocket this proxy declines — the
+	// Responses-API case below, which answers 426 itself.
+	forwardUpgrade := upgradesToWebSocket(r.Header) &&
+		!(s.DeclineResponsesWebSockets && wantsResponsesWebSocket(r))
+
 	// Before the request row is recorded, 20-odd lines below, and NOT down beside
 	// stripForUpstream where the strip itself happens — the row is appended first,
 	// so a field set after it is set on nothing. (It was, and three unit tests
 	// driving this method directly all passed while the feature recorded nothing
-	// end to end.) Reading it here is equivalent: the strip is unconditional, so an
-	// Upgrade present on the inbound request is one that will be removed.
-	pctx.RecordStrippedUpgrade(r.Header)
+	// end to end.) Reading it here is equivalent: an Upgrade present on the
+	// inbound request is one the strip below will remove, because the one case it
+	// is kept is exactly the case excluded by forwardUpgrade above.
+	if !forwardUpgrade {
+		pctx.RecordStrippedUpgrade(r.Header)
+	}
 
 	// After the pipeline, so a plugin's reject still wins; before any row, since this
 	// records its own pair. See declineResponsesWebSocket.
@@ -504,7 +682,7 @@ func (s *Server) serveOutbound(w http.ResponseWriter, r *http.Request, tl *tunne
 		// streaming inference response away from its request's session.
 		pctx.OutboundSessionID = sid
 		if chain != nil {
-			defer s.Sessions.TouchProcess(sid, chain)
+			defer s.touch(sid, chain)
 		}
 		// Record EVERY message that reaches the pipeline — even when no
 		// plugin acted and no parser matched (Invocations/MCP/Inference all
@@ -524,39 +702,120 @@ func (s *Server) serveOutbound(w http.ResponseWriter, r *http.Request, tl *tunne
 	// x-api-key). Content-Length / Content-Encoding are managed by the
 	// body-rewrite block below and the transport, so leave them untouched.
 	// Mirrors reverseproxy's forwarded-request header sync.
-	syncHeaders(r, pctx.Headers)
+	httpx.SyncRequestHeaders(r, pctx.Headers)
 
 	// If a WritesRequestBody plugin rewrote pctx.Body, ship the new bytes
 	// upstream and clear Content-Encoding (see forwardproxy response
 	// path for the rationale).
 	if pctx.BodyMutated() {
-		setBody(r, pctx.Body)
+		httpx.SetRequestBody(r, pctx.Body)
 	}
 
-	ownEncoding := !skipped && (s.OutboundPipeline.NeedsResponseBody() || s.OutboundPipeline.HasStreamingResponders())
-	stripForUpstream(r, ownEncoding)
+	// The pipeline this request runs on for the rest of the handler: every
+	// capability probe below (encoding, streaming, buffering) must answer
+	// for it, not whatever a mid-request reload left in the Holder — the
+	// path the listener picks has to match the pipeline the response
+	// phases dispatch on. Nil-pinned (skipped requests never ran Run)
+	// falls back to the current pipeline (Holder.ForPctx).
+	pinned := s.OutboundPipeline.ForPctx(pctx)
+
+	ownEncoding := !skipped && (pinned.NeedsResponseBody() || pinned.HasStreamingResponders())
+	stripForUpstream(r, ownEncoding, forwardUpgrade)
 
 	// Clear RequestURI — set by the server but must be empty for client requests
 	r.RequestURI = ""
 
+	// Egress allow list, redirect re-check (#1483): a plugin's redirect —
+	// inference-router moves requests between model servers — can change the
+	// dial target after the gate at the top of this function passed it, and
+	// deny-by-default means the DIAL TARGET is what counts, not the host the
+	// client named. An off-list redirect target is refused here, before the
+	// exchange: the request row has already landed above, and this denial row
+	// follows it. Unconditional rather than only-when-redirected, so the
+	// invariant "nothing dials off-list" holds by one check at the dial
+	// rather than by reasoning about every path that can reach it.
+	if s.EgressAllow != nil && !s.EgressAllow.Allows(r.URL.Host, r.URL.Scheme) {
+		host := hostOnly(r.URL.Host)
+		action := egressAllowRefusal(pctx, host)
+		s.recordOutboundRejectIn(tl, pctx, action, s.recordingSessionID(sessionID, r.Header, chain))
+		// A delivered answer, not a failed exchange — the 426 rule: the deferred
+		// RunFinish reads zero StatusCode as OutcomeError, and the allowlist
+		// refusing an off-list redirect is the policy working, not a failure.
+		pctx.StatusCode = http.StatusForbidden
+		// Sanitized like the gate at the top of this function: both hosts are
+		// client-controlled (pctx.Host is the one the client named, pre-redirect).
+		slog.Info("forward-proxy: destination refused by egress allow list (redirect re-check)",
+			"host", pipeline.SanitizeLogValue(host),
+			"requested", pipeline.SanitizeLogValue(pctx.Host))
+		httpx.WriteRejection(w, action)
+		return
+	}
+
 	client := s.Client
 	if isBridge && s.TLSBridge != nil {
+		// No upgrade-specific client, though this one negotiates h2: net/http
+		// pins a WebSocket upgrade to HTTP/1.1 on its own (Request.requiresHTTP1
+		// matches the Connection/Upgrade pair stripForUpstream just normalized
+		// to), so the exchange rides this client as HTTP/1.1.
 		client = s.TLSBridge.Upstream
 	}
 	resp, err := client.Do(r)
-	if err == nil && !skipped {
+	// A Resender reads refused answers, and a 101 is not one — it is the upgrade
+	// succeeding. Peeking at its (empty) body and sending the GET again would tear
+	// down the connection the origin just switched, so a forwarded upgrade never
+	// resends.
+	//
+	// THE RULE IS KEYED ON THE REQUEST, NOT THE ANSWER, so it also covers an
+	// upgrade the origin DECLINED with a non-101 (401/403/429 — those take the
+	// ordinary response path, and a Resender does not see them here). That is
+	// deliberate, and narrowing this to `resp.StatusCode != 101` would break it:
+	// the resend path strips the Upgrade pair (`stripForUpstream(again,
+	// ownEncoding, false)`), so the second attempt would reach the origin as a
+	// bare GET — not the handshake the client sent, and on an endpoint that only
+	// answers an upgrade, not a request worth making. A re-auth that cannot carry
+	// the upgrade cannot rescue the upgrade; the client retries the handshake
+	// itself, with whatever credential it has now. Left as a request-keyed rule
+	// rather than made cleverer (#1549 review).
+	if err == nil && !skipped && !forwardUpgrade {
 		resp, err = s.resendIfAsked(r, pctx, client, resp, tl, ownEncoding)
 	}
 	if err != nil {
+		// The egress guard's refusal, BEFORE the generic 502: a destination that
+		// resolved into refused space is a policy answer (403 destination_private),
+		// not a failed exchange. errors.As traverses the *url.Error client.Do wraps
+		// every dial error in; see TransportError's note on that wrapping.
+		var ref *egressguard.Refusal
+		if errors.As(err, &ref) {
+			slog.Debug("forward-proxy: destination refused by egress guard",
+				// Sanitized: Host and Method are client-controlled, and a newline
+				// forged into either would forge a log entry (#1539's CodeQL finding).
+				"host", pipeline.SanitizeLogValue(r.Host),
+				"method", pipeline.SanitizeControlRunes(r.Method), "addr", ref.Addr.String())
+			// The listener's standard rejection shape, code verbatim from the MOCA
+			// egress contract so the shared conformance suite matches.
+			httpx.WriteRejection(w, pipeline.DenyStatus(http.StatusForbidden, "destination_private",
+				fmt.Sprintf("refusing to reach private destination %s (%s)", ref.Host, ref.Addr)))
+			// A delivered answer, not a failed exchange — the 426 rule: the Finisher
+			// reads non-zero StatusCode as an allow, and the guard did what it was
+			// configured to. usage keys off EventError.Kind, which stays set below.
+			pctx.StatusCode = http.StatusForbidden
+			if !skipped {
+				s.recordOutboundResponseEvent(pctx, http.StatusForbidden, &pipeline.EventError{
+					Kind:    pipeline.ErrorKindDestinationPrivate,
+					Message: ref.Error(),
+				})
+			}
+			return
+		}
 		// A 502 with the cause, or a 499 when the client hung up first — which,
 		// with no timeout on this client, is how a hung upstream usually ends.
 		// See pipeline.ExchangeFailure.
 		status, fail := pipeline.ExchangeFailure(r.Context(), err)
 		if r.Context().Err() != nil {
-			slog.Debug("forward-proxy: client went away before the upstream answered", "host", r.Host, "method", r.Method)
+			slog.Debug("forward-proxy: client went away before the upstream answered", "host", pipeline.SanitizeLogValue(r.Host), "method", r.Method)
 		} else {
 			// fail.Message, not err: err's text quotes the request URL, query and all.
-			slog.Warn("forward-proxy: upstream request failed", "host", r.Host, "method", r.Method, "kind", fail.Kind, "error", fail.Message)
+			slog.Warn("forward-proxy: upstream request failed", "host", pipeline.SanitizeLogValue(r.Host), "method", r.Method, "kind", fail.Kind, "error", fail.Message)
 		}
 		http.Error(w, `{"error":"bad gateway"}`, http.StatusBadGateway)
 		// Without this the request event is the only trace, and a row with no
@@ -572,11 +831,31 @@ func (s *Server) serveOutbound(w http.ResponseWriter, r *http.Request, tl *tunne
 		}
 		return
 	}
+
+	// The 101: the origin took the upgrade. Hand both connections to a splice and
+	// get out of the way (#1488). The caller's resp.Body.Close() below must NOT
+	// run — the body IS the origin's connection now, and the splice owns closing
+	// it. Anything else the origin answered (a 200 serving the bare GET, a 4xx
+	// from an endpoint that does not upgrade) falls through to the ordinary
+	// response path, headers and body relayed as usual.
+	if forwardUpgrade && resp.StatusCode == http.StatusSwitchingProtocols {
+		pctx.ResponseHeadersAt = time.Now()
+		s.relayUpgradedWebSocket(w, r, pctx, resp, !skipped)
+		return
+	}
 	defer resp.Body.Close()
 
 	// Response phase: populate pctx and run plugins in reverse order.
 	pctx.StatusCode = resp.StatusCode
 	pctx.ResponseHeaders = resp.Header.Clone()
+	// Taken HERE and not where client.Do returned, because a resend
+	// (resendIfAsked above) discards that response and re-issues the exchange:
+	// the figure the response row should carry is for the response the client
+	// actually got. Both proxy listeners measure at the same point in their
+	// own flow — the moment the delivered response's headers are in hand —
+	// so ttfb means one thing wherever a row reports it. Stays zero on the
+	// error path above, where no headers ever arrived (#1251).
+	pctx.ResponseHeadersAt = time.Now()
 
 	// BytesDown for the response row (#1309), counted HERE and nowhere else. Every
 	// arm below reads this one body — buffered whole, relayed SSE block by block, relayed
@@ -587,12 +866,13 @@ func (s *Server) serveOutbound(w http.ResponseWriter, r *http.Request, tl *tunne
 	// with what extproc reports for the same response without each having to
 	// count: see bodycount.
 	//
-	// What the wrapper does NOT reach is the final io.Copy at the bottom of this
-	// function — the arm a response takes when nothing buffered it and it was not
-	// streamed. The row is recorded above that copy, so those bytes are counted
-	// after the figure has been read and the row reports zero, which agentop
-	// renders blank rather than wrong. reverseproxy's unbuffered relay has the same
-	// shape for the same reason.
+	// The final io.Copy at the bottom of this function — the arm a response takes
+	// when nothing buffered it and it was not streamed — reads through this
+	// wrapper, and the row is recorded below that copy, so the count is complete
+	// when the figure is read. What the wrapper still does not reach is a SKIPPED
+	// response's row: skip_hosts records nothing at all. reverseproxy's
+	// unbuffered relay defers its row to the end of its copy the same way
+	// (recordOnEOFBody).
 	resp.Body = bodycount.Wrap(resp.Body, &pctx.ResponseBytes)
 
 	// SkipHosts: bypass response-phase pipeline + recording entirely.
@@ -615,8 +895,8 @@ func (s *Server) serveOutbound(w http.ResponseWriter, r *http.Request, tl *tunne
 		// `{"detail":"Method Not Allowed"}` arrived as the literal string "Unknown error"
 		// once isKnownMislabeledSSE started matching every status, not just success.
 		mislabeled := resp.StatusCode/100 == 2 && isKnownMislabeledSSE(r.Host, r.URL.Path)
-		if (isEventStream(resp.Header.Get("Content-Type")) || mislabeled) && resp.Body != nil {
-			if s.OutboundPipeline.WritesResponseBody() {
+		if (httpx.IsEventStream(resp.Header.Get("Content-Type")) || mislabeled) && resp.Body != nil {
+			if pinned.WritesResponseBody() {
 				// A response mutator needs the whole response to rewrite it, so
 				// it can't stream — fall back to the buffered path with a warning.
 				// A request-only mutator does NOT land here: it never touches
@@ -625,9 +905,9 @@ func (s *Server) serveOutbound(w http.ResponseWriter, r *http.Request, tl *tunne
 				// supported configuration (cpex, sparc), not a misconfiguration, so
 				// warning every request is log spam at request rate.
 				s.bufferedFallbackOnce.Do(func() {
-					slog.Info("forward-proxy: text/event-stream responses will use the buffered path — a WritesResponseBody plugin is in the chain", "host", r.Host)
+					slog.Info("forward-proxy: text/event-stream responses will use the buffered path — a WritesResponseBody plugin is in the chain", "host", pipeline.SanitizeLogValue(r.Host))
 				})
-			} else if s.OutboundPipeline.HasStreamingResponders() {
+			} else if pinned.HasStreamingResponders() {
 				// Streaming-aware plugins (inference-parser, a2a-parser) read each
 				// SSE event's payload; handleStreamingResponse forwards the
 				// upstream bytes unchanged.
@@ -652,15 +932,15 @@ func (s *Server) serveOutbound(w http.ResponseWriter, r *http.Request, tl *tunne
 				// HasStreamingResponders — a request-only mutator can still be here —
 				// so ask about the response side specifically rather than asserting
 				// what NeedsBody implies.
-				if s.OutboundPipeline.NeedsResponseBody() {
-					slog.Warn("forward-proxy: text/event-stream response with a ReadsBody plugin that is not a StreamingResponder — streaming byte-for-byte; its OnResponse will see an empty body (implement StreamingResponder to inspect a streamed body)", "host", r.Host)
+				if pinned.NeedsResponseBody() {
+					slog.Warn("forward-proxy: text/event-stream response with a ReadsBody plugin that is not a StreamingResponder — streaming byte-for-byte; its OnResponse will see an empty body (implement StreamingResponder to inspect a streamed body)", "host", pipeline.SanitizeLogValue(r.Host))
 				}
 				s.streamPassthrough(w, r, resp, pctx)
 				return
 			}
 		}
 
-		if s.OutboundPipeline.NeedsResponseBody() && resp.Body != nil {
+		if pinned.NeedsResponseBody() && resp.Body != nil {
 			respBody, ok := s.bufferResponseBody(w, r, resp, pctx)
 			if !ok {
 				return
@@ -695,7 +975,7 @@ func (s *Server) serveOutbound(w http.ResponseWriter, r *http.Request, tl *tunne
 		// as one last=true frame so plugins finalize their running state.
 		// Plugins that didn't migrate — i.e. don't implement
 		// StreamingResponder — are unaffected (RunResponseFrame skips them).
-		if s.OutboundPipeline.HasStreamingResponders() && resp.Body != nil {
+		if pinned.HasStreamingResponders() && resp.Body != nil {
 			// Its own budget, per the rule above.
 			finalCtx, cancelFinal := httpx.TeardownContext(r.Context())
 			defer cancelFinal()
@@ -718,26 +998,52 @@ func (s *Server) serveOutbound(w http.ResponseWriter, r *http.Request, tl *tunne
 			resp.Header.Del("Content-Encoding")
 		}
 
-		s.recordOutboundResponseEvent(pctx, resp.StatusCode, nil)
 	}
 
-	for key, values := range resp.Header {
-		for _, value := range values {
-			w.Header().Add(key, value)
-		}
-	}
+	copyResponseHeaders(w, resp)
 	w.WriteHeader(resp.StatusCode)
 	// A skipped response of unknown length — an event stream, a long poll — is relayed as
 	// it arrives, as httputil.ReverseProxy does; buffered, its first bytes would wait for
 	// the next 4KB. skip_hosts never sent one here, but self-traffic does: OpenCode's TUI
 	// follows its service's event stream through this path.
 	var dst io.Writer = w
-	if f, ok := w.(http.Flusher); ok && skipped && (resp.ContentLength == -1 || isEventStream(resp.Header.Get("Content-Type"))) {
+	if f, ok := w.(http.Flusher); ok && skipped && (resp.ContentLength == -1 || httpx.IsEventStream(resp.Header.Get("Content-Type"))) {
 		f.Flush()
 		dst = flushWriter{w: w, f: f}
 	}
+	var streamFail *pipeline.EventError
 	if _, err := io.Copy(dst, resp.Body); err != nil {
-		slog.Debug("response copy error", "host", r.Host, "error", err)
+		var abort bool
+		streamFail, abort = classifyBrokenStream(pctx, r, resp, err)
+		if abort {
+			// Record before the panic: the recording below this block is
+			// unreachable on the panic path, and skip_hosts keeps its
+			// promise of no row — the client still gets its connection
+			// reset, which is not recording (#1543).
+			if !skipped {
+				s.recordOutboundResponseEvent(pctx, resp.StatusCode, streamFail)
+			}
+			// Push what is already relayed — headers and any body bytes
+			// still sitting in net/http's buffer — before the reset: the
+			// SSE arms flush per chunk, but this arm writes through a plain
+			// buffered writer, and ErrAbortHandler discards whatever it
+			// holds (#1543).
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+			panic(http.ErrAbortHandler)
+		}
+	}
+	// Recorded after the copy, not before it: the arm that reaches this io.Copy
+	// unbuffered is still receiving its body while the copy runs, and a row filed
+	// above it would stop Duration at the headers — reporting a body share of zero
+	// for a body the proxy was still relaying, the exact misreading #1251's split
+	// exists to prevent. After the copy the figure covers the whole exchange,
+	// matching the streamed arms (which record when their relay loop ends), and
+	// ResponseBytes is complete for the same reason. Skipped responses stay
+	// unrecorded, as skip_hosts promises.
+	if !skipped {
+		s.recordOutboundResponseEvent(pctx, resp.StatusCode, streamFail)
 	}
 }
 
@@ -830,29 +1136,40 @@ func (s *Server) bridgeMemory(tl *tunnelLog, host string) (*tlsbridge.SkipSet, s
 // bridgeServe records its close too. A bridged tunnel is settled by whichever of
 // finish and the last handler's release comes last, which records what the tunnel
 // still owes — its open and a close — only if no request recorded a row. On the
-// false path the caller tunnels and records the close itself.
-func (s *Server) bridgeServe(client net.Conn, authority, host string, tl *tunnelLog) bool {
+// false path the caller tunnels and records the close itself. originDead says the
+// CONNECT's own pre-dial failed, in which case the origin probe is skipped: see
+// step 1.
+func (s *Server) bridgeServe(client net.Conn, authority, host string, tl *tunnelLog, originDead bool) bool {
 	// 1) Verify upstream reachability + cert via the dedicated client, BEFORE forging.
 	//    HEAD avoids GET side-effects; a non-2xx status still returns err==nil (cert
 	//    verified), which is all we need. Only a transport/TLS error fails here. The
 	//    verify is bounded by its own context timeout so a slow/stalled origin can't
 	//    pin the bridging goroutine — the timeout is on this probe ONLY, not on the
 	//    relay (which must stay unbounded for streaming responses).
-	ctx, cancel := context.WithTimeout(context.Background(), upstreamVerifyTimeout)
-	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodHead, "https://"+authority, nil)
-	if err != nil {
-		slog.Info("tls-bridge passthrough", "host", host, "reason", "upstream-verify", "error", err)
-		tl.open(pipeline.TunnelOriginUnverified)
-		return false
+	//
+	//    Skipped when the pre-dial already failed (originDead): the probe would only
+	//    re-confirm a dead origin at up to upstreamVerifyTimeout more, and its
+	//    passthrough fallback dials the same dead origin. Bridging proceeds so a
+	//    plugin redirect (inference-router moving a pinned session) can still send
+	//    the request to a live server (#1595); the re-originated request is verified
+	//    against whatever host it actually goes to.
+	if !originDead {
+		ctx, cancel := context.WithTimeout(context.Background(), upstreamVerifyTimeout)
+		defer cancel()
+		req, err := http.NewRequestWithContext(ctx, http.MethodHead, "https://"+authority, nil)
+		if err != nil {
+			slog.Info("tls-bridge passthrough", "host", pipeline.SanitizeLogValue(host), "reason", "upstream-verify", "error", err)
+			tl.open(pipeline.TunnelOriginUnverified)
+			return false
+		}
+		resp, err := s.TLSBridge.Upstream.Do(req)
+		if err != nil {
+			slog.Info("tls-bridge passthrough", "host", pipeline.SanitizeLogValue(host), "reason", "upstream-verify", "error", err)
+			tl.open(pipeline.TunnelOriginUnverified)
+			return false // fall back to plain tunnel — agent's own e2e TLS still reaches origin
+		}
+		_ = resp.Body.Close()
 	}
-	resp, err := s.TLSBridge.Upstream.Do(req)
-	if err != nil {
-		slog.Info("tls-bridge passthrough", "host", host, "reason", "upstream-verify", "error", err)
-		tl.open(pipeline.TunnelOriginUnverified)
-		return false // fall back to plain tunnel — agent's own e2e TLS still reaches origin
-	}
-	_ = resp.Body.Close()
 
 	// 2) Forge + terminate downstream.
 	tconn, err := s.TLSBridge.Term.Terminate(client, hostOnly(authority))
@@ -897,7 +1214,7 @@ func (s *Server) bridgeServe(client net.Conn, authority, host string, tl *tunnel
 		// HERE, because the connection is gone by the time anyone reads the log and no
 		// later process listing can attribute it.
 		args := []any{
-			"host", host,
+			"host", pipeline.SanitizeLogValue(host),
 			"reason", reason,
 			"client", clientAddr(client),
 			"error", err,
@@ -969,6 +1286,108 @@ func (s *Server) bridgeServe(client net.Conn, authority, host string, tl *tunnel
 	return true
 }
 
+// dialFailMemo is a memoized failed CONNECT pre-dial: the error and when it was
+// taken. dialFailMemoTTL bounds how long it is believed.
+type dialFailMemo struct {
+	err error
+	at  time.Time
+}
+
+// dialFailMemoTTL is how long a failed pre-dial is remembered, so a destination
+// that drops packets — where a dial burns the whole connectDialTimeout — is not
+// re-dialed per CONNECT. Bridge-enabled CONNECTs only: there a skipped dial is
+// re-attempted wherever its result would have been used (the plain-tunnel path
+// dials fresh in tunnelOrDial; the bridge path re-originates to a different host
+// and dials that), so the staleness it can buy is one skipped dial, never a
+// misrouted request. Without the bridge the 502 is the last word, so a memo hit
+// would keep answering 502 for an origin that came back within the TTL. A stale
+// hit also skips the origin probe (bridgeServe), not just the dial: an origin
+// that comes back within the TTL with a certificate the bridge cannot verify is
+// bridged rather than passed through, and the request fails at re-origination —
+// bounded by the TTL, and the failure is loud rather than silent.
+const dialFailMemoTTL = 30 * time.Second
+
+// dialTCP is net.DialTimeout; a variable so tests can count dials.
+var dialTCP = net.DialTimeout
+
+// bridgeable reports whether the TLS bridge could take a connection to
+// authority's port. The dead-origin fall-through and its memo are for those
+// connections only: anywhere else the bridge would decline by port anyway, so
+// a failed pre-dial keeps its immediate 502 instead of a 200 the bridge cannot
+// use.
+func (s *Server) bridgeable(authority string) bool {
+	return s.TLSBridge != nil && s.TLSBridge.Decision.HandlesPort(portOf(authority))
+}
+
+// dialUpstream is a CONNECT's pre-dial, memoizing failures per target for
+// dialFailMemoTTL (#1595: a client that opens a CONNECT per request must not pay
+// a dead destination's dial timeout every time). bridgeable gates the memo: where
+// the bridge cannot take the connection the failure is answered with a 502, not
+// skipped, so remembering it would only pin that 502 past an origin that came
+// back. The final return says whether the failure came from the memo rather than
+// a dial this call made — a caller that would re-dial (tunnelOrDial) should not,
+// because a failure from its own dial is already the answer.
+func (s *Server) dialUpstream(dialTarget string, bridgeable bool) (net.Conn, error, bool) {
+	if bridgeable {
+		s.dialMu.Lock()
+		if s.dialFails == nil {
+			s.dialFails = make(map[string]dialFailMemo)
+		}
+		if m, ok := s.dialFails[dialTarget]; ok {
+			if time.Since(m.at) < dialFailMemoTTL {
+				s.dialMu.Unlock()
+				return nil, m.err, true
+			}
+			delete(s.dialFails, dialTarget)
+		}
+		s.dialMu.Unlock()
+	}
+
+	conn, err := dialTCP("tcp", dialTarget, connectDialTimeout)
+	if err == nil {
+		return conn, nil, false
+	}
+	if bridgeable {
+		s.dialMu.Lock()
+		// Sweep while inserting: an entry is otherwise deleted only when its own
+		// target is CONNECTed again after the TTL, so distinct dead targets — a
+		// scanner's stock in trade — would grow the map without bound.
+		now := time.Now()
+		for k, m := range s.dialFails {
+			if now.Sub(m.at) >= dialFailMemoTTL {
+				delete(s.dialFails, k)
+			}
+		}
+		s.dialFails[dialTarget] = dialFailMemo{err: err, at: now}
+		s.dialMu.Unlock()
+	}
+	return nil, err, false
+}
+
+// tunnelOrDial serves a tunnel whose pre-dialed upstream is gone — the bridge
+// declined the connection, or fell open after the origin probe failed — by dialing
+// fresh: a working dial tunnels normally, a failing one closes the client with the
+// dial error on the close row. The client already has its 200, so that stays the
+// status and the error says why the tunnel died. fail, when non-nil, is a failure
+// the pre-dial produced on a real dial: re-dialing would only repeat it, so the
+// tunnel closes with it instead.
+func (s *Server) tunnelOrDial(clientConn net.Conn, dialTarget string, tl *tunnelLog, fail error) {
+	if fail != nil {
+		_ = clientConn.Close()
+		tl.close(http.StatusOK, dialError(fail), 0, 0)
+		return
+	}
+	up2, derr := dialTCP("tcp", dialTarget, connectDialTimeout)
+	if derr != nil {
+		_ = clientConn.Close()
+		tl.close(http.StatusOK, dialError(derr), 0, 0)
+		return
+	}
+	sent, received := tunnel(clientConn, up2)
+	_ = up2.Close()
+	tl.close(http.StatusOK, nil, sent, received)
+}
+
 // misdirectedBody is the 421's body. Static: the Host it refuses is the client's own
 // input, and echoing it back would make the proxy a reflector.
 const misdirectedBody = "misdirected request: the Host header does not name this tunnel's destination\n"
@@ -984,7 +1403,7 @@ func (s *Server) refuseMisdirected(w http.ResponseWriter, r *http.Request, pctx 
 		claimed = claimed[:255]
 	}
 	slog.Warn("forward-proxy: refused a bridged request whose Host is not the tunnel's",
-		"tunnel", r.URL.Host, "host", claimed, "method", r.Method)
+		"tunnel", pipeline.SanitizeLogValue(r.URL.Host), "host", pipeline.SanitizeLogValue(claimed), "method", r.Method)
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.WriteHeader(http.StatusMisdirectedRequest)
 	_, _ = io.WriteString(w, misdirectedBody)
@@ -994,10 +1413,10 @@ func (s *Server) refuseMisdirected(w http.ResponseWriter, r *http.Request, pctx 
 	}
 	pctx.Host = r.URL.Host
 	chain := s.clientChain(r)
-	sid := s.recordingSessionID("", r.Header, chain)
+	sid := s.attributeForRecording(pctx, s.trustedSessionOf(r), r.Header, chain)
 	pctx.OutboundSessionID = sid
 	if chain != nil {
-		defer s.Sessions.TouchProcess(sid, chain)
+		defer s.touch(sid, chain)
 	}
 	s.recordOutboundRequestEvent(tl, pctx, sid)
 	s.recordOutboundResponseEvent(pctx, http.StatusMisdirectedRequest, &pipeline.EventError{
@@ -1016,8 +1435,8 @@ const declinedUpgradeBody = `{"detail":"WebSocket transport is not available thr
 // Scoped twice: to OpenAI's own hosts (isOpenAIResponsesHost), and to the Responses
 // suffix inference-parser reads (/v1/responses, and Codex's
 // /backend-api/codex/responses). A 426 is an answer only Codex is known to read as
-// "use HTTPS", and only against OpenAI is that known: every other WebSocket keeps the
-// strip and whatever its origin makes of the bare GET.
+// "use HTTPS", and only against OpenAI is that known: every other WebSocket is
+// forwarded (#1488), whatever its origin makes of the upgrade.
 func wantsResponsesWebSocket(r *http.Request) bool {
 	return r.Method == http.MethodGet &&
 		upgradesToWebSocket(r.Header) &&
@@ -1047,11 +1466,30 @@ func isOpenAIResponsesHost(authority string) bool {
 	return false
 }
 
-// upgradesToWebSocket reports whether h's Upgrade names websocket. RFC 9110 §7.8 makes
-// Upgrade a comma-separated list, matched case-insensitively and in any repeat of the
-// header, so "websocket, h2c" asks for a WebSocket as surely as "websocket" does. A
-// token may carry a version ("websocket/13"); only the name before it is compared.
+// upgradesToWebSocket reports whether h is a WebSocket upgrade REQUEST. RFC 9110
+// §7.8 makes Upgrade a comma-separated list, matched case-insensitively and in any
+// repeat of the header, so "websocket, h2c" asks for a WebSocket as surely as
+// "websocket" does. A token may carry a version ("websocket/13"); only the name
+// before it is compared.
+//
+// CONNECTION IS CHECKED FIRST, and it is not a formality. RFC 9110 §7.8 is
+// explicit that a sender MUST send Connection: upgrade with the Upgrade header,
+// and that a recipient ignores Upgrade when Connection does not list it — which is
+// exactly what net/http's own httpguts-based upgradeType does before
+// ReverseProxy honours an upgrade at all.
+//
+// Keying on Upgrade alone made this proxy SYNTHESIZE an upgrade the client had not
+// requested: stripForUpstream sets the normalized Connection/Upgrade pair whenever
+// keepUpgrade is true, so a request carrying a bare "Upgrade: websocket" and no
+// Connection token reached the origin as a well-formed handshake, and an origin
+// that answered 101 got its connection hijacked and spliced — turning a request
+// the client expected an ordinary HTTP response to into an opaque byte pipe whose
+// frames no plugin inspects. Measured end to end before this check existed
+// (TestForwardProxy_UpgradeWithoutConnectionTokenIsStripped) (#1549 review).
 func upgradesToWebSocket(h http.Header) bool {
+	if !headerListContainsToken(h, "Connection", "upgrade") {
+		return false
+	}
 	for _, line := range h.Values("Upgrade") {
 		for _, tok := range strings.Split(line, ",") {
 			name, _, _ := strings.Cut(strings.TrimSpace(tok), "/")
@@ -1063,18 +1501,39 @@ func upgradesToWebSocket(h http.Header) bool {
 	return false
 }
 
+// headerListContainsToken reports whether the named header — in any repeat, as a
+// comma-separated list — carries token, compared case-insensitively. The shape
+// RFC 9110 gives Connection, and the check net/http makes with
+// httpguts.HeaderValuesContainsToken, which is not importable from here.
+func headerListContainsToken(h http.Header, name, token string) bool {
+	for _, line := range h.Values(name) {
+		for _, tok := range strings.Split(line, ",") {
+			if strings.EqualFold(strings.TrimSpace(tok), token) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // declineResponsesWebSocket answers a WebSocket upgrade on a Responses API path with
 // 426 Upgrade Required, without contacting the origin.
 //
-// THE ORIGIN'S ANSWER IS ALREADY KNOWN, AND IT IS THE EXPENSIVE ONE. stripForUpstream
-// must remove Upgrade, so the origin would get a bare GET on an endpoint that takes a
-// POST or an upgrade and answer 405. Codex reads a 405 as transient: it retries five
-// times on a 200ms-doubling backoff, about six seconds, printing `Reconnecting… n/5`,
-// before falling back to HTTPS. A 426 is the one status it reads as "this endpoint wants
+// THE EXPENSIVE ANSWER IS THE ONE A STRIPPED HANDSHAKE DREW. Before upgrades were
+// forwarded (#1488) the strip turned this handshake into a bare GET on an endpoint
+// that takes a POST or an upgrade, and the origin answered 405. Codex reads a 405 as
+// transient: it retries five times on a 200ms-doubling backoff, about six seconds,
+// printing `Reconnecting… n/5`, before falling back to HTTPS. A 426 is the one status
+// it reads as "this endpoint wants
 // HTTP": it switches at once, for the rest of the session, with no retry and no warning
 // (codex-rs/core/src/client.rs, the UPGRADE_REQUIRED arms). Measured on Codex 0.163.0,
 // eight runs each of a one-word `codex exec` turn: 10.2–15.1s (median 11.0s) through the
 // 405, 2.4–6.4s (median 3.0s) through this, with one handshake attempt instead of seven.
+//
+// TODAY THE DECLINE IS A STEER RATHER THAN A LIMIT: a forwarded Responses WebSocket
+// works (relayUpgradedWebSocket), but its frames are opaque to every plugin, so a
+// Codex session moved onto one stops being parseable — no token counts, no cost. The
+// 426 keeps it on HTTPS, where its traffic stays observable.
 //
 // RFC 9110 gives 426 the opposite sense — the server requires the client to upgrade.
 // OpenAI's backend uses it this way and Codex reads it this way, and a client that reads
@@ -1084,9 +1543,9 @@ func upgradesToWebSocket(h http.Header) bool {
 // attempt; the request row keeps its upgradeStripped marker, since the Upgrade was not
 // forwarded. error.kind "upgrade_declined" says the 426 is ours, as misdirected_request
 // does for the 421.
-func (s *Server) declineResponsesWebSocket(w http.ResponseWriter, r *http.Request, pctx *pipeline.Context, tl *tunnelLog, sid string, chain []session.Proc) {
+func (s *Server) declineResponsesWebSocket(w http.ResponseWriter, r *http.Request, pctx *pipeline.Context, tl *tunnelLog, sid string, chain []attribution.Proc) {
 	slog.Debug("forward-proxy: declined a WebSocket upgrade on a Responses path; the client falls back to HTTPS",
-		"host", r.Host, "path", r.URL.Path)
+		"host", pipeline.SanitizeLogValue(r.Host), "path", pipeline.SanitizeLogValue(r.URL.Path))
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusUpgradeRequired)
 	_, _ = io.WriteString(w, declinedUpgradeBody)
@@ -1099,13 +1558,252 @@ func (s *Server) declineResponsesWebSocket(w http.ResponseWriter, r *http.Reques
 	}
 	pctx.OutboundSessionID = sid
 	if chain != nil {
-		defer s.Sessions.TouchProcess(sid, chain)
+		defer s.touch(sid, chain)
 	}
 	s.recordOutboundRequestEvent(tl, pctx, sid)
 	s.recordOutboundResponseEvent(pctx, http.StatusUpgradeRequired, &pipeline.EventError{
 		Kind:    pipeline.ErrorKindUpgradeDeclined,
 		Message: "WebSocket upgrade answered 426 by the proxy; the client falls back to HTTPS",
 	})
+}
+
+// relayUpgradedWebSocket splices a 101 Switching Protocols answer onto the
+// client's connection and blocks until either side closes (#1488). It mirrors
+// httputil.ReverseProxy's handleUpgradeResponse — hijack the client connection,
+// write the origin's 101 through it, then copy both ways — with two things that
+// proxy does not need and this one does: per-direction byte counts for the
+// session row, and the row itself.
+//
+// resp.Body is the origin's connection once the origin answered 101 (the
+// transport hands back an io.ReadWriteCloser or it never sent a 101), and this
+// function owns it: serveOutbound returns without its resp.Body.Close() defer
+// running, because closing the body here would close the WebSocket.
+//
+// THE ROWS: the request row was recorded before client.Do, as for any request.
+// Its pair is recorded here, after the splice ends, carrying the 101 and both
+// directions' byte counts — the one response row with bytesUp on it, like a
+// tunnel close, because after the 101 the bytes are protocol frames the proxy
+// does not parse and there is no body/header split to report. Duration covers
+// the whole WebSocket session, not the handshake; ttfb is the handshake, set
+// where client.Do returned. That is one audit event per upgrade, the request row
+// plus its paired 101 (MOCA MI1 §8.5 item 5).
+//
+// Response plugins never see the 101 — pctx.ResponseHeaders is not set from it,
+// so no RunResponse runs on this answer: the frames after a successful upgrade
+// belong to the client and the origin ("streamed, never inspected or buffered",
+// the same contract), and a response mutator would have nothing to act on. A
+// non-101 answer never reaches here; it takes the ordinary response path.
+//
+// record=false is skip_hosts: the splice still happens — a skipped request is
+// forwarded as a transparent proxy or not at all — but no row is appended, which
+// is what skip_hosts promises.
+func (s *Server) relayUpgradedWebSocket(w http.ResponseWriter, r *http.Request, pctx *pipeline.Context, resp *http.Response, record bool) {
+	// The host as this function logs it: r.Host is client-controlled.
+	host := pipeline.SanitizeLogValue(r.Host)
+	// BOTH early returns below must close the origin themselves. This function
+	// owns resp.Body (serveOutbound skipped its Close defer, see the doc above),
+	// and the goroutine that closes it on context-done is only armed further
+	// down — so returning before that point without closing here leaves the
+	// origin holding a connection it believes is an established WebSocket, until
+	// its own idle timeout reaps it. The client meanwhile has a 502, so nothing
+	// will ever come back for it (#1549 review).
+	// THE ORIGIN MUST BE SWITCHING TO THE PROTOCOL THE CLIENT ASKED FOR. A 101 is
+	// not self-describing: it says "switching", and its own Upgrade header says to
+	// what. net/http's ReverseProxy compares the two (handleUpgradeResponse refuses
+	// when resUpType != reqUpType), and this function is modelled on it, but the
+	// comparison was the one part left out — so an origin answering "101 Upgrade:
+	// h2c" to a WebSocket handshake got spliced anyway, handing the client an
+	// opaque pipe speaking a protocol it never negotiated and cannot parse. The
+	// client is the one that would have to detect that, after the proxy already
+	// committed its connection. Refuse before the hijack, while a 502 is still
+	// writable (#1549 review).
+	if !upgradesToWebSocket(resp.Header) {
+		got := pipeline.SanitizeLogValue(resp.Header.Get("Upgrade"))
+		slog.Error("forward-proxy: origin switched to another protocol than the WebSocket requested — not relaying",
+			"host", host, "upgrade", got)
+		_ = resp.Body.Close()
+		s.failUpgradedWebSocket(w, pctx, record,
+			fmt.Sprintf("origin switched to %q, not the websocket requested", got))
+		return
+	}
+	backConn, ok := resp.Body.(io.ReadWriteCloser)
+	if !ok {
+		// Not reachable through net/http's own transport, which gives a 101 a
+		// writable body; a custom RoundTripper could violate it.
+		slog.Error("forward-proxy: 101 switching protocols with a non-writable body — cannot relay the upgrade", "host", host)
+		// Not an io.ReadWriteCloser, but still an io.Closer: the Body contract
+		// guarantees that much, so the origin's end can be released.
+		_ = resp.Body.Close()
+		s.failUpgradedWebSocket(w, pctx, record, "101 switching protocols with a non-writable body")
+		return
+	}
+	conn, brw, err := http.NewResponseController(w).Hijack()
+	if err != nil {
+		// The host is fenced above; the hijack error is the runtime's own text.
+		slog.Error("forward-proxy: hijack failed relaying a WebSocket upgrade", "host", host, "error", err)
+		_ = backConn.Close()
+		s.failUpgradedWebSocket(w, pctx, record, fmt.Sprintf("hijack failed relaying the upgrade: %v", err))
+		return
+	}
+	// The origin's end closes when the client's request context is done — which
+	// covers a client hang-up the copies have not noticed yet (golang.org/issue
+	// 35559, as in ReverseProxy) — or when the splice below ends, whichever is
+	// first; the deferred close of conn takes care of the client's end.
+	backConnCloseCh := make(chan struct{})
+	go func() {
+		select {
+		case <-r.Context().Done():
+		case <-backConnCloseCh:
+		}
+		backConn.Close()
+	}()
+	defer close(backConnCloseCh)
+	defer conn.Close()
+
+	// The origin's 101, as it wrote it, onto the hijacked connection. Moving
+	// resp.Header into w's still-empty header map first is ReverseProxy's trick:
+	// resp.Write then serializes status line and headers as one response, and
+	// nil'ing the body stops it at the blank line.
+	for k, vv := range resp.Header {
+		w.Header()[k] = vv
+	}
+	resp.Header = w.Header()
+	resp.Body = nil
+	if err := resp.Write(brw); err != nil {
+		slog.Error("forward-proxy: writing the 101 failed", "host", host, "error", err)
+		s.recordSpliceFailure(pctx, record, fmt.Sprintf("writing the 101 failed: %v", err))
+		return
+	}
+	if err := brw.Flush(); err != nil {
+		slog.Error("forward-proxy: flushing the 101 failed", "host", host, "error", err)
+		s.recordSpliceFailure(pctx, record, fmt.Sprintf("flushing the 101 failed: %v", err))
+		return
+	}
+
+	// A delivered answer from here: the deferred RunFinish reads any non-zero
+	// status as OutcomeAllow, and 101 is what the client got.
+	pctx.StatusCode = http.StatusSwitchingProtocols
+
+	// Both directions, each one io.Copy so its return count needs no second
+	// counter. Up is client → origin, read from brw rather than conn so bytes
+	// the hijack buffered are not lost; down is origin → client, written
+	// straight to conn, which has no write buffer to strand. An EOF propagates
+	// as CloseWrite where the connection has it (ReverseProxy's
+	// switchProtocolCopier), so a half-closed WebSocket shuts down instead of
+	// hanging on the open half.
+	var up, down int64
+	errc := make(chan error, 2)
+	go func() {
+		var err error
+		if up, err = io.Copy(backConn, brw); err != nil {
+			errc <- err
+			return
+		}
+		if wc, ok := backConn.(interface{ CloseWrite() error }); ok {
+			errc <- wc.CloseWrite()
+			return
+		}
+		errc <- nil
+	}()
+	go func() {
+		var err error
+		if down, err = io.Copy(conn, backConn); err != nil {
+			errc <- err
+			return
+		}
+		if wc, ok := conn.(interface{ CloseWrite() error }); ok {
+			errc <- wc.CloseWrite()
+			return
+		}
+		errc <- nil
+	}()
+	// Both, not one: the counts are read below, and a goroutine's send on errc
+	// is what publishes its write.
+	//
+	// But a FAILED direction has to tear both ends down before we wait for the
+	// second, or that wait never returns. A clean EOF propagates as CloseWrite
+	// above, which is what lets a half-closed WebSocket finish; an error has no
+	// such signal, so the peer of the broken direction stays blocked in Read
+	// with nothing coming. Measured: an origin that RSTs mid-session ends the
+	// origin→client copy with an error while client→origin stays blocked on a
+	// silent client, and the 101 row — recorded after both — is never written at
+	// all. That is the one-event-per-upgrade promise lost on exactly the
+	// connections worth auditing.
+	//
+	// ReverseProxy avoids this by returning after the FIRST result and letting
+	// its deferred closes unblock the other; this function waits for both
+	// because it needs their byte counts, so it closes explicitly instead. The
+	// counts stay correct: io.Copy returns what it copied before the error, and
+	// the closes only release a direction that is already finished or broken
+	// (#1549 review).
+	spliceErr := <-errc
+	if spliceErr != nil {
+		_ = conn.Close()
+		_ = backConn.Close()
+	}
+	if err := <-errc; spliceErr == nil {
+		spliceErr = err
+	}
+
+	if !record || s.Sessions == nil {
+		return
+	}
+	// THE ROW SAYS WHETHER THE SESSION ENDED CLEANLY. Both directions have
+	// finished either way and the status is still 101 — the upgrade did succeed,
+	// and the client got its 101 — but a relay that ended in an error is not the
+	// same event as one that closed cleanly, and without this the only symptom
+	// was truncated byte counts: an operator auditing a WebSocket that broke
+	// mid-session read a successful upgrade. One event per upgrade is the MOCA
+	// contract; one event that cannot distinguish the two outcomes only half
+	// keeps it.
+	//
+	// NOT EVERY ERROR HERE IS A FAILURE, and net.ErrClosed is the one that is not.
+	// A WebSocket normally ends with one side closing; the deferred conn.Close()
+	// and the context goroutine's backConn.Close() then race the direction still
+	// blocked in Read, which returns "use of closed network connection". That is
+	// the ordinary shutdown of a healthy session — marking it would flag EVERY
+	// WebSocket as broken, which is worse than the gap this closes. Caught by
+	// assertUpgradedRows' own "no error on a clean session" assertion, which is
+	// why that one exists alongside the broken-direction test: a marker that is
+	// always set distinguishes nothing.
+	//
+	// proxy_error otherwise, the kind the two pre-splice failure paths already
+	// use, because a relay that broke is on our side. Sanitized: a network
+	// error's text can carry a client-supplied address (#1549 review).
+	var fail *pipeline.EventError
+	if spliceErr != nil && !errors.Is(spliceErr, net.ErrClosed) {
+		fail = &pipeline.EventError{
+			Kind:    "proxy_error",
+			Message: "websocket relay ended in error: " + pipeline.SanitizeControlRunes(spliceErr.Error()),
+		}
+	}
+	ev := outboundResponseEvent(pctx, http.StatusSwitchingProtocols, fail)
+	ev.BytesUp, ev.BytesDown = up, down
+	s.Sessions.Append(s.responseSessionID(pctx), ev)
+}
+
+// recordSpliceFailure records the response row for a 101 whose relay broke after
+// the hijack — the connection is the client's problem now, so there is no status
+// to write it, but the request row still exists and a row with no pair reads as a
+// request still in flight (#1045). 502 with proxy_error, as failUpgradedWebSocket:
+// this failure is ours.
+func (s *Server) recordSpliceFailure(pctx *pipeline.Context, record bool, cause string) {
+	if !record {
+		return
+	}
+	s.recordOutboundResponseEvent(pctx, http.StatusBadGateway, &pipeline.EventError{
+		Kind:    "proxy_error",
+		Message: cause,
+	})
+}
+
+// failUpgradedWebSocket answers a 101 this proxy could not relay and records the
+// failure row. The status stays off pctx (zero reads as OutcomeError to the
+// deferred RunFinish) for the same reason the client.Do error path in
+// serveOutbound keeps its 502 off it: nothing succeeded here.
+func (s *Server) failUpgradedWebSocket(w http.ResponseWriter, pctx *pipeline.Context, record bool, cause string) {
+	http.Error(w, `{"error":"bad gateway"}`, http.StatusBadGateway)
+	s.recordSpliceFailure(pctx, record, cause)
 }
 
 // tunnelAuthorityMatches reports whether host, a bridged request's Host, names the same
@@ -1155,6 +1853,15 @@ func (s *Server) bridgedHandler(authority string, tl *tunnelLog) http.Handler {
 		if tl.conn != nil {
 			r = r.WithContext(context.WithValue(r.Context(), connProcKey{}, tl.conn))
 		}
+		// Before anything reads identity off r. A decrypted request is a NEW
+		// request — the accepting listener's wrapper never saw it, so whatever
+		// it stamped on or stripped from the CONNECT has to be redone here, or
+		// the guest's own headers decide the session (#1569 review).
+		if s.AdoptBridgedRequest != nil && tl.connect != nil {
+			if adopted := s.AdoptBridgedRequest(tl.connect, r); adopted != nil {
+				r = adopted
+			}
+		}
 		r.URL.Scheme = "https"
 		r.URL.Host = authority // host:port — preserves non-443 origins
 		s.serveOutbound(w, r, tl)
@@ -1188,7 +1895,7 @@ func (s *Server) bridgedHandler(authority string, tl *tunnelLog) http.Handler {
 // Safe to call with s.Sessions == nil: ActiveSession() is skipped and the default
 // bucket is returned, so a future caller that forgets the nil check on Sessions
 // gets a usable answer rather than a panic.
-func (s *Server) resolveOutboundSessionID(clientHeaders http.Header, chain []session.Proc) string {
+func (s *Server) resolveOutboundSessionID(clientHeaders http.Header, chain []attribution.Proc) string {
 	if sid := s.resolvePluginSessionID(clientHeaders, chain); sid != "" {
 		return sid
 	}
@@ -1200,48 +1907,120 @@ func (s *Server) resolveOutboundSessionID(clientHeaders http.Header, chain []ses
 // local so no plugin can rewrite it; "" means hydration found no identity (or ran
 // on a path that has none), and recording — unlike a plugin — must still file the
 // event somewhere, so the full order including the default bucket applies.
-func (s *Server) recordingSessionID(resolved string, clientHeaders http.Header, chain []session.Proc) string {
+func (s *Server) recordingSessionID(resolved string, clientHeaders http.Header, chain []attribution.Proc) string {
 	if resolved != "" {
 		return resolved
 	}
 	return s.resolveOutboundSessionID(clientHeaders, chain)
 }
 
+// trustedSessionOf is the listener's own answer to "which session is this request
+// on", from how the connection arrived (vmcontrol installs the hook; the socket
+// that accepted the connection names the VM). Empty when no hook is installed, or
+// when it does not recognise this request — a transparently redirected connection
+// has no request at all.
+//
+// Separate from hydrateSession so the pre-pipeline refusal paths can ask the same
+// question: those never reach hydration, and a refusal filed under a header- or
+// process-derived id defeats the point of deriving identity from the connection.
+func (s *Server) trustedSessionOf(r *http.Request) string {
+	if s.TrustedSessionID == nil || r == nil {
+		return ""
+	}
+	return s.TrustedSessionID(r)
+}
+
+// attributeForRecording resolves a request that never reached hydration — refused before the
+// pipeline, or unreadable — pins its attribution on pctx so its rows carry the process, and
+// returns the bucket they go in: the trusted sid, else the attribution's, else
+// ActiveSession(), else default.
+//
+// A trusted sid SHORT-CIRCUITS, and pins attribution EMPTY rather than skipping the
+// pin: SetAttribution is write-once and AttributedProc() is recorded straight into
+// SessionEvent.Proc, so claiming the slot with nothing is what stops a VM's refusal
+// row from being stamped with the host process that merely happens to own the
+// control socket — the same reasoning hydrateSession's trusted branch gives, applied
+// to the paths that never get there (#1569 review).
+func (s *Server) attributeForRecording(pctx *pipeline.Context, trusted string, clientHeaders http.Header, chain []attribution.Proc) string {
+	if trusted != "" {
+		pctx.SetAttribution("", "", "")
+		return trusted
+	}
+	at := s.attribute(clientHeaders, chain)
+	pctx.SetAttribution(at.Proc, at.ClientProc, at.Header)
+	if sid := at.RecordID(); sid != "" {
+		return sid
+	}
+	if sid := s.Sessions.ActiveSession(); sid != "" {
+		return sid
+	}
+	return session.DefaultSessionID
+}
+
 // recordOutboundRequestEvent records pctx's request row under sid. Its pair is
 // recordOutboundResponseEvent, which files under pctx.OutboundSessionID, so the
 // caller pins that to sid first.
-// syncHeaders makes r's headers the pipeline's: pctx.Headers started as a clone of
-// r.Header, so a plugin's set, replace and delete on it are the upstream-facing
-// header set. Content-Length and Content-Encoding are left to setBody and the
-// transport.
-func syncHeaders(r *http.Request, h http.Header) {
-	skip := func(k string) bool {
-		return strings.EqualFold(k, "Content-Length") || strings.EqualFold(k, "Content-Encoding")
+
+// hopByHopHeaders is the response-side twin of the request-side list stripForUpstream
+// deletes. RFC 9110 §7.6.3: these describe one connection, not the resource, and must
+// not be forwarded in either direction.
+var hopByHopHeaders = map[string]bool{
+	"Connection":          true,
+	"Keep-Alive":          true,
+	"Proxy-Authenticate":  true,
+	"Proxy-Authorization": true,
+	"Proxy-Connection":    true,
+	"Te":                  true,
+	"Trailer":             true,
+	"Transfer-Encoding":   true,
+	"Upgrade":             true,
+}
+
+// copyResponseHeaders forwards resp's end-to-end headers to w, skipping the hop-by-hop
+// set — including anything the response's own Connection header names as hop-by-hop for
+// this connection (#1567). The four response paths used to copy resp.Header verbatim
+// while requests were stripped, so an HTTP/1.1 origin's Keep-Alive reached the client;
+// through the TLS bridge that lands inside an HTTP/2 HEADERS frame, which clients like
+// Node's http2 reject outright.
+//
+// Content-Length is NOT skipped here: the buffered paths forward a body that matches it,
+// and the streaming paths delete it themselves after this call.
+func copyResponseHeaders(w http.ResponseWriter, resp *http.Response) {
+	// The Connection header itself is in the skip list; its values are read first
+	// because a response can demote a normally end-to-end header to hop-by-hop by
+	// naming it ("Connection: X-Hop-Extra" makes X-Hop-Extra per-connection).
+	named := map[string]bool{}
+	for _, v := range resp.Header.Values("Connection") {
+		for _, name := range strings.Split(v, ",") {
+			if name = strings.TrimSpace(name); name != "" {
+				named[http.CanonicalHeaderKey(name)] = true
+			}
+		}
 	}
-	for k := range r.Header {
-		if skip(k) {
+	for key, values := range resp.Header {
+		if hopByHopHeaders[http.CanonicalHeaderKey(key)] || named[http.CanonicalHeaderKey(key)] {
 			continue
 		}
-		if _, ok := h[k]; !ok {
-			r.Header.Del(k) // plugin removed it
+		for _, value := range values {
+			w.Header().Add(key, value)
 		}
-	}
-	for k, vv := range h {
-		if skip(k) {
-			continue
-		}
-		if len(vv) == 0 {
-			r.Header.Del(k) // pctx.Headers[k] = nil is a delete, same as Del(k)
-			continue
-		}
-		r.Header[k] = append([]string(nil), vv...) // set / overwrite
 	}
 }
 
 // stripForUpstream removes from r what is the proxy's and not the upstream's: the
 // hop-by-hop headers, and, when ownEncoding, the client's Accept-Encoding. It runs on
 // every request the proxy sends upstream for a client, a resend included.
-func stripForUpstream(r *http.Request, ownEncoding bool) {
+//
+// keepUpgrade is the WebSocket exception (#1488). RFC 9110 makes Upgrade
+// hop-by-hop, and the strip is right everywhere the proxy is a reader between two
+// endpoints — but an upgrade exchange makes it an endpoint of the hop instead:
+// everything after the 101 is opaque to it, so the header must cross or the
+// origin never sees an upgrade request at all. The pair is normalized rather than
+// forwarded raw (mirroring httputil.ReverseProxy): Connection becomes "Upgrade"
+// and Upgrade "websocket", the one protocol this proxy forwards — a client's
+// "Connection: keep-alive, Upgrade" is not the proxy's to pass on, and any other
+// token sharing the client's Upgrade list was never going to be forwarded anyway.
+func stripForUpstream(r *http.Request, ownEncoding, keepUpgrade bool) {
 	// Remove hop-by-hop headers
 	r.Header.Del("Connection")
 	r.Header.Del("Keep-Alive")
@@ -1252,6 +2031,10 @@ func stripForUpstream(r *http.Request, ownEncoding bool) {
 	r.Header.Del("Trailer")
 	r.Header.Del("Transfer-Encoding")
 	r.Header.Del("Upgrade")
+	if keepUpgrade {
+		r.Header.Set("Connection", "Upgrade")
+		r.Header.Set("Upgrade", "websocket")
+	}
 
 	// Strip the client's Accept-Encoding so Go's transport negotiates content
 	// coding on its own behalf.
@@ -1282,15 +2065,6 @@ func stripForUpstream(r *http.Request, ownEncoding bool) {
 	}
 }
 
-// setBody gives r the body a plugin wrote, and clears Content-Encoding, since the
-// bytes are the plugin's and carry none.
-func setBody(r *http.Request, body []byte) {
-	r.Body = io.NopCloser(bytes.NewReader(body))
-	r.ContentLength = int64(len(body))
-	r.Header.Set("Content-Length", fmt.Sprintf("%d", len(body)))
-	r.Header.Del("Content-Encoding")
-}
-
 // resendIfAsked gives the outbound pipeline's Resenders a look at each refused answer,
 // at most pipeline.MaxResends times, and sends the request again when one asks. It
 // returns the answer to relay: resp itself, or the last send's.
@@ -1303,7 +2077,10 @@ func setBody(r *http.Request, body []byte) {
 // refused answer that is not sent again goes to the client byte for byte, the bytes
 // read for the Resender included.
 func (s *Server) resendIfAsked(r *http.Request, pctx *pipeline.Context, client *http.Client, resp *http.Response, tl *tunnelLog, ownEncoding bool) (*http.Response, error) {
-	if !s.OutboundPipeline.HasResenders() || !s.OutboundPipeline.NeedsRequestBody() {
+	// Both probes and Resend itself answer for the pipeline this request
+	// ran on (Holder.ForPctx): the reload-drain window must not flip the
+	// resend decision onto plugins that never saw the request.
+	if !s.OutboundPipeline.ForPctx(pctx).HasResenders() || !s.OutboundPipeline.ForPctx(pctx).NeedsRequestBody() {
 		return resp, nil
 	}
 	for round := 0; round < pipeline.MaxResends && resp.StatusCode/100 != 2; round++ {
@@ -1331,9 +2108,12 @@ func (s *Server) resendIfAsked(r *http.Request, pctx *pipeline.Context, client *
 			s.recordOutboundRequestEvent(tl, pctx, pctx.OutboundSessionID)
 		}
 		again := r.Clone(r.Context())
-		syncHeaders(again, pctx.Headers)
-		setBody(again, pctx.Body)
-		stripForUpstream(again, ownEncoding)
+		httpx.SyncRequestHeaders(again, pctx.Headers)
+		httpx.SetRequestBody(again, pctx.Body)
+		// No keepUpgrade: a resent request is never a forwarded upgrade — the
+		// 101 branch in serveOutbound skips resendIfAsked entirely, and only that
+		// branch leaves the headers unstripped.
+		stripForUpstream(again, ownEncoding, false)
 		var err error
 		if resp, err = client.Do(again); err != nil {
 			return nil, err
@@ -1366,6 +2146,9 @@ func (s *Server) recordOutboundRequestEvent(tl *tunnelLog, pctx *pipeline.Contex
 		Client:          pctx.ClientInfo(),
 		Subagent:        pctx.Subagent(),
 		ParentSubagent:  pctx.ParentSubagent(),
+		Proc:            pctx.AttributedProc(),
+		ClientProc:      pctx.AttributedClientProc(),
+		SessionHeader:   pctx.NamingHeader(),
 	}
 	s.appendOutbound(tl, sid, ev)
 }
@@ -1382,14 +2165,14 @@ func (s *Server) recordOutboundRequestEvent(tl *tunnelLog, pctx *pipeline.Contex
 // hydration, which runs after the body is read. Resolution reads only the
 // client's headers and process, never the body, so the answer is the one the
 // request would have got.
-func (s *Server) recordUnbufferedRequest(tl *tunnelLog, pctx *pipeline.Context, r *http.Request, chain []session.Proc, err error) {
+func (s *Server) recordUnbufferedRequest(tl *tunnelLog, pctx *pipeline.Context, r *http.Request, chain []attribution.Proc, err error) {
 	if s.Sessions == nil {
 		return
 	}
-	sid := s.recordingSessionID("", r.Header, chain)
+	sid := s.attributeForRecording(pctx, s.trustedSessionOf(r), r.Header, chain)
 	pctx.OutboundSessionID = sid
 	if chain != nil {
-		defer s.Sessions.TouchProcess(sid, chain)
+		defer s.touch(sid, chain)
 	}
 	status, fail := bodyread.Failure(r, maxRequestBodySize, err)
 	s.recordOutboundRequestEvent(tl, pctx, sid)
@@ -1413,7 +2196,7 @@ func (s *Server) appendOutbound(tl *tunnelLog, sid string, ev pipeline.SessionEv
 // Those rows keep ActiveSession() at recording time, as without affinity.
 // With the client's process known, an empty answer means a process of no agent, and the
 // row goes to default like that process's requests.
-func (s *Server) tunnelSessionID(resolved string, clientHeaders http.Header, chain []session.Proc) string {
+func (s *Server) tunnelSessionID(resolved string, clientHeaders http.Header, chain []attribution.Proc) string {
 	if s.ClientAffinity && resolved == "" && chain == nil && s.Sessions != nil {
 		if sid := s.Sessions.ActiveSession(); sid != "" {
 			return sid
@@ -1462,10 +2245,9 @@ func (s *Server) tunnelSessionID(resolved string, clientHeaders http.Header, cha
 // in #984, which is where to argue with it.
 //
 // With the client's process known (chain non-nil), a header claims the session for that
-// process as well as for its agent, and a request with no header asks
-// session.Store.SessionForProcess first; client affinity and ActiveSession() answer only
-// what it leaves open.
-func (s *Server) resolvePluginSessionID(clientHeaders http.Header, chain []session.Proc) string {
+// process as well as for its agent, and a request with no header is filed by process first;
+// client affinity and ActiveSession() answer only what it leaves open. See core/attribution.
+func (s *Server) resolvePluginSessionID(clientHeaders http.Header, chain []attribution.Proc) string {
 	sid, _ := s.resolvePluginSession(clientHeaders, chain)
 	return sid
 }
@@ -1479,15 +2261,52 @@ type pluginSession struct {
 // hydrateSession resolves the plugin session for a request and, when there is one,
 // sets pctx.Session and how it was resolved. It returns the id for the caller's
 // local, which recording reads instead of pctx.
-func (s *Server) hydrateSession(pctx *pipeline.Context, clientHeaders http.Header, chain []session.Proc) string {
-	sid, how := s.resolvePluginSession(clientHeaders, chain)
+// trusted is the connection's own answer (trustedSessionOf), resolved by the
+// caller — which also keeps the r.Header read at the CALL SITE rather than in
+// here. The headers arrive as a parameter for the same reason trusted does:
+// the caller resolves both once per request, so the pre-hydration refusal
+// paths (attributeForRecording and its call sites) share the caller's values
+// instead of re-deriving them. CodeQL note, so nobody re-litigates the
+// placement: moving the r.Header read inside this function made CodeQL's
+// diff-informed analysis report 28 pre-existing go/clear-text-logging and
+// go/log-injection alerts in untouched plugins (sessionbudget, contextguru,
+// inferencerouter) as new, every one sourced to the moved line. They are
+// false positives — a header id passes validHeaderSessionID before anything
+// logs it, and a session id is not a secret — and taking the read back out
+// did NOT clear them; they need dismissing on the PR (#1569 review).
+func (s *Server) hydrateSession(pctx *pipeline.Context, trusted string, clientHeaders http.Header, chain []attribution.Proc) string {
+	// The listener's own answer first, and it ends the search: a session
+	// resolved from how the connection arrived is not something the client has
+	// any say in, and letting a header or a process chain override it would
+	// defeat the point of deriving identity from the connection (vmcontrol).
+	// Hydration still happens — plugins get their pctx.Session view — but the
+	// claims and affinity work below is skipped: a VM's traffic must not be
+	// filed by a process it never ran as. A transparently redirected connection
+	// has no request at all (r == nil), so there is nothing to claim either.
+	//
+	// Attribution is pinned EMPTY rather than left unset. SetAttribution is
+	// write-once and AttributedProc() is recorded straight into
+	// SessionEvent.Proc, so claiming the slot here is what stops a later
+	// attributeForRecording from filling a VM's row in with a host process
+	// that merely happens to own the control socket. The VM's identity is the
+	// session id itself, which the connection already settled.
+	if trusted != "" {
+		pctx.Session = s.sessionViewFor(trusted)
+		pctx.SessionSource = pipeline.SessionSourceConnection
+		pctx.SessionHeader = ""
+		pctx.SetAttribution("", "", "")
+		return trusted
+	}
+	at := s.attribute(clientHeaders, chain)
+	pctx.SetAttribution(at.Proc, at.ClientProc, at.Header)
+	sid, how := s.pluginSessionOf(at)
 	if sid != "" {
 		pctx.Session = s.sessionViewFor(sid)
 		pctx.SessionSource = how.source
 		pctx.SessionHeader = how.header
 	}
 	if chain != nil && s.processesOn() {
-		pctx.ChainSession = s.Sessions.ChainSession(chain)
+		pctx.ChainSession = at.ChainSession
 		if pctx.ChainSession != "" && sid != pctx.ChainSession && how.source == pipeline.SessionSourceHeader {
 			if _, seen := s.chainOverrideLogged.LoadOrStore(how.header, struct{}{}); !seen {
 				slog.Info("forwardproxy: a process named a session other than its parent agent's; "+
@@ -1500,49 +2319,17 @@ func (s *Server) hydrateSession(pctx *pipeline.Context, clientHeaders http.Heade
 
 // resolvePluginSession is resolvePluginSessionID that also says how the id was
 // resolved.
-func (s *Server) resolvePluginSession(clientHeaders http.Header, chain []session.Proc) (string, pluginSession) {
-	affinity := s.affinityOn()
-	procs := chain != nil && s.processesOn()
-	agent := affinityClient(clientHeaders)
-	if sid, header := session.IDHeaderFrom(clientHeaders, s.SessionIDHeaders); sid != "" {
-		// The process's claim first: it adopts the process's own pending bucket, which is
-		// certainly its calls, before the agent-wide guess can take the session.
-		if procs {
-			s.Sessions.ClaimProcess(sid, agent, chain)
-		}
-		if affinity {
-			s.Sessions.Claim(sid, agent)
-		}
-		return sid, pluginSession{source: pipeline.SessionSourceHeader, header: header}
+func (s *Server) resolvePluginSession(clientHeaders http.Header, chain []attribution.Proc) (string, pluginSession) {
+	return s.pluginSessionOf(s.attribute(clientHeaders, chain))
+}
+
+// pluginSessionOf is an attribution as plugins hear it: its plugin id, else — for no
+// identity at all — the store's ActiveSession(), the in-cluster answer.
+func (s *Server) pluginSessionOf(at attribution.Attribution) (string, pluginSession) {
+	if sid := at.PluginID(); sid != "" {
+		return sid, pluginSession{source: at.Source, header: at.Header}
 	}
-	if procs {
-		// The default bucket is SessionForProcess's answer for a process of no agent while
-		// an agent is active, and plugins hear it as "", as they do affinity's below.
-		switch sid := s.Sessions.SessionForProcess(chain, agent); {
-		case sid == "":
-		case sid == session.DefaultSessionID:
-			return "", pluginSession{}
-		case strings.HasPrefix(sid, session.PendingPrefix):
-			return sid, pluginSession{source: pipeline.SessionSourcePending}
-		default:
-			return sid, pluginSession{source: pipeline.SessionSourceProcess}
-		}
-	}
-	if affinity {
-		// See session.Store.SessionForClient for the order. The default bucket is its
-		// "ambiguous" answer, and plugins hear that as "" — the no-identity answer this
-		// function exists to give them — while recording files it under default.
-		switch sid := s.Sessions.SessionForClient(agent); {
-		case sid == "":
-		case sid == session.DefaultSessionID:
-			return "", pluginSession{}
-		case strings.HasPrefix(sid, session.PendingPrefix):
-			return sid, pluginSession{source: pipeline.SessionSourcePending}
-		default:
-			return sid, pluginSession{source: pipeline.SessionSourceAffinity}
-		}
-	}
-	if s.Sessions != nil {
+	if at.Session == "" && at.Source != pipeline.SessionSourcePending && s.Sessions != nil {
 		if sid := s.Sessions.ActiveSession(); sid != "" {
 			return sid, pluginSession{source: pipeline.SessionSourceActive}
 		}
@@ -1550,23 +2337,47 @@ func (s *Server) resolvePluginSession(clientHeaders http.Header, chain []session
 	return "", pluginSession{}
 }
 
-// affinityOn reports whether header-less requests are filed by coding agent. It needs
-// header bucketing: a client's session is the one its header named, so with id_headers
-// empty no session is ever any client's and every known agent would collect in its
-// pending bucket forever.
-func (s *Server) affinityOn() bool {
-	return s.ClientAffinity && s.Sessions != nil && len(s.SessionIDHeaders) > 0
+// attribute is the attributor's answer for a request, or what an attributor with nothing
+// configured gives — no session — when there is none (sessions off, or a test Server built
+// without one).
+func (s *Server) attribute(clientHeaders http.Header, chain []attribution.Proc) attribution.Attribution {
+	a := s.attributor()
+	if a == nil {
+		return attribution.Attribution{Agent: attribution.AgentOf(clientHeaders)}
+	}
+	if !s.processesOn() {
+		chain = nil
+	}
+	return a.Resolve(clientHeaders, chain)
 }
 
-// affinityClient names the coding agent behind a request for session attribution. Read
-// from the headers as RECEIVED, like the session header beside it, so it is the same
-// User-Agent pctx.ResolveClient pins. Nil headers — the transparent path — name nobody.
-func affinityClient(clientHeaders http.Header) string {
-	if clientHeaders == nil {
-		return ""
+// attributor is the Server's Attributor, built on first use from SessionIDHeaders and
+// ClientAffinity — fields the caller sets after NewServer — and registered with the store,
+// which tells it which sessions exist. nil without a store.
+func (s *Server) attributor() *attribution.Attributor {
+	if s.Sessions == nil {
+		return nil
 	}
-	return pipeline.ParseUserAgent(clientHeaders.Get("User-Agent")).AffinityName()
+	s.attributorOnce.Do(func() {
+		s.attr = attribution.New(attribution.Config{
+			SessionIDHeaders: s.SessionIDHeaders,
+			ClientAffinity:   s.ClientAffinity,
+		})
+		s.Sessions.AddRecorder(s.attr)
+	})
+	return s.attr
 }
+
+// touch is attribution's Touch, a no-op without process attribution.
+func (s *Server) touch(sid string, chain []attribution.Proc) {
+	if a := s.attributor(); a != nil && chain != nil {
+		a.Touch(sid, chain)
+	}
+}
+
+// affinityClient names the coding agent behind a request for session attribution; see
+// attribution.AgentOf.
+func affinityClient(clientHeaders http.Header) string { return attribution.AgentOf(clientHeaders) }
 
 // sessionViewFor returns the recorded view for sid, or an empty view carrying
 // just the id when nothing has been recorded under it yet.
@@ -1635,8 +2446,19 @@ func (s *Server) recordOutboundResponseEvent(pctx *pipeline.Context, statusCode 
 	// when nothing was pinned (defensive — a response-only path), then to
 	// the default bucket. See Context.OutboundSessionID.
 	sid := s.responseSessionID(pctx)
+	// Always record — see the request-phase comment. This is what surfaces
+	// responses no plugin acted on (e.g. a generic 404), carrying StatusCode
+	// + Error even with empty invocations.
+	s.Sessions.Append(sid, outboundResponseEvent(pctx, statusCode, fail))
+}
+
+// outboundResponseEvent builds the SessionResponse row every outbound answer is
+// recorded through — the shared shape, so the WebSocket splice
+// (relayUpgradedWebSocket) can adjust its byte fields without forking the
+// snapshotting logic.
+func outboundResponseEvent(pctx *pipeline.Context, statusCode int, fail *pipeline.EventError) pipeline.SessionEvent {
 	plugins := pipeline.SnapshotPlugins(pctx.Extensions.Custom)
-	ev := pipeline.SessionEvent{
+	return pipeline.SessionEvent{
 		At:             time.Now(),
 		Direction:      pipeline.Outbound,
 		Phase:          pipeline.SessionResponse,
@@ -1654,14 +2476,12 @@ func (s *Server) recordOutboundResponseEvent(pctx *pipeline.Context, statusCode 
 		StatusCode:     statusCode,
 		Error:          pipeline.EventErrorOr(pctx, fail),
 		Duration:       pipeline.DurationSince(pctx.StartedAt),
+		Ttfb:           pipeline.DurationBetween(pctx.StartedAt, pctx.ResponseHeadersAt),
 		Client:         pctx.ClientInfo(),
 		Subagent:       pctx.Subagent(),
 		ParentSubagent: pctx.ParentSubagent(),
+		Proc:           pctx.AttributedProc(),
 	}
-	// Always record — see the request-phase comment. This is what surfaces
-	// responses no plugin acted on (e.g. a generic 404), carrying StatusCode
-	// + Error even with empty invocations.
-	s.Sessions.Append(sid, ev)
 }
 
 // bufferResponseBody reads resp's body whole for the response phase. When it
@@ -1691,11 +2511,11 @@ func (s *Server) bufferResponseBody(w http.ResponseWriter, r *http.Request, resp
 	if err != nil {
 		status, fail = pipeline.ExchangeFailure(r.Context(), err)
 		if r.Context().Err() == nil {
-			slog.Warn("forward-proxy: response body read error", "host", r.Host, "kind", fail.Kind, "error", fail.Message)
+			slog.Warn("forward-proxy: response body read error", "host", pipeline.SanitizeLogValue(r.Host), "kind", fail.Kind, "error", fail.Message)
 		}
 		http.Error(w, `{"error":"response body read error"}`, http.StatusBadGateway)
 	} else {
-		slog.Warn("forward-proxy: response body too large", "host", r.Host, "limit", maxBodySize)
+		slog.Warn("forward-proxy: response body too large", "host", pipeline.SanitizeLogValue(r.Host), "limit", maxBodySize)
 		http.Error(w, `{"error":"response body too large"}`, http.StatusBadGateway)
 		status, fail = http.StatusBadGateway, &pipeline.EventError{
 			Kind:    "proxy_error",
@@ -1708,19 +2528,49 @@ func (s *Server) bufferResponseBody(w http.ResponseWriter, r *http.Request, resp
 	return nil, false
 }
 
-// isEventStream reports whether a Content-Type header value names the
-// SSE media type. Content-Type may carry parameters (charset=, boundary=,
-// etc.) so we match on the bare type/subtype prefix and tolerate any
-// suffix. Case-insensitive per RFC 9110 §8.3.1.
-func isEventStream(contentType string) bool {
-	if contentType == "" {
-		return false
+// classifyBrokenStream classifies a mid-body read error on a relay path
+// (#1543). fail is what the response row should carry — client_canceled
+// when the client hung up first, the transport kind otherwise, with the
+// upstream's status as error.code exactly as the buffered path records it.
+// Two of the errors that reach here are the proxy's own cuts, not the
+// upstream's — the idle read cutoff and the per-frame size cap — and both
+// record proxy_error, the kind CLAUDE.md reserves for "the one that is
+// ours", exactly as the buffered path records its own size limit. An
+// operator reading an upstream_error row should be looking at the network,
+// never at streamReadIdleTimeout.
+//
+// abort says the client's connection must be reset — the caller panics with
+// http.ErrAbortHandler — instead of letting the handler return normally: a
+// normal return makes net/http write the terminating chunk (h1) or
+// END_STREAM (h2), handing the client a COMPLETE response off a stream the
+// upstream cut off. ErrAbortHandler is the standard library's own abort
+// signal: deferred finalization still runs, and net/http does not log it as
+// a panic. abort is false only when the client hung up first — there is
+// nobody left to abort for.
+// pctx.StatusCode goes back to zero, as the buffered path does on a failed
+// read: the deferred RunFinish derives the outcome from it after the handler
+// returns, and a 200 there would report OutcomeAllow for an exchange the
+// client saw reset — lineage labelling "ok" a failed one, the exact
+// misreading the buffered path's zero exists to prevent. The row is
+// unaffected: it records resp.StatusCode, the status already on the wire.
+func classifyBrokenStream(pctx *pipeline.Context, r *http.Request, resp *http.Response, err error) (fail *pipeline.EventError, abort bool) {
+	switch {
+	case errors.Is(err, errIdleCut):
+		fail = &pipeline.EventError{Kind: "proxy_error", Message: fmt.Sprintf("stream idle over the proxy's %s read cutoff", streamReadIdleTimeout)}
+	case errors.Is(err, sseframe.ErrFrameTooLarge):
+		fail = &pipeline.EventError{Kind: "proxy_error", Message: fmt.Sprintf("single SSE frame over the %d-byte frame cap", maxBodySize)}
+	default:
+		_, fail = pipeline.ExchangeFailure(r.Context(), err)
 	}
-	// Strip parameters: "text/event-stream; charset=utf-8" → "text/event-stream".
-	if idx := strings.IndexByte(contentType, ';'); idx >= 0 {
-		contentType = contentType[:idx]
+	fail.Code = strconv.Itoa(resp.StatusCode)
+	pctx.StatusCode = 0
+	if r.Context().Err() != nil {
+		slog.Debug("forward-proxy: streaming response ended by client hangup", "host", pipeline.SanitizeLogValue(r.Host), "error", err)
+		return fail, false
 	}
-	return strings.EqualFold(strings.TrimSpace(contentType), "text/event-stream")
+	slog.Warn("forward-proxy: streaming response read error — aborting the client connection",
+		"host", pipeline.SanitizeLogValue(r.Host), "kind", fail.Kind, "error", fail.Message)
+	return fail, true
 }
 
 // isKnownMislabeledSSE reports whether host+path is a known endpoint that sends real SSE
@@ -1764,17 +2614,22 @@ func (s *Server) handleStreamingResponse(w http.ResponseWriter, r *http.Request,
 		// is supported by net/http's default ResponseWriter, so this
 		// is a defensive guard for exotic wrappers (httptest with a
 		// custom recorder, embedded servers).
-		slog.Warn("forward-proxy: ResponseWriter does not support flushing — falling back to buffered for streaming response", "host", r.Host)
+		slog.Warn("forward-proxy: ResponseWriter does not support flushing — falling back to buffered for streaming response", "host", pipeline.SanitizeLogValue(r.Host))
 		s.streamFallbackBuffered(w, r, resp, pctx)
 		return
 	}
 
+	// Set by the read-error arm below; the deferred recorder puts it on the
+	// response row so a stream the upstream broke mid-body stops showing as
+	// a clean 200 in agentop (#1543).
+	var streamFail *pipeline.EventError
+
 	// Defer the final last=true dispatch + session-event recording so
 	// every exit path (normal EOF, upstream read error, downstream
-	// client-write error) finalizes aggregating plugins and records
-	// the response event. Without this, a client disconnect mid-stream
-	// leaves inference/a2a stuck in an unfinalized state and emits no
-	// SessionResponse row to agentop.
+	// client-write error, the ErrAbortHandler panic below) finalizes
+	// aggregating plugins and records the response event. Without this, a
+	// client disconnect mid-stream leaves inference/a2a stuck in an
+	// unfinalized state and emits no SessionResponse row to agentop.
 	defer func() {
 		// Use a detached, BOUNDED context for finalization: the client may have
 		// cancelled the request context after reading the full stream, but
@@ -1792,19 +2647,15 @@ func (s *Server) handleStreamingResponse(w http.ResponseWriter, r *http.Request,
 			// Headers already sent; we can't promote to 502, but
 			// surface the policy violation so operators see it.
 			slog.Warn("forward-proxy: streaming response rejected on finalization (headers already sent)",
-				"host", r.Host, "violation", finalAction.Violation)
+				"host", pipeline.SanitizeLogValue(r.Host), "violation", finalAction.Violation)
 		}
-		s.recordOutboundResponseEvent(pctx, resp.StatusCode, nil)
+		s.recordOutboundResponseEvent(pctx, resp.StatusCode, streamFail)
 	}()
 
 	// Forward headers and the streaming status code BEFORE the first
 	// frame is written. Strip Content-Length since we'll be writing
-	// chunked, and clear hop-by-hop headers as net/http would.
-	for key, values := range resp.Header {
-		for _, value := range values {
-			w.Header().Add(key, value)
-		}
-	}
+	// chunked; copyResponseHeaders clears the hop-by-hop set as net/http would.
+	copyResponseHeaders(w, resp)
 	w.Header().Del("Content-Length")
 	w.WriteHeader(resp.StatusCode)
 	flusher.Flush()
@@ -1816,15 +2667,21 @@ func (s *Server) handleStreamingResponse(w http.ResponseWriter, r *http.Request,
 			break
 		}
 		if err != nil {
-			// Read error or oversized single frame. The client has
-			// already received some frames; the cleanest signal is to
-			// close the connection and log. We can't promote this to
-			// 502 — headers are sent.
+			// Read error or oversized single frame. We can't promote this to
+			// 502 — headers are sent — so the client's only honest signal is a
+			// broken connection: returning normally would write the terminating
+			// chunk and hand it a COMPLETE stream off a cut-off one (#1543).
+			// The deferred finalize + recorder above still run, both on the
+			// panic path and the plain break.
 			// bytesRead, not the bytesWritten this used to keep in a local: the
 			// local was declared after the recording defer and never reached the
 			// session event, so the figure is now taken off the counting wrapper
 			// around resp.Body — which is bytes received, not frames relayed.
-			slog.Warn("forward-proxy: streaming response read error", "host", r.Host, "error", err, "bytesRead", pctx.ResponseBytes)
+			var abort bool
+			streamFail, abort = classifyBrokenStream(pctx, r, resp, err)
+			if abort {
+				panic(http.ErrAbortHandler)
+			}
 			break
 		}
 
@@ -1840,7 +2697,7 @@ func (s *Server) handleStreamingResponse(w http.ResponseWriter, r *http.Request,
 				// stream, which is the best we can do without inspect-
 				// before-forward semantics.
 				slog.Warn("forward-proxy: streaming response rejected mid-stream by plugin",
-					"host", r.Host, "violation", respAction.Violation)
+					"host", pipeline.SanitizeLogValue(r.Host), "violation", respAction.Violation)
 				break
 			}
 		}
@@ -1851,7 +2708,7 @@ func (s *Server) handleStreamingResponse(w http.ResponseWriter, r *http.Request,
 		// used to drop event:, id:, retry: and comment lines, which clients
 		// type, resume and keep alive by.
 		if _, err := w.Write(block.Raw); err != nil {
-			slog.Debug("forward-proxy: streaming write error", "host", r.Host, "error", err)
+			slog.Debug("forward-proxy: streaming write error", "host", pipeline.SanitizeLogValue(r.Host), "error", err)
 			break
 		}
 		flusher.Flush()
@@ -1882,7 +2739,7 @@ func (s *Server) streamPassthrough(w http.ResponseWriter, r *http.Request, resp 
 		// No incremental delivery possible on this ResponseWriter — buffer.
 		// http.Flusher is implemented by net/http's default writer; this is a
 		// defensive guard for test recorders and exotic wrappers.
-		slog.Warn("forward-proxy: ResponseWriter does not support flushing — falling back to buffered for streaming response", "host", r.Host)
+		slog.Warn("forward-proxy: ResponseWriter does not support flushing — falling back to buffered for streaming response", "host", pipeline.SanitizeLogValue(r.Host))
 		s.streamFallbackBuffered(w, r, resp, pctx)
 		return
 	}
@@ -1896,17 +2753,23 @@ func (s *Server) streamPassthrough(w http.ResponseWriter, r *http.Request, resp 
 		return
 	}
 
+	// Set by the read-error arm below; the deferred recorder puts it on the
+	// response row so a stream the upstream broke mid-body stops showing as a
+	// clean 200 in agentop (#1543).
+	var streamFail *pipeline.EventError
+
 	// Record the response event on every exit path (normal EOF, upstream read
-	// error, downstream write error) so a SessionResponse row still lands.
-	defer s.recordOutboundResponseEvent(pctx, resp.StatusCode, nil)
+	// error, downstream write error, the ErrAbortHandler panic below) so a
+	// SessionResponse row still lands. A closure, not a bare defer call:
+	// defer evaluates its arguments up front, so streamFail must be read at
+	// exit time, not at entry.
+	defer func() {
+		s.recordOutboundResponseEvent(pctx, resp.StatusCode, streamFail)
+	}()
 
 	// Forward headers + status before the first byte. Drop Content-Length since
 	// we relay an open-ended chunked stream.
-	for key, values := range resp.Header {
-		for _, value := range values {
-			w.Header().Add(key, value)
-		}
-	}
+	copyResponseHeaders(w, resp)
 	w.Header().Del("Content-Length")
 	w.WriteHeader(resp.StatusCode)
 	flusher.Flush()
@@ -1920,14 +2783,21 @@ func (s *Server) streamPassthrough(w http.ResponseWriter, r *http.Request, resp 
 		n, readErr := body.Read(buf)
 		if n > 0 {
 			if _, writeErr := w.Write(buf[:n]); writeErr != nil {
-				slog.Debug("forward-proxy: streaming write error", "host", r.Host, "error", writeErr)
+				slog.Debug("forward-proxy: streaming write error", "host", pipeline.SanitizeLogValue(r.Host), "error", writeErr)
 				return
 			}
 			flusher.Flush()
 		}
 		if readErr != nil {
 			if readErr != io.EOF {
-				slog.Warn("forward-proxy: streaming response read error", "host", r.Host, "error", readErr)
+				// Returning normally would write the terminating chunk and
+				// hand the client a COMPLETE stream off a cut-off one (#1543);
+				// the deferred recorder above still runs on the panic path.
+				var abort bool
+				streamFail, abort = classifyBrokenStream(pctx, r, resp, readErr)
+				if abort {
+					panic(http.ErrAbortHandler)
+				}
 			}
 			return
 		}
@@ -1961,7 +2831,7 @@ func (s *Server) streamFallbackBuffered(w http.ResponseWriter, r *http.Request, 
 		s.rejectResponse(w, pctx, respAction)
 		return
 	}
-	if s.OutboundPipeline.HasStreamingResponders() {
+	if s.OutboundPipeline.ForPctx(pctx).HasStreamingResponders() {
 		// Re-parse the buffered SSE body frame-by-frame so plugins see the
 		// same per-event shape as the real streaming path. A Reject is
 		// honored here — headers are not yet on the wire.
@@ -1991,7 +2861,7 @@ func (s *Server) streamFallbackBuffered(w http.ResponseWriter, r *http.Request, 
 				break
 			}
 			if ferr != nil {
-				slog.Warn("forward-proxy: streaming response read error in fallback", "host", r.Host, "error", ferr)
+				slog.Warn("forward-proxy: streaming response read error in fallback", "host", pipeline.SanitizeLogValue(r.Host), "error", ferr)
 				break
 			}
 			frameAction := s.OutboundPipeline.RunResponseFrame(foldCtx, pctx, frame, false)
@@ -2012,14 +2882,10 @@ func (s *Server) streamFallbackBuffered(w http.ResponseWriter, r *http.Request, 
 		}
 	}
 	s.recordOutboundResponseEvent(pctx, resp.StatusCode, nil)
-	for key, values := range resp.Header {
-		for _, value := range values {
-			w.Header().Add(key, value)
-		}
-	}
+	copyResponseHeaders(w, resp)
 	w.WriteHeader(resp.StatusCode)
 	if _, err := io.Copy(w, resp.Body); err != nil {
-		slog.Debug("response copy error", "host", r.Host, "error", err)
+		slog.Debug("response copy error", "host", pipeline.SanitizeLogValue(r.Host), "error", err)
 	}
 }
 
@@ -2047,10 +2913,43 @@ func (s *Server) recordOutboundRejectIn(tl *tunnelLog, pctx *pipeline.Context, a
 	s.appendOutbound(tl, sid, sessionevent.Deny(pctx, action, pipeline.Outbound))
 }
 
+// egressAllowRefusal builds the destination_denied refusal for an off-list
+// destination and records the deny invocation on pctx. The invocation is
+// what makes the denied-phase session row land at all — recordOutboundRejectIn
+// skips events with no invocations, and a listener gate is not a plugin, so
+// the record is ours to make. Phase is stamped explicitly because the gate
+// runs outside a pipeline pass, where the framework's currentPhase is empty
+// and the row's snapshot filters by it. Details name the host the way the
+// moca conformance suite's audit event reads it ({decision:
+// destination_denied, host, ...}); #1482's JSON audit channel builds on the
+// same row.
+func egressAllowRefusal(pctx *pipeline.Context, host string) pipeline.Action {
+	pctx.Record(pipeline.Invocation{
+		Plugin:  "egress-allowlist",
+		Action:  pipeline.ActionDeny,
+		Phase:   pipeline.InvocationPhaseRequest,
+		Reason:  "destination_denied",
+		Details: map[string]string{"host": host},
+	})
+	return pipeline.MocaRefusal(http.StatusForbidden, "destination_denied", host)
+}
+
 // connectDialTimeout bounds the upstream TCP dial for a CONNECT tunnel.
 // Once the tunnel is open the timeout no longer applies — the agent's TLS
 // handshake and subsequent traffic flow at their own pace.
-const connectDialTimeout = 30 * time.Second
+//
+// 10s, not the 30s it long was, because the only dials that wait it out are
+// black-holed ones (#1251): a refused or unroutable destination answers a TCP
+// SYN with an RST in well under a second, while a host that drops the SYN
+// silently — off the VPN that reaches it, behind a dead NAT — consumes the
+// whole budget and the agent spends it staring at nothing. By 10s the initial
+// SYN and its first four scheduled retransmits (1s, 2s, 4s, 8s) have all gone
+// unanswered; a handshake that misses five straight tries is not being saved
+// by a sixth at 16s, so the rest of the budget bought no connection, only
+// latency before the 502. Matches the budget the bridge already trusts for
+// its own upstream probe (upstreamVerifyTimeout) and the mTLS dialer's plain
+// dial, which had settled on 10s independently.
+const connectDialTimeout = 10 * time.Second
 
 // handleConnect tunnels HTTPS (and any other TLS-wrapped protocol) through
 // the forward proxy as raw TCP. Mirrors the TLS-passthrough behavior of
@@ -2067,6 +2966,7 @@ const connectDialTimeout = 30 * time.Second
 // GitHub API, etc.) where the agent's existing TLS is the right answer.
 func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 	s.noteTunnel()
+	attribution.Strip(r.Header)
 	pctx := &pipeline.Context{
 		Direction: pipeline.Outbound,
 		Method:    r.Method, // always "CONNECT" here, but populated for parity with handleRequest
@@ -2080,6 +2980,41 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 	// recordTunnelOpened builds its event, so the pin is what keeps the tunnel row
 	// attributed to the agent that opened it.
 	pctx.ResolveClient()
+
+	// The connection's own answer, resolved once for this CONNECT — the egress
+	// refusal below is recorded before hydration, so it needs the same trusted
+	// sid the hydrated path gets (see serveOutbound's, same reasoning).
+	trusted := s.trustedSessionOf(r)
+
+	// Egress allow list (#1483): when on, an off-list CONNECT target is refused
+	// here — before the SkipHosts match, so a skip entry cannot exempt an
+	// off-list host (the allowlist is the outer boundary), and before the
+	// pipeline and the dial, so the destination is neither resolved nor
+	// contacted: the refusal happens at a point Go's resolver has not run
+	// (it runs inside net.DialTimeout, which this return never reaches), which
+	// is the conformance contract's "no DNS, no connect" by construction. The
+	// named 403 is written with plain WriteRejection, never
+	// WriteRejectionForRequest: the egress boundary's answer is the contract,
+	// and the MCP JSON-RPC 200 rewrite would hide it behind a protocol frame.
+	if s.EgressAllow != nil && !s.EgressAllow.Allows(r.Host, "tcp") {
+		host := hostOnly(r.Host)
+		action := egressAllowRefusal(pctx, host)
+		// Session resolution the recordUnbufferedRequest way — pre-pipeline,
+		// from the connection's own answer first, then the client's headers and
+		// process — so the denied row lands in the bucket the request would have
+		// recorded under. The trusted sid has to come first here for the same
+		// reason it does on the plain path: this CONNECT is refused before
+		// hydration, and a VM's denied row filed by header or process lands in
+		// another VM's session (#1569 review).
+		chain := s.clientChain(r)
+		s.recordOutboundReject(pctx, action, s.recordingSessionID(trusted, r.Header, chain))
+		// Sanitized like the serveOutbound refusal: host is client-controlled and
+		// lands in a log file.
+		slog.Info("forward-proxy: CONNECT destination refused by egress allow list",
+			"host", pipeline.SanitizeLogValue(host))
+		httpx.WriteRejection(w, action)
+		return
+	}
 
 	// SkipHosts short-circuit: open the tunnel without running the
 	// pipeline or recording a session event. The pipeline never ran,
@@ -2099,11 +3034,11 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 	pat, skipped := s.SkipHosts.MatchPattern(pctx.Host)
 	if skipped {
 		slog.Info("forward-proxy: skip_hosts match (CONNECT) — opening tunnel without pipeline + recording",
-			"host", pctx.Host, "pattern", pat)
+			"host", pipeline.SanitizeLogValue(pctx.Host), "pattern", pat)
 	}
 
 	var sessionID string
-	var chain []session.Proc
+	var chain []attribution.Proc
 	if !skipped {
 		defer func() {
 			s.OutboundPipeline.RunFinish(r.Context(), pctx, pipeline.OutcomeFromContext(pctx))
@@ -2117,8 +3052,10 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 		// announces its session on CONNECT is honored; most do not, and those
 		// fall through to ActiveSession() exactly as before.
 		chain = s.clientChain(r)
-		if s.Sessions != nil {
-			sessionID = s.hydrateSession(pctx, r.Header, chain)
+		// Same widening as the request path: the trusted answer needs no store,
+		// and a VM's tunnel must carry its identity even with the store off.
+		if s.Sessions != nil || trusted != "" {
+			sessionID = s.hydrateSession(pctx, trusted, r.Header, chain)
 		}
 
 		// Run the outbound pipeline. Plugins that policy on host/identity
@@ -2143,9 +3080,13 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 	// request files under this pin, when it settles. Pinned only now, after the pipeline,
 	// for the reason sessionID is a local; left unpinned where affinity had no answer, for
 	// the reason in tunnelSessionID. See recordTunnelOpened. With process attribution the
-	// pin is the process's answer, which is never empty.
+	// pin is the process's answer, which is never empty. A trusted connection answer is
+	// pinned ahead of both, whatever those knobs say: identity from the connection must
+	// not need session.client_affinity to reach a tunnel's own rows (#1569 review).
 	if !skipped && s.Sessions != nil {
 		switch {
+		case trusted != "":
+			pctx.OutboundSessionID = trusted
 		case chain != nil && s.processesOn():
 			// The client's process is known, so the tunnel's own row goes where that
 			// process's requests go — default included, for a process of no agent.
@@ -2161,7 +3102,7 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 	// Hijack() call happens after dial succeeds — http.Error needs an
 	// un-hijacked ResponseWriter to deliver the dial-failure 502.
 	if _, ok := w.(http.Hijacker); !ok {
-		slog.Error("forward-proxy: ResponseWriter does not support hijacking", "host", r.Host)
+		slog.Error("forward-proxy: ResponseWriter does not support hijacking", "host", pipeline.SanitizeLogValue(r.Host))
 		http.Error(w, `{"error":"connect not supported by listener"}`, http.StatusInternalServerError)
 		return
 	}
@@ -2175,24 +3116,109 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 	// plugin ran, so there is nothing to attribute them to.
 	tl := s.newTunnelLog(pctx, skipped)
 	tl.conn = connProcOf(r.Context())
+	// Kept for AdoptBridgedRequest: the requests this tunnel decrypts are parsed
+	// fresh and inherit nothing from here, so a connection-derived identity has
+	// to be re-stamped from the CONNECT onto each of them.
+	tl.connect = r
 
 	// Plain TCP dial. See package-level comment on why mTLS doesn't
 	// apply here. r.Host on a CONNECT carries "host:port" already.
-	upstream, err := net.DialTimeout("tcp", r.Host, connectDialTimeout)
+	//
+	// dialTarget is what actually gets dialed: r.Host itself when the guard is
+	// off, else the address the guard checked — resolved once here, and reused
+	// verbatim by the bridge-fall-open re-dial below, so no second resolution
+	// can ever re-answer between check and connect (the DNS-rebinding window).
+	dialTarget := r.Host
+	bridgeable := s.bridgeable(r.Host)
+	var resolveErr error // a non-refusal CheckAddr failure: the name would not resolve
+	if s.EgressGuard != nil {
+		checked, cerr := s.EgressGuard.CheckAddr(r.Context(), "tcp", r.Host)
+		if cerr != nil {
+			var ref *egressguard.Refusal
+			if errors.As(cerr, &ref) {
+				slog.Warn("forward-proxy: CONNECT destination refused by egress guard",
+					// Sanitized like the Debug line in serveOutbound: r.Host is
+					// client-controlled and lands in a log file.
+					"host", pipeline.SanitizeLogValue(r.Host), "addr", ref.Addr.String())
+				// A policy answer, not a failed exchange. skip_hosts destinations
+				// are refused too — a bypass must not become an SSRF bypass — and
+				// tl's rows are no-ops for them, exactly as the dial failure's are.
+				httpx.WriteRejection(w, pipeline.DenyStatus(http.StatusForbidden, "destination_private",
+					fmt.Sprintf("refusing to reach private destination %s (%s)", ref.Host, ref.Addr)))
+				// The 426 rule again: a delivered 403 the Finisher reads as an
+				// allow, because the guard did what it was configured to.
+				pctx.StatusCode = http.StatusForbidden
+				tl.open(pipeline.TunnelDestPrivate)
+				tl.close(http.StatusForbidden, &pipeline.EventError{
+					Kind:    pipeline.ErrorKindDestinationPrivate,
+					Message: ref.Error(),
+				}, 0, 0)
+				return
+			}
+			// Not a refusal: the name would not resolve. Same shape as a dial
+			// failure — nothing was dialed, and the client gets the 502. Where the
+			// bridge could take the connection, fall through instead, carrying the
+			// resolution error as the pre-dial's failure: the bridge can still
+			// bridge it, and a redirect can move the request to a name that
+			// resolves (#1595). The empty checked address is never dialed.
+			// Both values sanitized: the name is client-controlled, and the error
+			// embeds it (net.DNSError quotes the name it failed to resolve).
+			if !bridgeable {
+				slog.Warn("forward-proxy: CONNECT destination resolution failed",
+					"host", pipeline.SanitizeLogValue(r.Host),
+					"error", pipeline.SanitizeControlRunes(cerr.Error()))
+				http.Error(w, `{"error":"bad gateway"}`, http.StatusBadGateway)
+				tl.open(pipeline.TunnelDialFailed)
+				tl.close(http.StatusBadGateway, dialError(cerr), 0, 0)
+				return
+			}
+			resolveErr = cerr
+		}
+		dialTarget = checked
+		// The audit trail against rebinding: "asked for the name, dialed this
+		// address" — moca's egress conformance reads it off the tunnel open row.
+		pctx.DialedAddr = checked
+	}
+	var upstream net.Conn
+	var memoized bool
+	err := resolveErr
+	if err == nil {
+		upstream, err, memoized = s.dialUpstream(dialTarget, bridgeable)
+	}
+	// dialFail remembers a pre-dial that failed where the bridge could take the
+	// connection: the connection continues with no upstream, because the bridge
+	// can still take it — a plugin redirect (inference-router moving a pinned
+	// session) sends the decrypted request to a live server, and an opaque tunnel
+	// to a dead origin helps nobody (#1595). Every path below that would have used
+	// the upstream handles a nil one by closing with this error or re-dialing
+	// (tunnelOrDial). freshDialFail is the failure when it came from a dial this
+	// connection made itself, not a memo hit: re-dialing would only repeat it
+	// behind the 200 the client already has, so tunnelOrDial closes with it.
+	var dialFail, freshDialFail error
 	if err != nil {
-		slog.Warn("forward-proxy: CONNECT upstream dial failed", "host", r.Host, "error", err)
-		http.Error(w, `{"error":"bad gateway"}`, http.StatusBadGateway)
-		// Recorded rather than dropped: an unreachable destination used to leave no
-		// trace in the timeline at all.
-		tl.open(pipeline.TunnelDialFailed)
-		tl.close(http.StatusBadGateway, dialError(err), 0, 0)
-		return
+		if !bridgeable {
+			slog.Warn("forward-proxy: CONNECT upstream dial failed", "host", pipeline.SanitizeLogValue(r.Host), "error", err)
+			http.Error(w, `{"error":"bad gateway"}`, http.StatusBadGateway)
+			// Recorded rather than dropped: an unreachable destination used to leave no
+			// trace in the timeline at all.
+			tl.open(pipeline.TunnelDialFailed)
+			tl.close(http.StatusBadGateway, dialError(err), 0, 0)
+			return
+		}
+		slog.Warn("forward-proxy: CONNECT upstream dial failed; trying the TLS bridge",
+			"host", pipeline.SanitizeLogValue(r.Host), "error", err)
+		dialFail = err
+		if !memoized {
+			freshDialFail = err
+		}
 	}
 
 	clientConn, _, err := w.(http.Hijacker).Hijack()
 	if err != nil {
-		_ = upstream.Close()
-		slog.Error("forward-proxy: CONNECT hijack failed", "host", r.Host, "error", err)
+		if upstream != nil {
+			_ = upstream.Close()
+		}
+		slog.Error("forward-proxy: CONNECT hijack failed", "host", pipeline.SanitizeLogValue(r.Host), "error", err)
 		return
 	}
 
@@ -2202,7 +3228,9 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 	// io.Copy goroutines until the OS finally times the socket out.
 	// 30s is loose enough to not perturb idle traffic and tight enough
 	// that operators get prompt cleanup on dead connections.
-	enableKeepalive(upstream)
+	if upstream != nil {
+		enableKeepalive(upstream)
+	}
 	enableKeepalive(clientConn)
 
 	// Tell the agent the tunnel is up. Per RFC 7231 §4.3.6 a 200 to
@@ -2210,8 +3238,10 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 	// subsequent bytes from either side are application data.
 	if _, err := clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n")); err != nil {
 		_ = clientConn.Close()
-		_ = upstream.Close()
-		slog.Debug("forward-proxy: CONNECT 200 write failed", "host", r.Host, "error", err)
+		if upstream != nil {
+			_ = upstream.Close()
+		}
+		slog.Debug("forward-proxy: CONNECT 200 write failed", "host", pipeline.SanitizeLogValue(r.Host), "error", err)
 		return
 	}
 
@@ -2220,38 +3250,54 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 	if s.TLSBridge != nil {
 		pc := &peekedConn{Conn: clientConn, r: bufio.NewReaderSize(clientConn, sniffBufSize)}
 		clientConn = pc // replay peeked bytes into whichever path runs
+		// A server-first protocol (SSH, SMTP) sends nothing until it reads the
+		// banner, so bound the peek: a short or empty first classifies as
+		// not-TLS and the tunnel takes the opaque path. Shorter than
+		// sniffHost's 5s because this delay is user-visible — the banner only
+		// flows once this returns.
+		_ = clientConn.SetReadDeadline(time.Now().Add(connectSniffTimeout))
 		first, _ := pc.Peek(5)
+		_ = clientConn.SetReadDeadline(time.Time{})
 		authority := r.Host // CONNECT target is already host:port
 		key := hostOnly(r.Host)
 		var bridge bool
 		reason, bridge = s.bridgeVerdict(r, tl, key, first)
 		if bridge {
 			s.noteBridgeAttempt()
-			_ = upstream.Close() // bridgeServe dials its own verified upstream
-			if s.bridgeServe(clientConn, authority, key, tl) {
+			if upstream != nil {
+				_ = upstream.Close() // bridgeServe dials its own verified upstream
+			}
+			if s.bridgeServe(clientConn, authority, key, tl, dialFail != nil) {
 				return
 			}
-			// fell open → re-dial for the tunnel. That tunnel is opaque, so it closes
-			// like any other opaque one.
-			up2, derr := net.DialTimeout("tcp", r.Host, connectDialTimeout)
-			if derr != nil {
-				// The client already has its 200, so that stays the status, and the
-				// error says why the tunnel died. Closing the client is what makes
-				// that close row true: the hijacked conn is this handler's to close,
-				// and it used to be left open for the client to time out on.
-				_ = clientConn.Close()
-				tl.close(http.StatusOK, dialError(derr), 0, 0)
-				return
-			}
-			sent, received := tunnel(clientConn, up2)
-			_ = up2.Close()
-			tl.close(http.StatusOK, nil, sent, received)
+			// fell open → re-dial for the tunnel. That tunnel is opaque, so it
+			// closes like any other opaque one. dialTarget, not r.Host: the address
+			// was already checked once, and re-resolving here would reopen the
+			// rebinding window the check closed. freshDialFail, when set, skips the
+			// re-dial: the pre-dial already failed on a real dial of this target.
+			s.tunnelOrDial(clientConn, dialTarget, tl, freshDialFail)
 			return
 		}
 	}
 
 	// Every path that reaches here left the bytes opaque without entering
-	// bridgeServe, so this is where their reason gets recorded.
+	// bridgeServe, so this is where their reason gets recorded — except a
+	// certainly-dead origin, which keeps the dial-failed reason the docs and
+	// dashboards key on, whatever made the bridge decline.
+	// The pre-dial failed (or was skipped as memoized-dead) and the bridge
+	// declined the connection: dial now — the memo's optimism was for the bridge
+	// path, and a plain tunnel still needs a real upstream. A fresh failure needs
+	// no second dial; a memo hit is up to dialFailMemoTTL old, and the origin may
+	// have come back.
+	if upstream == nil {
+		if freshDialFail != nil {
+			tl.open(pipeline.TunnelDialFailed)
+		} else {
+			tl.open(reason)
+		}
+		s.tunnelOrDial(clientConn, dialTarget, tl, freshDialFail)
+		return
+	}
 	tl.open(reason)
 
 	// Bidirectional copy until either side closes.
@@ -2284,21 +3330,42 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 // data either way. The wider hazard — closing the body concurrently
 // with an active Read — is the documented unblock mechanism the
 // stdlib http transport relies on for forced disconnects.
+//
+// When the timer — not the upstream — is what closed the body, Read
+// surfaces errIdleCut instead of the bare closed-body error, so
+// classifyBrokenStream can record the cut as proxy_error rather than
+// blaming a healthy upstream (#1543: on the issue's own log, 68 of
+// 103 truncations were this cutoff killing MCP's standing GET).
 type idleReadCloser struct {
 	rc        io.ReadCloser
 	timeout   time.Duration
 	closeOnce sync.Once
+	cutFired  atomic.Bool
 }
+
+// errIdleCut is the read error idleReadCloser returns when its timer closed
+// the body. Matched with errors.Is; see classifyBrokenStream.
+var errIdleCut = errors.New("stream cut by the proxy's idle read cutoff")
 
 func idleReader(rc io.ReadCloser, timeout time.Duration) io.ReadCloser {
 	return &idleReadCloser{rc: rc, timeout: timeout}
 }
 
 func (i *idleReadCloser) Read(p []byte) (int, error) {
-	timer := time.AfterFunc(i.timeout, i.closeIdempotent)
+	timer := time.AfterFunc(i.timeout, i.cut)
 	n, err := i.rc.Read(p)
 	timer.Stop()
+	if err != nil && i.cutFired.Load() {
+		return n, errIdleCut
+	}
 	return n, err
+}
+
+// cut is the timer's callback: mark that THIS close was the cutoff's, so a
+// concurrent or next Read reports the cut rather than an upstream break.
+func (i *idleReadCloser) cut() {
+	i.cutFired.Store(true)
+	i.closeIdempotent()
 }
 
 func (i *idleReadCloser) Close() error {
@@ -2578,6 +3645,10 @@ type tunnelLog struct {
 	// conn is the CONNECT's client process slot, handed to the requests a bridged tunnel
 	// decrypts; nil off the CONNECT path.
 	conn *connProc
+	// connect is the CONNECT request itself, kept for AdoptBridgedRequest so a
+	// listener that derived identity from the accepting connection can stamp it
+	// onto each decrypted request too. nil off the CONNECT path.
+	connect *http.Request
 	// program is the client's program when the bridge rules named it, nil when they did
 	// not. bridgeServe records a handshake's failure against it when set and against the
 	// host when not, which is what the transparent listener and a nameless client get.

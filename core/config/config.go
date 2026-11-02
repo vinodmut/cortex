@@ -45,6 +45,9 @@ type Config struct {
 	// TLSBridge, when non-nil and Enabled, terminates agent outbound TLS so the
 	// outbound pipeline sees decrypted HTTPS. See docs/.../tlsbridge-design.md.
 	TLSBridge *TLSBridgeConfig `yaml:"tls_bridge,omitempty" json:"tls_bridge,omitempty"`
+	// Memory, when set, applies a Go runtime soft memory limit
+	// (debug.SetMemoryLimit) at boot. See MemoryConfig.
+	Memory *MemoryConfig `yaml:"memory,omitempty" json:"memory,omitempty"`
 	// Pricing configures model rates for the whole process — one section rather
 	// than a knob per plugin, so cost is consistent wherever it is reported.
 	//
@@ -224,6 +227,54 @@ func (c *CostLedgerConfig) Validate() error {
 			minCostLedgerRetentionDays, c.RetentionDays)
 	}
 	return nil
+}
+
+// MemoryConfig applies a Go runtime soft memory limit at boot. The limit is
+// SOFT by the runtime's contract: near it the GC runs more often (trading CPU
+// for memory — that is where the savings come from), and a live heap that
+// genuinely exceeds it is allowed to grow past it rather than fail any
+// allocation. The failure mode of setting it too low is slowness near the
+// limit, never a crash. It counts Go-managed memory (heap, stacks, runtime
+// structures); cgo allocations, the CPEX build's FFI included, sit outside it.
+//
+// It exists because nothing in cmd/ or core/ bounded the runtime's appetite:
+// with GOGC at its default the heap is sized to ~2x live, and session-API
+// reads leave the memory they expand from the store's sharing as idle RSS —
+// measured, a live heap of ~1.4GB carried 2.9GB of RSS (#1541). A limit caps
+// both.
+//
+// Boot-only, like mtls: apply it where the process starts, not per reload.
+type MemoryConfig struct {
+	// LimitMB is the soft limit in megabytes. Zero disables the limit (an
+	// explicitly-set zero is kept as "off"); the block absent entirely leaves
+	// the defaulting to the binary — cmd/cortex applies
+	// DefaultLocalMemoryLimitMB for a local install, none anywhere else.
+	LimitMB int `yaml:"limit_mb" json:"limit_mb"`
+}
+
+// DefaultLocalMemoryLimitMB is the soft memory limit a local install uses
+// when the config carries no memory block. The default must be COMPUTED
+// (MemoryLimitBytes), never written into a stored *Config: the reloader
+// compares the active config against a fresh disk load on every reload, so a
+// boot-time cfg.Memory assignment would refuse every reload on a local
+// install. Same shape as ArchiveRunsOnLocalInstall — a method, not state.
+const DefaultLocalMemoryLimitMB = 2048
+
+// MemoryLimitBytes reports the configured soft limit in bytes, or 0 for off.
+// A nil memory block on a local install defaults to
+// DefaultLocalMemoryLimitMB; anywhere else it is off. localInstall is a
+// parameter because the binary, not the file, knows it.
+func (c *Config) MemoryLimitBytes(localInstall bool) int64 {
+	if c.Memory != nil {
+		if c.Memory.LimitMB <= 0 {
+			return 0
+		}
+		return int64(c.Memory.LimitMB) << 20
+	}
+	if localInstall {
+		return int64(DefaultLocalMemoryLimitMB) << 20
+	}
+	return 0
 }
 
 // TLSBridgeConfig configures the outbound TLS bridge (TLS termination of
@@ -928,6 +979,10 @@ type ListenerConfig struct {
 	// consult SkipHosts — that is the hard egress guard and must not
 	// be self-exemptable via the agent's outbound destination.
 	//
+	// When EgressAllowHosts (or MOCA_EGRESS_ALLOW) is non-empty, the
+	// allowlist is checked FIRST and a skip pattern cannot exempt an
+	// off-list host: the allowlist is the outer boundary.
+	//
 	// Match-all patterns ("*", "**", whitespace-only) and patterns
 	// containing ":port" are rejected at startup so a single
 	// misconfigured entry can't silently disable all outbound
@@ -935,27 +990,124 @@ type ListenerConfig struct {
 	// in #496.
 	SkipHosts []string `yaml:"skip_hosts" json:"skip_hosts"`
 
+	// EgressAllowHosts is the forward proxy's deny-by-default destination
+	// allow list (#1483, MOCA MI1 §8.5): when non-empty, an outbound
+	// destination not on the list is refused with 403 destination_denied
+	// naming the host — header X-Moca-Egress-Error, text/plain body
+	// "destination_denied: <host>\n", the moca egress conformance
+	// contract's refusal shape — before the plugin pipeline, before DNS
+	// resolution and before any dial, so an off-list host is answered by
+	// name rather than left to time out. Applies to CONNECT targets,
+	// absolute-form http:// hosts, and the target a plugin's redirect
+	// moved a request to.
+	//
+	// Entries are "host:port", exact match (no globs — a wildcard in a
+	// security boundary is one typo from "allow everything", so the shapes
+	// that would widen it are rejected at startup). Hosts compare
+	// lowercased without a trailing dot; a destination naming no port
+	// defaults to its scheme's (80 http, 443 otherwise).
+	//
+	// Checked BEFORE skip_hosts: when the list is on it is the outer
+	// boundary, and a skip_hosts entry for an off-list host is refused,
+	// not honored — bypass must not become an egress bypass.
+	//
+	// When this field is empty, the binary falls back to the
+	// MOCA_EGRESS_ALLOW environment variable (comma-separated host:port
+	// entries) — the channel the MOCA conformance harness drives the
+	// target with. Both empty means the feature is off and outbound
+	// behavior is unchanged.
+	//
+	// SCOPE — this gates the FORWARD PROXY's paths only, and "outer
+	// boundary" above means outer with respect to skip_hosts, not with
+	// respect to every way a byte can leave the pod. Not covered:
+	//
+	//   - the transparent listener (listener.transparent_proxy_addr,
+	//     proxy-sidecar enforce-redirect mode): egress that iptables
+	//     REDIRECTs there is NOT filtered by this list.
+	//     HandleTransparentConn runs the shared pipeline but dials the
+	//     recovered destination without consulting it. Note the contrast
+	//     with SkipHosts above, which that listener also does not consult
+	//     — there the omission hardens the boundary, here it leaves a way
+	//     around this one.
+	//   - the extproc listener (envoy-sidecar mode): no wiring at all —
+	//     only cmd/cortex builds a Matcher, and only onto the forward
+	//     proxy server.
+	//
+	// MOCA shape A is the proxy-sidecar forward proxy and #1483 names
+	// CONNECT plus absolute-form only, so that is the scope this field
+	// claims. A deployment that also captures traffic by iptables
+	// REDIRECT, or runs envoy-sidecar, needs its egress held somewhere
+	// else too — deny-by-default here is not deny-by-default for the pod.
+	//
+	// A listener.* field: changing it requires a restart, like every other
+	// listener knob.
+	EgressAllowHosts []string `yaml:"egress_allow_hosts,omitempty" json:"egress_allow_hosts,omitempty"`
+
 	// DeclineResponsesWebSockets: whether the forward proxy answers a WebSocket
 	// upgrade on an OpenAI Responses API path (one ending /responses, on chatgpt.com
-	// or api.openai.com) with 426 itself, instead of forwarding the request with its Upgrade stripped. nil means
-	// unset, and the default is on; explicit false restores the forwarding. See
+	// or api.openai.com) with 426 itself, instead of forwarding the upgrade. nil
+	// means unset, and the default is on; explicit false forwards it. See
 	// DeclinesResponsesWebSockets for why on is the default.
 	//
 	// A pointer for the reason SessionConfig.Enabled is one: with a plain bool,
 	// "unset" and "false" are the same value, and the default could not be on.
 	DeclineResponsesWebSockets *bool `yaml:"decline_responses_websockets,omitempty" json:"decline_responses_websockets,omitempty"`
+
+	// EgressGuard arms the SSRF dial guard on the forward proxy's every
+	// outbound dial (#1484): each destination is resolved once, refused with
+	// 403 destination_private when it lands in loopback, link-local (cloud
+	// metadata, 169.254.169.254), RFC 1918 / unique-local space, RFC 6598
+	// CGNAT (100.64.0.0/10), or one of this host's own interface addresses —
+	// the addresses themselves, not their on-link subnets — and dialed at the
+	// checked address, so DNS rebinding cannot re-answer between check and
+	// connect. CONNECT tunnels, plain and bridged requests, transparent
+	// redirects and skip_hosts traffic are all covered: a bypass must not
+	// become an SSRF bypass.
+	//
+	// OFF BY DEFAULT, deliberately: a sidecar's ordinary upstreams — Keycloak,
+	// in-cluster services, a laptop's local model — live in exactly the
+	// refused space, so defaulting this on would break every existing
+	// deployment. An operator who wants the hard boundary (or runs the MOCA
+	// shape, where the sandbox's egress is meant to be public-only) enables it
+	// and lists the private prefixes still allowed in permit_cidrs.
+	//
+	// permit_cidrs covers prefixes within the refused space only; link-local,
+	// unspecified, multicast and the AWS IPv6 metadata address
+	// (fd00:ec2::254) are NEVER permitted, whatever the list says — the
+	// metadata ranges are what this guard exists among other things to
+	// protect.
+	//
+	// A pointer so "absent" (off) stays distinguishable from an explicit
+	// enabled: false, mirroring DeclineResponsesWebSockets. Listener.* field:
+	// changing it requires a restart, like every other listener knob.
+	EgressGuard *EgressGuardConfig `yaml:"egress_guard,omitempty" json:"egress_guard,omitempty"`
+}
+
+// EgressGuardConfig configures the forward proxy's SSRF dial guard.
+type EgressGuardConfig struct {
+	// Enabled arms the guard. False (or an absent egress_guard block) keeps
+	// the dial behavior unchanged.
+	Enabled bool `yaml:"enabled" json:"enabled"`
+
+	// PermitCIDRs lists CIDR prefixes within the refused space that remain
+	// dialable — e.g. ["127.0.0.1/32"] for a laptop proxy whose upstream is a
+	// local model, or ["10.0.0.0/8"] for an in-cluster deployment. Never has
+	// any effect on link-local, unspecified, multicast or the AWS IPv6
+	// metadata address (fd00:ec2::254).
+	PermitCIDRs []string `yaml:"permit_cidrs,omitempty" json:"permit_cidrs,omitempty"`
 }
 
 // DeclinesResponsesWebSockets reports whether the forward proxy answers a WebSocket
 // upgrade on a Responses API path with 426 rather than forwarding it.
 //
-// On unless set false, in every deployment. The proxy must strip Upgrade (RFC 9110
-// makes it hop-by-hop), so a forwarded upgrade reaches the origin as a bare GET, and
-// OpenAI's Responses endpoint answers that 405. Codex reads a 405 as transient and
-// retries for about six seconds before falling back to HTTPS; it reads a 426 as "use
-// HTTP" and falls back at once. The forwarded request can never become a WebSocket, so
-// nothing is lost by answering it here. False is the escape hatch for a client that
-// reads 426 some other way.
+// On unless set false, in every deployment. The proxy CAN forward a WebSocket (it
+// does for every other host, #1488), but a Responses session on one is opaque to
+// every parser — no token counts, no cost — so the 426 keeps Codex on HTTPS where
+// its traffic stays observable. That, and history: before forwarding existed the
+// stripped handshake drew a 405 that Codex retried for about six seconds before
+// falling back to HTTPS, while it reads a 426 as "use HTTP" and falls back at once.
+// False is the escape hatch for a client that reads 426 some other way — or wants
+// the WebSocket for real.
 func (l ListenerConfig) DeclinesResponsesWebSockets() bool {
 	return l.DeclineResponsesWebSockets == nil || *l.DeclineResponsesWebSockets
 }
@@ -1075,12 +1227,6 @@ func Load(path string) (*Config, error) {
 	if cfg.TLSBridge != nil {
 		if err := cfg.TLSBridge.Validate(); err != nil {
 			return nil, err
-		}
-		// With the bridge on, the session API may carry decrypted request/response
-		// bodies; restrict its bind to loopback so other pods can't scrape it.
-		// kubectl port-forward (agentop) still works — it targets the pod's loopback.
-		if cfg.TLSBridge.Mode == "enabled" {
-			cfg.Listener.SessionAPIAddr = forceLocalhost(cfg.Listener.SessionAPIAddr)
 		}
 	}
 

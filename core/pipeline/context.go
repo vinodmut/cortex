@@ -126,21 +126,24 @@ type Context struct {
 	// UpgradeStripped names the protocol the client asked to switch to —
 	// "websocket" in every case seen so far — on a request whose Upgrade header
 	// the forward proxy then removed. Empty on every other request, which is
-	// almost all of them.
+	// almost all of them: a WebSocket the proxy FORWARDS (#1488) carries no
+	// marker, because nothing was stripped.
 	//
 	// Set by the listener, not a plugin, and purely diagnostic: nothing reads it
 	// to change behaviour. It exists because the stripping is CORRECT and its
-	// consequence is baffling. RFC 9110 makes Upgrade hop-by-hop, so a proxy must
-	// not forward it; but the request then reaches the origin as a bare GET, and
-	// an origin whose endpoint takes a POST or an upgrade and nothing else answers
-	// 405. Codex does exactly this against chatgpt.com, retries about five times
+	// consequence was baffling. RFC 9110 makes Upgrade hop-by-hop, so a proxy
+	// must not forward it on an ordinary request; but a stripped upgrade request
+	// reaches the origin as a bare GET, and an origin whose endpoint takes a POST
+	// or an upgrade and nothing else answers 405. Codex did exactly this against
+	// chatgpt.com, retried about five times
 	// over roughly six seconds, falls back to HTTPS and works — leaving the user
 	// looking at `405 Method Not Allowed` in their agent's output with every
 	// reason to think Cortex broke, and an event saying only `backend_error/405`
 	// with nothing connecting the two. (Codex no longer reaches that 405 by default:
 	// the forward proxy answers a Responses API WebSocket with 426 itself, which it
 	// reads as "use HTTPS" at once — see listener.decline_responses_websockets. The
-	// marker is still set there, since the Upgrade is still not forwarded.)
+	// marker is still set there, since the Upgrade is still not forwarded. Every
+	// other WebSocket is forwarded, and those rows carry no marker.)
 	//
 	// Recorded on the REQUEST row, where the fact is true, and paired with the
 	// response row's status by RequestID — the same split Tunnel/TunnelReason use.
@@ -150,10 +153,32 @@ type Context struct {
 	// an origin quietly serves the un-upgraded request instead.
 	UpgradeStripped string
 
+	// DialedAddr is the address the listener dialed for this request, "ip:port",
+	// set when the egress guard is enabled — the resolved address the guard
+	// checked, which may differ from Host whenever the destination was named.
+	// Read by the recorder onto SessionEvent.DialAddr; moca's egress conformance
+	// pins it as the audit trail against DNS rebinding. Listener-set: a plugin
+	// has no way to write it, for the same reason it has no way to write Host
+	// after the dial.
+	DialedAddr string
+
 	// StartedAt is the wall-clock time this context was constructed by the
 	// listener at the start of a request. Used on the response path to
 	// compute SessionEvent.Duration without walking the event history.
 	StartedAt time.Time
+
+	// ResponseHeadersAt is the wall-clock time the upstream's response HEADERS
+	// arrived — when client.Do returned (both proxy listeners) or Envoy delivered
+	// the response-headers callback (extproc). Set by the listener, once, on the
+	// arm that actually got a response; left zero on a failed exchange, so
+	// SessionEvent.Ttfb stays absent rather than reporting a figure for a call
+	// that never answered (#1251). Together with StartedAt it decomposes a
+	// response's Duration: ttfb is how long the origin took to answer, and the
+	// remainder is the body — for a streamed completion, how long it took to
+	// finish streaming. Duration alone cannot tell a slow-to-answer origin from
+	// a slow-to-finish stream, which is the distinction an operator sorting by
+	// duration is usually asking the timeline for.
+	ResponseHeadersAt time.Time
 
 	// requestID backs RequestID(), which generates it on first use. See
 	// requestid.go for why it is lazy rather than a constructor argument.
@@ -190,6 +215,12 @@ type Context struct {
 	subagent       string
 	parentSubagent string
 	subagentParsed bool
+
+	// attributedProc, namingHeader and attributed hold SetAttribution's pin.
+	attributedProc string
+	clientProc     string
+	namingHeader   string
+	attributed     bool
 
 	Agent    *AgentIdentity
 	Identity Identity // nil before an auth plugin runs
@@ -378,6 +409,18 @@ type Context struct {
 	// reference so a pctx is safe to pass across pipelines in tests.
 	dispatched []int
 
+	// pinned is the *Pipeline this request's Run dispatched on, set by
+	// Holder.Run. Every later phase on the same pctx (RunResponse,
+	// RunResponseFrame, RunFinish, Resend) runs against it rather than
+	// whatever the Holder currently holds: a reload can Store a new
+	// pipeline while a request is open (CONNECT tunnels and SSE streams
+	// stay open for minutes), and pctx.dispatched holds indexes into the
+	// OLD pipeline's plugin slice — indexing the new one with them panics
+	// when the new chain is shorter and otherwise runs hooks on plugins
+	// that never saw OnRequest. Direct *Pipeline calls (not via a Holder)
+	// never reload under a live request and leave this nil.
+	pinned *Pipeline
+
 	// outcome is populated exactly once by Pipeline.RunFinish immediately
 	// before dispatching OnFinish on the first plugin. Nil during OnRequest
 	// and OnResponse. Read via Outcome() so the "nil outside OnFinish"
@@ -467,7 +510,7 @@ type Context struct {
 // being parsed ten times; it does not escape.
 //
 // THE COPY IS AN ALLOCATION PER CALL, roughly ten per request, and that is the price of the
-// line above. sanitizeUA's fast path is written not to allocate, which bounds what a hostile
+// line above. SanitizeControlRunes's fast path is written not to allocate, which bounds what a hostile
 // header costs; this one is unconditional and buys the integrity claim instead.
 func (c *Context) ClientInfo() *EventClient {
 	if c.clientParsed {
@@ -891,7 +934,7 @@ func (c *Context) RecordStrippedUpgrade(h http.Header) {
 	if v == "" {
 		return
 	}
-	c.UpgradeStripped = capUA(sanitizeUA(strings.ReplaceAll(v, "\t", " ")))
+	c.UpgradeStripped = capUA(SanitizeControlRunes(strings.ReplaceAll(v, "\t", " ")))
 }
 
 // ResponseBodyMutated is the response-side analogue of BodyMutated, and
