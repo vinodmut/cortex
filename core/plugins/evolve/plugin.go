@@ -49,6 +49,7 @@ type config struct {
 	LearnNamespace string   `json:"learn_namespace" description:"Evolve namespace learned guidelines are written to, for review. Never injected from." default:"cortex-candidates"`
 	Profile        string   `json:"processing_profile" description:"Evolve processing profile the plugin creates and learns with." default:"cortex"`
 	Inject         *bool    `json:"inject" description:"Append guidelines to main-agent requests." default:"true"`
+	Placement      string   `json:"placement" description:"Where guidelines go: system (after the system instructions) or user (a system-reminder on the first user message)." default:"system" enum:"system,user"`
 	Learn          *bool    `json:"learn" description:"Send idle sessions' new turns to evolve to learn from." default:"true"`
 	Agents         []string `json:"agents" description:"Client names to act on (claude-code, codex, bob, opencode). Empty = all recognised agents."`
 	TopK           int      `json:"top_k" description:"Most guidelines to inject per session." default:"8"`
@@ -90,6 +91,9 @@ func (c *config) applyDefaults() {
 	if c.Profile == "" {
 		c.Profile = "cortex"
 	}
+	if c.Placement == "" {
+		c.Placement = placementSystem
+	}
 }
 
 func (c *config) validate() error {
@@ -98,6 +102,9 @@ func (c *config) validate() error {
 	}
 	if c.ServeNamespace == c.LearnNamespace {
 		return fmt.Errorf("serve_namespace and learn_namespace must differ: learned guidelines are reviewed before they are served")
+	}
+	if c.Placement != placementSystem && c.Placement != placementUser {
+		return fmt.Errorf("placement must be %q or %q, got %q", placementSystem, placementUser, c.Placement)
 	}
 	if c.TopK < 1 || c.TopK > 50 {
 		return fmt.Errorf("top_k must be between 1 and 50")
@@ -320,7 +327,7 @@ func (p *Plugin) OnRequest(ctx context.Context, pctx *pipeline.Context) (action 
 		pctx.Skip(reason)
 		return action
 	}
-	out, err := injectBlock(pctx.Body, d, entry.block)
+	out, err := injectBlock(pctx.Body, d, p.cfg.Placement, entry.block)
 	if err != nil || !gjson.ValidBytes(out) {
 		p.m.inc(&p.m.injectErrors)
 		ev.Error = "unsupported_request_shape"

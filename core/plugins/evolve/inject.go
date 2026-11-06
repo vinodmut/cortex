@@ -74,11 +74,20 @@ func formatBlock(gs []Guideline) string {
 
 var errUnsupportedShape = errors.New("unsupported request shape")
 
-// injectBlock appends block to the request's system instructions and returns
-// the new body. It edits the raw bytes with sjson rather than re-marshalling, so
-// every field it does not touch — cache_control markers included — survives
-// byte-for-byte.
-func injectBlock(body []byte, d dialect, block string) ([]byte, error) {
+const (
+	placementSystem = "system"
+	placementUser   = "user"
+)
+
+// injectBlock adds block to the request and returns the new body: after the
+// system instructions, or with placement "user" as a <system-reminder> leading
+// the first user message. It edits the raw bytes with sjson rather than
+// re-marshalling, so every field it does not touch — cache_control markers
+// included — survives byte-for-byte.
+func injectBlock(body []byte, d dialect, placement, block string) ([]byte, error) {
+	if placement == placementUser {
+		return injectFirstUser(body, d, "<system-reminder>\n"+block+"\n</system-reminder>")
+	}
 	switch d {
 	case dialectAnthropic:
 		return injectAnthropic(body, block)
@@ -131,6 +140,40 @@ func injectResponses(body []byte, block string) ([]byte, error) {
 		return sjson.SetBytes(body, "instructions", block)
 	case instructions.Type == gjson.String:
 		return sjson.SetBytes(body, "instructions", joinText(instructions.String(), block))
+	}
+	return nil, errUnsupportedShape
+}
+
+// injectFirstUser puts reminder ahead of the first user message's text, where
+// agents like Claude Code carry their own harness context. The conversation's
+// first message is the same on every turn, so the edit is too: the cached
+// prefix is broken only on the session's first request.
+func injectFirstUser(body []byte, d dialect, reminder string) ([]byte, error) {
+	path, textType := "messages", "text"
+	if d == dialectResponses {
+		path, textType = "input", "input_text"
+	}
+	items := gjson.GetBytes(body, path)
+	if !items.IsArray() {
+		return nil, errUnsupportedShape
+	}
+	for i, m := range items.Array() {
+		if m.Get("role").String() != "user" {
+			continue
+		}
+		at := fmt.Sprintf("%s.%d.content", path, i)
+		content := m.Get("content")
+		switch {
+		case content.Type == gjson.String:
+			return sjson.SetBytes(body, at, joinText(reminder, content.String()))
+		case content.IsArray():
+			parts := []any{map[string]string{"type": textType, "text": reminder}}
+			for _, part := range content.Array() {
+				parts = append(parts, rawJSON(part.Raw))
+			}
+			return sjson.SetBytes(body, at, parts)
+		}
+		return nil, errUnsupportedShape
 	}
 	return nil, errUnsupportedShape
 }

@@ -46,9 +46,13 @@ A withdrawn guideline stops being injected once each session's cache expires
 
 ## What a request looks like
 
-The block is appended after the existing system instructions — a trailing `system` text block
-on Anthropic Messages, the leading system message on Chat Completions, `instructions` on the
-Responses API:
+By default the block is appended after the existing system instructions — a trailing `system`
+text block on Anthropic Messages, the leading system message on Chat Completions,
+`instructions` on the Responses API. With `placement: user` it instead leads the session's
+first user message, wrapped in `<system-reminder>`, where Claude Code carries its own
+harness context. Models attend to that position more than to the end of a long system
+prompt, and some gateways drop trailing system blocks. The first user message is the same
+on every turn, so either placement keeps the prompt cache hitting after the first request:
 
 ```text
 <evolve-guidelines source="altk-evolve" ids="3,2">
@@ -122,6 +126,7 @@ pipeline:
 | `learn_namespace` | `cortex-candidates` | Learned guidelines, for review. Must differ. |
 | `processing_profile` | `cortex` | Evolve profile created and used for learning. |
 | `inject` | `true` | Append guidelines to main-agent requests. |
+| `placement` | `system` | `system`: after the system instructions. `user`: a `<system-reminder>` leading the first user message. |
 | `learn` | `true` | Send idle sessions' new turns to evolve. |
 | `agents` | all | Client names to act on (`claude-code`, `codex`, `bob`, `opencode`). |
 | `top_k` | `8` | Most guidelines injected per session. |

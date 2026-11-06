@@ -141,6 +141,7 @@ func TestConfigure_Validation(t *testing.T) {
 		`{"endpoint":"http://x","top_k":99}`,
 		`{"endpoint":"http://x","serve_namespace":"a","learn_namespace":"a"}`,
 		`{"endpoint":"http://x","min_turns":-1}`,
+		`{"endpoint":"http://x","placement":"tools"}`,
 	} {
 		if err := New().Configure(json.RawMessage(raw)); err == nil {
 			t.Errorf("Configure(%s) succeeded, want error", raw)
@@ -151,7 +152,7 @@ func TestConfigure_Validation(t *testing.T) {
 func TestConfigure_Defaults(t *testing.T) {
 	p, _ := configured(t, "", &fakeEvolve{})
 	if !*p.cfg.Inject || !*p.cfg.Learn || p.cfg.TopK != 8 || p.cfg.TimeoutMs != 3000 || p.cfg.CacheTTL != 1800 || p.cfg.IdleAfter != 900 ||
-		p.cfg.ServeNamespace != "cortex" || p.cfg.LearnNamespace != "cortex-candidates" || p.cfg.Profile != "cortex" {
+		p.cfg.ServeNamespace != "cortex" || p.cfg.LearnNamespace != "cortex-candidates" || p.cfg.Profile != "cortex" || p.cfg.Placement != "system" {
 		t.Fatalf("defaults not applied: %+v", p.cfg)
 	}
 }
@@ -221,6 +222,48 @@ func TestInject_Dialects(t *testing.T) {
 				t.Errorf("user message not preserved: %s", pctx.Body)
 			}
 		})
+	}
+}
+
+func TestInject_UserPlacementLeadsFirstUserMessage(t *testing.T) {
+	const reminder = "<system-reminder>\n<evolve-guidelines"
+	cases := []struct {
+		name, path, body, field string
+	}{
+		{"anthropic string content", "/v1/messages", `{"system":"base","messages":[{"role":"user","content":"fix the test"},{"role":"assistant","content":"ok"},{"role":"user","content":"later"}]}`, "messages.0.content"},
+		{"anthropic block content", "/v1/messages", `{"messages":[{"role":"user","content":[{"type":"text","text":"fix the test","cache_control":{"type":"ephemeral"}}]}]}`, "messages.0.content.0.text"},
+		{"chat after system message", "/v1/chat/completions", `{"messages":[{"role":"system","content":"base"},{"role":"user","content":"fix the test"}]}`, "messages.1.content"},
+		{"responses input", "/v1/responses", `{"instructions":"base","input":[{"role":"user","content":[{"type":"input_text","text":"fix the test"}]}]}`, "input.0.content.0.text"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p, _ := configured(t, `{"endpoint":"http://x","placement":"user"}`, &fakeEvolve{gs: twoGuidelines})
+			pctx := reqCtx(tc.path, tc.body)
+			run(t, p, pctx)
+			got := gjson.GetBytes(pctx.Body, tc.field).String()
+			if !strings.HasPrefix(got, reminder) || !strings.Contains(got, "</evolve-guidelines>\n</system-reminder>") {
+				t.Fatalf("%s = %q", tc.field, got)
+			}
+			if strings.Contains(string(pctx.Body), `"base\n\n<evolve`) || gjson.GetBytes(pctx.Body, "messages.2.content").String() == got {
+				t.Fatalf("block placed outside the first user message: %s", pctx.Body)
+			}
+			if strings.Contains(tc.body, "cache_control") && gjson.GetBytes(pctx.Body, "messages.0.content.1.cache_control.type").String() != "ephemeral" {
+				t.Fatalf("existing user blocks not preserved: %s", pctx.Body)
+			}
+			if !strings.Contains(string(pctx.Body), "fix the test") || !published(t, pctx).Injected {
+				t.Fatalf("task text or event lost: %s", pctx.Body)
+			}
+		})
+	}
+}
+
+func TestInject_UserPlacementWithoutUserMessageFailsOpen(t *testing.T) {
+	p, _ := configured(t, `{"endpoint":"http://x","placement":"user"}`, &fakeEvolve{gs: twoGuidelines})
+	body := `{"messages":[{"role":"assistant","content":"hi"}]}`
+	pctx := reqCtx("/v1/messages", body)
+	run(t, p, pctx)
+	if pctx.BodyMutated() || skipReason(pctx) != "unsupported_request_shape" {
+		t.Fatalf("mutated=%v skip=%q", pctx.BodyMutated(), skipReason(pctx))
 	}
 }
 
