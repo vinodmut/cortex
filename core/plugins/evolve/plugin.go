@@ -449,7 +449,7 @@ func (p *Plugin) OnFinish(_ context.Context, pctx *pipeline.Context) {
 	if !*p.cfg.Learn {
 		return
 	}
-	if out := pctx.Outcome(); out == nil || out.StatusCode < 200 || out.StatusCode >= 300 {
+	if !answered(pctx) {
 		return
 	}
 	reason, sessionID, agent := p.eligible(pctx)
@@ -468,6 +468,29 @@ func (p *Plugin) OnFinish(_ context.Context, pctx *pipeline.Context) {
 	}
 	s.rec.observe(pctx.Extensions.Inference)
 	s.last = p.now()
+}
+
+// answered reports whether the request got a whole response worth learning
+// from: a 2xx, or a response the client hung up on only after it had read the
+// end of it. Codex closes each stream as soon as it reads response.completed,
+// so the listener marks most of its turns client_canceled and resets the
+// status to 0, though the response arrived whole; without this most of every
+// Codex session would be dropped. A turn the parser never saw finish (no
+// finish reason, or a failed one) and a denied request are still skipped.
+func answered(pctx *pipeline.Context) bool {
+	out := pctx.Outcome()
+	if out == nil {
+		return false
+	}
+	if out.StatusCode >= 200 && out.StatusCode < 300 {
+		return true
+	}
+	if out.StatusCode != 0 || out.FinalAction != pipeline.OutcomeError {
+		return false
+	}
+	inf := pctx.Extensions.Inference
+	return inf != nil && inf.FinishReason != "" && inf.FinishReason != "failed" &&
+		(inf.Completion != "" || len(inf.ToolCalls) > 0)
 }
 
 func (p *Plugin) evictOldestSession() {

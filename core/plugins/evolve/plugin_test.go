@@ -438,6 +438,18 @@ func finish(t *testing.T, p *Plugin, pctx *pipeline.Context, status ...int) {
 	pipe.RunFinish(context.Background(), pctx, pipeline.Outcome{FinalAction: pipeline.OutcomeAllow, StatusCode: code})
 }
 
+// hungUp runs one request whose client closed the stream early, as the listener
+// reports it: status reset to 0 and an error outcome.
+func hungUp(t *testing.T, p *Plugin, pctx *pipeline.Context) {
+	t.Helper()
+	pipe, err := pipeline.New([]pipeline.Plugin{p})
+	if err != nil {
+		t.Fatalf("pipeline.New: %v", err)
+	}
+	pipe.Run(context.Background(), pctx)
+	pipe.RunFinish(context.Background(), pctx, pipeline.Outcome{FinalAction: pipeline.OutcomeError})
+}
+
 func session3(t *testing.T, p *Plugin) {
 	t.Helper()
 	finish(t, p, turn(h1, "Running.", bash1))
@@ -540,6 +552,75 @@ func TestLearn_SkipsTooFewTurnsAndIneligibleTraffic(t *testing.T) {
 	p.learnIdle(context.Background())
 	if len(fe.learned) != 0 {
 		t.Fatalf("learned = %+v", fe.learned)
+	}
+}
+
+// Codex closes each stream as soon as it has read response.completed, so the
+// listener reports most of its turns as client_canceled with status 0. A turn
+// that finished before the hang-up is learned from; one cut off before the end
+// is not.
+func TestLearn_KeepsTurnsTheClientHungUpOnAfterTheEnd(t *testing.T) {
+	fe := &fakeEvolve{}
+	p, c := configured(t, `{"endpoint":"http://x","idle_after_seconds":60}`, fe)
+	first := turn(h1, "Running.", bash1)
+	first.Extensions.Inference.FinishReason = "completed"
+	hungUp(t, p, first)
+	second := turn(h2, "Done.", nil, pipeline.InferenceToolResult{ToolUseID: "t1", Content: "ok"})
+	second.Extensions.Inference.FinishReason = "completed"
+	hungUp(t, p, second)
+	c.t = c.t.Add(61 * time.Second)
+	p.learnIdle(context.Background())
+	if len(fe.learned) != 1 {
+		t.Fatalf("learned = %+v, want the session", fe.learned)
+	}
+	var roles []string
+	for _, m := range fe.learned[0].t.Messages {
+		roles = append(roles, m["role"].(string))
+	}
+	if got := strings.Join(roles, ","); got != "user,assistant,tool,assistant" {
+		t.Errorf("roles = %s, want both turns and the tool result", got)
+	}
+}
+
+func TestLearn_SkipsTurnsCutOffOrDenied(t *testing.T) {
+	cases := map[string]func(*pipeline.Context) pipeline.Outcome{
+		"no finish reason": func(*pipeline.Context) pipeline.Outcome {
+			return pipeline.Outcome{FinalAction: pipeline.OutcomeError}
+		},
+		"failed": func(pctx *pipeline.Context) pipeline.Outcome {
+			pctx.Extensions.Inference.FinishReason = "failed"
+			return pipeline.Outcome{FinalAction: pipeline.OutcomeError}
+		},
+		"denied": func(pctx *pipeline.Context) pipeline.Outcome {
+			pctx.Extensions.Inference.FinishReason = "completed"
+			return pipeline.Outcome{FinalAction: pipeline.OutcomeDeny, DenyingPlugin: "ibac"}
+		},
+		"upstream error": func(pctx *pipeline.Context) pipeline.Outcome {
+			pctx.Extensions.Inference.FinishReason = "completed"
+			return pipeline.Outcome{FinalAction: pipeline.OutcomeError, StatusCode: 502}
+		},
+	}
+	for name, outcome := range cases {
+		t.Run(name, func(t *testing.T) {
+			fe := &fakeEvolve{}
+			p, c := configured(t, `{"endpoint":"http://x","idle_after_seconds":60}`, fe)
+			for _, pctx := range []*pipeline.Context{
+				turn(h1, "Running.", bash1),
+				turn(h2, "Done.", nil, pipeline.InferenceToolResult{ToolUseID: "t1", Content: "ok"}),
+			} {
+				pipe, err := pipeline.New([]pipeline.Plugin{p})
+				if err != nil {
+					t.Fatal(err)
+				}
+				pipe.Run(context.Background(), pctx)
+				pipe.RunFinish(context.Background(), pctx, outcome(pctx))
+			}
+			c.t = c.t.Add(61 * time.Second)
+			p.learnIdle(context.Background())
+			if len(fe.learned) != 0 {
+				t.Fatalf("learned = %+v, want nothing", fe.learned)
+			}
+		})
 	}
 }
 
