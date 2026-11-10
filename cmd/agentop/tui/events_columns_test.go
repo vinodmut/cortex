@@ -791,7 +791,7 @@ func TestColumnPicker_DoesNotReturnAfterAnAsyncPaneChange(t *testing.T) {
 // Cells must truncate to their own column's declared width, read from
 // cellContext rather than hardcoded.
 //
-// PLUGIN and HOST previously repeated 18 and 20 in their truncStr calls,
+// PLUGIN and HOST previously repeated 18 and 20 in their truncation calls,
 // duplicating the width two lines above — the same drift actionColWidth and
 // methodColWidth were named to prevent, in the file whose premise is that a column
 // is one definition. This fails if the plumbing regresses to a hardcoded number or
@@ -816,7 +816,7 @@ func TestEventColumns_CellsTruncateToTheirOwnWidth(t *testing.T) {
 			t.Errorf("%s cell is %d wide, exceeding its column width %d: %q", c.Title, n, c.Width, cell)
 		}
 		// A cell that came back empty for a column that has content to show would be
-		// the signature of a zero width reaching truncStr.
+		// the signature of a zero width reaching trunc.
 		if c.Title == "HOST" && n == 0 {
 			t.Error("HOST truncated to nothing; the column width was not plumbed through")
 		}
@@ -837,9 +837,7 @@ func TestNumericColumns_RightAligned(t *testing.T) {
 		Duration:  1230 * time.Millisecond,
 		Inference: &pipeline.InferenceExtension{OutputTokens: 42},
 	}
-	rows := []eventRow{{event: &ev}}
-	m := &model{}
-	cc := cellContext{m: m, rows: rows, i: 0, row: rows[0]}
+	cc := cellContext{m: &model{}, row: eventRow{event: &ev}}
 
 	numeric := map[eventColumnID]bool{colDuration: true, colTokens: true, colCost: true}
 	filled := 0

@@ -611,6 +611,9 @@ DEMO_FORWARD_PORT=47600
 DEMO_SESSION_PORT=47601
 DEMO_STATS_PORT=47602
 DEMO_HEALTH_PORT=47604
+# praxis mode: cortex-gateway's listener (praxis.listen) and the egress (praxis.egress).
+DEMO_GATEWAY_PORT=47605
+DEMO_EGRESS_PORT=47606
 
 # port_in_use exits 0 if something is already listening on the given loopback port.
 # Best-effort across platforms: lsof (macOS + many Linux), then ss (iproute2, the
@@ -670,8 +673,8 @@ pid_exe_path() { # pid
 		# default, so `-p <pid> -d txt` means "files of this pid OR any txt
 		# descriptor on the system" — which lists every process's executable, and
 		# `head -1` would then take whichever came first. On macOS this is the
-		# source foreign_proxy_holder judges, so a stray first record would name
-		# some other binary and classify our own managed proxy as foreign.
+		# source pre_rename_proxy_running judges, so a stray first record would name
+		# some other binary and hide a v0.7.0 proxy from --stop.
 		# (-sTCP:LISTEN elsewhere needs no -a: a state list is a filter, not an
 		# ORed selection set.)
 		_pep=$(lsof -p "$1" -a -d txt -Fn 2>/dev/null | sed -n 's/^n//p' | head -1)
@@ -693,7 +696,7 @@ PROXY_PIDFILE="${CORTEX_DIR}/proxy.pid"
 #   - after an unclean shutdown the OS can recycle the pid onto an unrelated process
 #     of the same user, which we must not SIGTERM/SIGKILL.
 # Where `ps` can name the process we require its basename to be exactly cortex — the
-# same check agentop's runningPID uses, so `agentop service install` and this script agree
+# same check agentop's proxyRunning makes, so `agentop service install` and this script agree
 # on what counts as "our proxy". Exact, not a pattern: macOS prints the full path, and
 # a path under ~/.cortex or any checkout of this repo contains the word, so a looser
 # match would claim a stranger's pid for stop_cortex to signal. Where the sandbox hides processes from `ps`, ps prints
@@ -706,6 +709,8 @@ proxy_running() {
 	kill -0 "${_pid}" 2>/dev/null || return 1
 	_comm=$(ps -o comm= -p "${_pid}" 2>/dev/null) || return 0
 	[ -z "${_comm}" ] && return 0
+	# agentop's proxyBinary, preRenameBinary and proxyPIDFile (cmd/agentop/proxy_names.go)
+	# hold the names this script checks. Change both together.
 	case "${_comm##*/}" in
 		cortex) return 0 ;;
 		*) return 1 ;;
@@ -778,7 +783,7 @@ stop_cortex() {
 	# we stopped what we know about means a foreign proxy this script did not start —
 	# worth naming, since in a sandbox it cannot be found through ps.
 	_busy=""
-	for _p in "${DEMO_FORWARD_PORT}" "${DEMO_SESSION_PORT}" "${DEMO_STATS_PORT}" "${DEMO_HEALTH_PORT}"; do
+	for _p in "${DEMO_FORWARD_PORT}" "${DEMO_SESSION_PORT}" "${DEMO_STATS_PORT}" "${DEMO_HEALTH_PORT}" "${DEMO_GATEWAY_PORT}" "${DEMO_EGRESS_PORT}"; do
 		port_in_use "${_p}" && _busy="${_busy} ${_p}"
 	done
 	if [ -n "${_stopped}" ]; then
@@ -834,7 +839,7 @@ no_setup() {
 restage() {
 	mkdir -p "${CORTEX_DIR}/tmp" || return 1
 	_rs=$(mktemp -d "${CORTEX_DIR}/tmp/stage.XXXXXX") || return 1
-	for _rs_b in agentop cortex cortex-session-dump; do
+	for _rs_b in agentop cortex cortex-session-dump cortex-gateway; do
 		[ ! -f "$1/${_rs_b}" ] || cp -p "$1/${_rs_b}" "${_rs}/${_rs_b}" || {
 			rm -rf "${_rs}"
 			return 1

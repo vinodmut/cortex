@@ -686,7 +686,7 @@ slot carries the parsed payload; the Invocation carries the
 attribution.
 
 Adding a new named extension is a core-library change: edit
-`pipeline/extensions.go`, `pipeline/session.go` (wire + JSON round-
+`model/extensions.go`, `model/session.go` (wire + JSON round-
 trip), the listener (snapshot + recorder), and agentop if you want
 bespoke rendering. Most new plugins don't need one — they emit an
 Invocation and publish extra context through the Custom map
@@ -1156,7 +1156,7 @@ Keep each implementation to a pure function over the extension's fields.
 Skip fragments with empty text — consumers never want zero-length entries.
 Stringify non-string values with `json.Marshal` so nested maps/slices
 become flat inspectable text. Reference implementations live alongside
-the types in [`core/pipeline/content.go`](../core/pipeline/content.go).
+the types in [`core/model/content.go`](../core/model/content.go).
 
 ### Consuming content in a guardrail
 
@@ -1265,6 +1265,110 @@ housekeeping — none of those qualify. Adding a method to the action
 set is a security-relevant change because it pulls the method into
 every guardrail's evaluation surface; review accordingly.
 
+## Session facts
+
+A plugin that judges a request against the session's history reads the
+session facts. It does not read `pctx.Session.Events`.
+
+- `pctx.LastIntent()` is the newest user intent: an inbound A2A request
+  (`model.IsIntent`). ibac reads it.
+- `pctx.LastInference()` is the newest outbound inference request
+  (`model.IsInferenceRequest`). sparc reads it in `mcp` mode.
+- `pctx.InferenceHosts()` is the session's `InferenceHosts` table and
+  `HostsKnown`. inference-router reads it. See
+  [The hosts fact](#the-hosts-fact).
+
+`LastIntent` and `LastInference` return a `pipeline.SessionFact`. Its
+`Event` is not nil only when its `State` is `FactPresent`.
+
+| State | Meaning |
+|---|---|
+| `FactNone` (the zero value) | The request has a session, and the store has no event of this kind for it. The store has no entry for the session yet, or it dropped the entry (`max_sessions`, `ttl`, `Delete`, `Clear`, a restart). Or no event of this kind was appended. Or a `session.max_events` trim removed the event. |
+| `FactNoSession` | The request has no session: `pctx.Session` is nil. |
+| `FactPresent` | `Event` is set. It points into `pctx.Session.Events`. |
+
+`LastIntent` and `LastInference` apply these rules, in order:
+
+1. `pctx.Session` is nil: `FactNoSession`, also when the listener set facts.
+2. The listener called `SetSessionFacts`: the fact that it set.
+3. Else, from `pctx.Session.Events`: `FactPresent`, or `FactNone`.
+
+Rule 3 serves a listener that sets only `pctx.Session`, and plugin tests
+that build a `SessionView`.
+
+Keep `FactNoSession` and `FactNone` apart when they are different
+decisions. ibac records `no_session` for the first and `no_intent` for the
+second:
+
+```go
+intent := pctx.LastIntent()
+if intent.State == pipeline.FactNoSession {
+    // the request has no session
+}
+if intent.Event == nil {
+    // FactNone: a session with no intent
+}
+```
+
+**Listeners.** Set `pctx.Session` and the facts from one
+`session.Store.ViewFacts` call, then call `pctx.SetSessionFacts`.
+`ViewFacts` reads the view and the facts under one read lock, so the two
+agree. When it returns a nil view, both facts are `FactNone`. A zero
+`SessionFacts` also reads as `FactNone`.
+
+- The forward proxy then gives plugins an empty view with the session id
+  (`sessionViewFor`), with `FactNone` facts. It keeps the table that
+  `ViewFacts` gave: with no entry, the archive's table.
+- ext_proc sets `pctx.Session` and the facts only with a view. With no view,
+  the facts read `FactNoSession`.
+
+### The hosts fact
+
+`InferenceHosts` has one `InferenceHostSeen` row for each agent and host.
+The store and the archive fold the row from each outbound inference
+request that is not an aside turn (`session.TurnOf`):
+
+- `Agent` is `model.AgentName(e.Client.Label())`.
+- `Host` is `e.Host` as recorded: where the bytes went.
+- `Last` is the seq of the newest such request.
+- `LastUnrouted` is the seq of the newest one that `session.CapturePath`
+  takes and that has no `RequestedHost`.
+
+The table holds hosts, not server names, because a hot reload can change
+the servers. A reader maps each host to a server by its own config when it
+reads: `LastServer(agent, serverAt)` gives the newest evidence for `agent`
+by the reader's `serverAt` map.
+
+`HostsKnown` false means "do not use the table". The zero `SessionFacts`
+has `HostsKnown` false. So when a listener sets facts with no table,
+inference-router scans the session's history, as it does with no facts.
+
+`InferenceHosts` applies these rules, in order:
+
+1. `pctx.Session` is nil: `(nil, false)`, also when the listener set facts.
+2. The listener called `SetSessionFacts`: the table and `HostsKnown` that
+   it set.
+3. Else `(nil, false)`. A view cannot vouch for a table: it can be a
+   trimmed part of the session.
+
+`ViewFacts` gives a copy of the table. The archive is the store's
+`session.HostsKeeper`, and the store reads it when `ViewFacts` answers:
+
+- An entry numbered after earlier history: the keeper's table, merged with
+  the entry's own. `HostsKnown` is the keeper's.
+- An entry with no earlier history: the entry's own table. `HostsKnown` is
+  true.
+- No entry: the keeper's table over every event it holds under the id.
+- No keeper: the entry's own table, or none. `HostsKnown` is false when a
+  `SeqSeeder` holds history for the id.
+
+A `session.max_events` trim removes no row. The archive's table is
+unknown in these cases:
+
+- A `session.json` from before the table, or of another rule version.
+- A `session.json` with segments and no summary.
+- A rename that the archive cannot split.
+
 ## Registering a plugin
 
 A plugin advertises itself to the pipeline builder through `RegisterPlugin`
@@ -1363,10 +1467,10 @@ The IBAC plugin (`core/plugins/ibac/judge.go`) is the in-tree reference; copy it
 - `core/config/config.go` — `PluginEntry` YAML shape and
   parsing.
 - `core/plugins/registry.go` — how Build calls Configure.
-- `core/pipeline/extensions.go` — named categories
+- `core/model/extensions.go` — named categories
   (`MCP`, `A2A`, `Inference`, `Security`, `Delegation`, `Auth`) + `Custom` map + escape-hatch
   convention.
-- `core/pipeline/session.go` — `SessionEvent` wire shape
+- `core/model/session.go` — `SessionEvent` wire shape
   and the `SessionDenied` phase.
 - `core/llmclient/` — chat-completions helper for
   plugins that call an LLM (see "Plugins making outbound LLM calls"

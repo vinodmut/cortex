@@ -9,6 +9,10 @@ laptop — and for the `agentop` TUI.
 **Trust model:** no authentication. Bind only on in-cluster addresses, never
 behind ingress. Payloads may contain raw user messages, LLM completions, and
 tool results.
+Where `listener.bind_loopback_only` is set (a local install), every route
+answers 403 to a request whose `Host` is not `localhost`, `127.0.0.1` or
+`::1`, or that carries an `Origin` header, so a web page cannot read it
+through DNS rebinding. The stats server applies the same check.
 
 ## Endpoints
 
@@ -16,15 +20,18 @@ tool results.
 |---|---|---|
 | `GET /` | text | One-line-per-endpoint index — answers "is this the session API, and on the right port?" |
 | `GET /v1/sessions` | `application/json` | List active sessions (see below) |
-| `GET /v1/sessions/{id}` | `application/json` | The session's most recent events; `?limit=N` and `?before=<seq>` page backward |
+| `GET /v1/sessions/{id}` | `application/json` | The session's most recent events; `?limit=N` and `?before=<seq>` page backward. `?view=summary` omits the large payloads |
 | `GET /v1/sessions/{id}/events/{seq}` | `application/json` | One event by its sequence number |
 | `GET /v1/sessions/{id}/timeline` | `application/json` | The session as spans: Claude Code agents, tool calls, subagent spawns and returns, and hosts (see below) |
+| `GET /v1/sessions/{id}/search` | `application/json` | The seqs of the session's events whose bodies or capture hold `?q=`, as the detail view shows them (see below) |
 | `DELETE /v1/sessions` | `application/json` | Clear every session: the store, and the session archive where one runs. The cost ledger is kept |
 | `DELETE /v1/sessions/{id}` | `application/json` | Erase one session: the store's entry and, where the archive runs, its files (see below) |
 | `GET /v1/events` | `text/event-stream` | SSE stream of new events; `?session=<id>` filters to one session. Heartbeat every 30s |
-| `GET /v1/pipeline` | `application/json` | Active pipeline composition, per plugin: name, direction, position, capabilities, runtime `config` |
-| `GET /v1/plugins` | `application/json` | Catalog of every registered plugin, active or not |
+| `GET /v1/pipeline` | `application/json` | Active pipeline composition, per plugin: name, direction, position, capabilities, runtime `config`. `onError` is sent only when it is not the default — in practice `observe`, since an `on_error: off` plugin is not built. A plugin under observe runs and records, but its rejections, body writes and redirects are dropped (header writes still apply), so its `config` says what it would do. agentop renders this as the Pipeline pane (`P`) |
+| `GET /v1/plugins` | `application/json` | Catalog of every registered plugin, active or not. 404 when the binary built its session API without `WithCatalog`. agentop renders this as the Catalog pane (`C`) |
 | `GET /v1/usage` | `application/json` | Windowed usage aggregation — the aggregate behind `agentop cost`; parameters and semantics in [`pricing.md`](pricing.md#reading-usage-over-http) |
+| `POST /v1/ingest` | NDJSON in, `204` out | Praxis mode only: rows that `cortex-gateway` records (see below). 404 otherwise |
+| `GET /v1/ingest/stats` | `application/json` | Praxis mode only: the ingestion counters (see below). 404 otherwise |
 | `GET /healthz` | text | Liveness probe |
 
 ## `GET /v1/sessions`
@@ -50,12 +57,22 @@ knowing by name:
   own events (a `/rename`, else a `<user_query>`, else ordinary user prose,
   with `<system-reminder>` blocks excised). Folded at append time and
   first-wins, except that a `/rename` always overrides. Nothing addresses a
-  session by its title.
+  session by its title. agentop's `TITLE` column uses it only as a fallback,
+  after a harvested Claude Code transcript title. For its re-harvest backoff,
+  agentop still treats a row with only a served title as unnamed, so it keeps
+  looking for the harvested title.
 - **`inferenceHost`** — the host of the session's most recent request that
   carried an inference parse; after a redirect, the server it was sent to
-  rather than the host the client named. `inferenceHostFromHistory` is `true`
-  when that host came only from the archive's fold, because no request the
-  proxy's current entry for the session holds has set it.
+  rather than the host the client named. Folded at append time, latest wins.
+  Tunnel rows, MCP calls, responses and denials leave it as it was: an event
+  with no inference parse must not clear it. agentop's sessions-table `SERVER`
+  column reads it, and so do the count of running sessions on `S`'s result line
+  and the warning from `agentop server remove`. `inferenceHostFromHistory` is
+  `true` when that host came only from the archive's fold, because no request
+  the proxy's current entry for the session holds has set it. On a local install
+  the inference-router keeps its pins in the plugin store
+  (`~/.cortex/plugin-state.json`), which a restart keeps, so both of agentop's
+  counts include such a resumed session.
 - **`procs`** — the processes, `<pid>.<start>`, whose own session header named
   this session. Recorded from each request's `proc` and `sessionHeader`, and
   continued from the archive's fold like the other figures.
@@ -74,13 +91,15 @@ knowing by name:
   (`session.archive`, laptop only): every session the archive holds and memory
   does not, marked `resident: false`, plus a top-level `archive` object —
   `{bytes, maxBytes, retentionDays}` and, only when nonzero, `droppedEvents`,
-  `writeErrors`, `droppedRenames`, `paused`, any of which means the history has
+  `writeErrors`, `droppedRenames`, `droppedCaptures`, `paused`, any of which means the history has
   gaps. A session in both is listed once, as its resident row, and that row
   covers the session's whole history: `eventCount`, `totalTokens`, `costMicros`,
   `title`, `agent`, `createdAt` and the rest continue from the archive's fold of
-  what came before this process's entry. Without an archive the parameter is
-  ignored and no `archive` object is sent — which is how a client tells "no
-  history here" from "no history yet".
+  what came before this process's entry. **This applies to the default list
+  too**, not only with `?archived=true`: with an archive and `session.max_events`
+  unset, a restart changes no figure. Without an archive, the figures start over
+  at a restart, the parameter is ignored, and no `archive` object is sent. That
+  is how a client tells "no history here" from "no history yet".
 
 ## `GET /v1/sessions/{id}` — snapshots and paging
 
@@ -99,12 +118,53 @@ than encoded whole, so serving it costs the proxy heap proportional to one
 event — but a client that reads it all still pays for all of it. Page with
 `before` rather than raising `limit`.
 
+**`?view=summary` omits the large payloads.** agentop sends it on each session page fetch (the
+events table). It does not send it on `GET /v1/sessions/{id}/timeline`. The script SDK (`core/plugins/script/sdk/cortex.py`) sends it too. The
+proxy then removes these fields from each event in the response:
+
+- `inference`: `messages`, `tools`, `toolCalls`, `toolResults` and `historyToolCalls`.
+  It adds `messageCount` and `toolCount`, the lengths of `messages` and `tools`.
+  Each one is absent when it is zero.
+- `a2a`: `artifact`.
+- `mcp`: `params` and `result`.
+
+All other fields stay, which includes `inference.completion`, `a2a.parts` and
+`plugins`. The stored events do not change. The value must be exactly `summary`.
+With any other value, the proxy sends full events. `GET /v1/sessions/{id}/events/{seq}` always
+returns the full event. `/v1/events` streams full events.
+
+**The response echoes `"view": "summary"` when it applied the summary.** A proxy
+that does not know the parameter ignores it. It sends full events and no `view`
+field. So a client that asked for the summary reads `view` to know which it got.
+Do not infer it from missing bodies: a session with no inference traffic has no
+bodies to omit.
+
 **With a session archive, a page continues from disk** below the oldest event
 memory holds: a session resumed after a restart pages back through its whole
 history, one evicted from memory is served instead of 404'd, and
 `totalEvents`/`oldestSeq` describe the merged history. `GET
 /v1/sessions/{id}/events/{seq}` falls back to the archive the same way, and
 answers 404 rather than a neighbour when neither holds that seq.
+
+**`?raw=1` adds the exact bytes** (#1494), under `raw`, when the archive holds a
+capture for the event. Only the archive holds them, so `raw` is absent without an
+archive, for an event that was not captured or predates capture, and for the
+second or so before the archive flushes a new event. A request event's `raw`:
+
+| Field | What it is |
+|---|---|
+| `request` | the body as the agent sent it |
+| `forwarded` | the body as Cortex sent it upstream; absent when no plugin rewrote it |
+| `requestHeaders` | the request headers, without credential headers |
+| `query` | the URL's raw query |
+
+A response event's `raw` has `response`: `{status, headers, body, decoded,
+truncated, incomplete}`. `body` is up to 10 MiB of the body as it came off the wire,
+in its `Content-Encoding`, unless `decoded` says the proxy decompressed it to read it
+for a plugin. `truncated` means it was longer, and `incomplete` means it was not read
+to its end: the stream broke off, or the proxy, a plugin or the client stopped it. A body that is not valid UTF-8 — every compressed body — is in
+`requestBase64`, `forwardedBase64` or `bodyBase64` instead. An unknown `raw`
+value is ignored, so an older proxy answers with the event alone.
 
 ## `GET /v1/sessions/{id}/timeline` — agents, tools and hosts on one time axis
 
@@ -182,15 +242,62 @@ tunnel, and every denial. `kind` is `llm`, `mcp`, `http` or `tunnel`, and
 
 **`end` absent means still in flight.** A span that never got an answer but
 provably stopped is `lost` and ends where it started: a turn or tool whose agent
-moved on, a `SubagentHandback` (it ends the run), or a request more than ten
+moved on, a `SubagentHandback` or a workflow agent's final `StructuredOutput` (each
+ends the run, and no result follows) and every tool asked for beside it, a
+subagent's tool still open
+at a `<task-notification>` naming that agent, or a request more than ten
 minutes old.
+
+## `GET /v1/sessions/{id}/search` — find the events whose bodies hold a text
+
+agentop's events pane uses this for its `details` search. The events list carries
+`view=summary`, which drops the bodies, so agentop checks the summaries it holds, and this
+route checks what the summary drops.
+
+```sh
+curl -s 'localhost:9094/v1/sessions/<id>/search?q=retry%20budget'
+```
+
+```json
+{"seqs":[12,14,40],"lastSeq":980,"schemaVersion":1}
+```
+
+- `seqs` is ascending: every event of the session that matches, in memory and in the archive.
+  `lastSeq` is the newest seq the pass read. A client that holds a newer event asks again.
+- The match is a case-insensitive substring, folded rune by rune with `unicode.ToLower`, as
+  agentop's `/` folds.
+- **What it reads**, only where the event detail view shows it for the event's phase
+  (`sessionapi.DetailKeys`):
+  - request: `inference.messages`, `inference.tools` (a tool's `parameters` as JSON),
+    `inference.toolResults`, the history tool calls, `mcp.params`
+  - response: `inference.toolCalls`, `mcp.result`, `a2a.artifact`
+  - the key names in those parts, as the view shows them
+  - where the archive holds a capture: its body blocks (keys and values when a block is JSON,
+    its text when not), the keys and values between blocks, the headers, the query, and a response's
+    status. Image and document blocks and binary bodies are skipped: the view shows them as
+    labels.
+- **It does not read** the fields the summary keeps (agentop checks those), the labels agentop
+  writes itself in the `raw` part (`forwarded as sent`, `[image … KB]`), a match that spans a
+  key and its value, or the quotes and punctuation the view draws around the keys and values
+  it reads.
+- **Errors:** an empty `q` is `400` (`{"error":"q is required"}`). An unknown session is `404`
+  with `{"error":"session not found"}`. A proxy that predates the route answers the mux's
+  plain-text `404`, which is how a client tells the two apart. An archive read that fails is
+  `500`: an answer without part of the history could say "no match" where there is one.
+- **Cost:** one pass. A long string that many events share is checked one time. On a 10,767-event
+  laptop session, the pass took about 4 s, with a peak heap of 149 MB (95 MB with `GOGC=25`).
+  One plain read of the same archive peaks at about 130 MB. The pass keeps a result for each long
+  string that the events of one segment share, and drops it at the next segment. It keeps none
+  for a capture's text, which no two events share. The pass stops when the client closes
+  the connection, and agentop closes it when its search is dropped.
 
 ## `DELETE /v1/sessions`
 
 Clears every session: the in-memory store, and the session archive where one
 runs. **The cost ledger is kept** — spend totals, no content. Answers
 `{sessions, archivedSessions, bytes}`; a failed disk half is a 500 adding
-`archiveError`, with memory cleared regardless.
+`archiveError`, with memory cleared regardless. The store clears under its
+lock before the archive is waited on, for up to 10s.
 
 This is the one state-changing route pair on an unauthenticated API, so both
 are guarded against a browser: DELETE only (a cross-site DELETE needs a
@@ -198,7 +305,8 @@ preflight this server never approves), a loopback `Host` (`localhost`,
 `127.0.0.1` or `::1`, which defeats DNS rebinding), no `Origin` header, and
 the server must have been built with clearing allowed
 (`listener.bind_loopback_only` on a local install). A refusal is a 403
-`{"error": ...}`. agentop's `X` drives it.
+`{"error": ...}`. Each guard is pinned by its own test in
+`core/sessionapi/clear_test.go`. agentop's `X` drives it.
 
 ## `DELETE /v1/sessions/{id}` — erase one session
 
@@ -211,6 +319,92 @@ regardless). The cost ledger, usage totals and inference-router pins are
 kept. An agent still using the session brings it back with its next request.
 agentop's `x` drives it, one request per session for an agent-wide erase —
 see [`laptop-service.md`](laptop-service.md) for the user-facing story.
+
+## `POST /v1/ingest` — rows from cortex-gateway (praxis mode)
+
+Registered only when `praxis.enabled` and `listener.bind_loopback_only` are
+both set; otherwise this route and `GET /v1/ingest/stats` answer 404 and no
+erase mark is kept. The design is in
+[`superpowers/specs/2026-11-07-praxis-mode-design.md`](superpowers/specs/2026-11-07-praxis-mode-design.md), Section 1.
+
+**Auth and guards, in order:**
+
+1. A non-loopback `Host`, or an `Origin` header: 403.
+2. No `Authorization: Bearer <token>`: 401. Cortex reads the token from the
+   file that `CORTEX_GATEWAY_TOKEN_FILE` names.
+
+A browser cannot add `Authorization` to a simple cross-site POST, so the
+token is the protection and the guards are a second layer.
+
+**The body** is NDJSON, one line per row, on one long-lived stream. A line
+over 64 MiB is discarded and refused. A refused line does not close the
+stream. When the body ends, the answer is 204. On shutdown, Cortex ends each
+open stream at once; lines still queued in the gateway are lost and counted
+there.
+
+**Line format, version 1:**
+
+```json
+{"v":1, "schemaVersion":1, "op":"append", "requestId":"…", "startedAt":"<RFC 3339, ns, UTC>",
+ "session":"<recording session>", "event":{ "...SessionEvent wire JSON..." },
+ "capture":{"original":"<base64>", "forwarded":null, "header":{"Name":["v"]}, "query":"",
+            "response":{"status":200, "header":{}, "body":"<base64>", "decoded":true,
+                        "truncated":false, "ended":true, "incomplete":false}},
+ "cost":{"headers":{"X-Litellm-Response-Cost":"0.01", "Content-Type":"application/json"}}}
+```
+
+A request row carries `original`, `header` and `query`; a response row
+carries `response` only. A capture the producer dropped is
+`{"dropped": true}`. `cost` is on response rows only.
+
+A response row's `inference` leaves out the request-only fields:
+`messages`, `tools`, `toolResults`, `historyToolCalls` and
+`historyThinking`. They are most of a line's bytes, and the request row
+carries them already. Cortex puts them back from the request row of the same
+`requestId`, so the stored response row is the same as in direct mode. A
+field the response row carries is kept. When the producer dropped the
+request row, the response row is stored without them.
+
+**What Cortex does with a line:**
+
+- Files it under `session`; an empty `session` goes to the active session,
+  then to `default`, as a listener files it.
+- Assigns `seq`, `sessionId` and `at`. The producer's values are not kept.
+- Removes the producer's `plugins.cost` and `plugins.litellm-budget-track`,
+  and settles a response row again from `cost.headers` and its own rate table.
+- Keeps a capture only for an event with `inference`, removes credentials
+  from its headers and query again, and keeps a response capture only after
+  the request capture of the same `requestId` (held for up to 1 hour).
+- Decodes up to 8 lines of a stream at the same time (at most one per CPU),
+  and files them one at a time, in stream order.
+- Drops a line whose `startedAt` is before an erase of its session
+  (`DELETE /v1/sessions/{id}` or `DELETE /v1/sessions`) in the last 10
+  minutes, so a queued row cannot bring an erased session back. A dropped
+  line also releases its tunnel join, and the tunnel then writes no row.
+- Joins the line to the forward proxy's state for the same `requestId`
+  (each join is kept for up to 60 s):
+  - A request row of a TLS-bridged request goes through its CONNECT
+    tunnel's pairing path, so the tunnel's open row and its request row pair
+    as in direct mode. A tunnel that closes before its row arrives waits for
+    the row. A join that expires settles the tunnel as in direct mode.
+  - When Cortex cut the response itself (`proxy_error`, such as its idle
+    read cutoff), Cortex's error replaces the one the gateway recorded, and
+    the row keeps the status the client got, as in direct mode.
+
+**Refusal reasons:** `bad_json`, `version` (`v` is not 1), `schema`
+(`schemaVersion` is not this API's), `op` (not `append`), `line_cap`,
+`erased`.
+
+## `GET /v1/ingest/stats`
+
+The ingestion counters, since start. The same loopback and `Origin` guards
+as `POST /v1/ingest`; no token.
+
+```json
+{"ingest_lines_total": 120,
+ "ingest_refused_total": {"bad_json":0, "version":0, "schema":0, "op":0, "line_cap":0, "erased":1},
+ "ingest_captures_dropped_total": 0}
+```
 
 ## Quick examples
 
@@ -243,10 +437,39 @@ curl -N http://localhost:9094/v1/events
 curl -N "http://localhost:9094/v1/events?session=$SID"
 ```
 
+## Schema version
+
+Each JSON response that carries events has one top-level `schemaVersion` field.
+The events in it do not carry one each. The value is now `1`
+(`SchemaVersion` in `core/sessionapi/server.go`). These responses carry it:
+
+- `GET /v1/sessions/{id}`, beside `id` and `events`.
+- `GET /v1/sessions/{id}/events/{seq}`. This response is the event object, so
+  the field is one more key in that object.
+
+The rule for the number:
+
+- It increases when a field of the response or of an event changes its meaning or
+  is removed.
+- It does not increase when a field is added. A client ignores keys it does not
+  know.
+- A response with no `schemaVersion` comes from a proxy older than the field.
+  Read it as version 1.
+
+`/v1/events` frames do not carry it. Each frame is one bare event, with no
+envelope to hold the field. The golden file
+`core/pipeline/testdata/session-event.golden.json` holds an event with every
+field set, and a test fails when the event wire form changes.
+
 ## Event schema
 
 Every event on `/v1/sessions/{id}` and `/v1/events` carries:
 
+- `sessionId` — the id of the session the store added the event to. The store
+  sets it on every event, which includes outbound MCP and inference events. Their
+  protocols have no session id of their own. `?session=` on `/v1/events` filters
+  on this field. A rekey writes the new id into every event the store holds for
+  that session.
 - `at`, `direction`, `phase` — when, which side, what stage. `phase` is one of
   `"request"`, `"response"`, or `"denied"` (terminal denial from a pipeline
   plugin — typically a jwt-validation failure).
@@ -255,9 +478,19 @@ Every event on `/v1/sessions/{id}` and `/v1/events` carries:
   intent can sit far ahead of the retained tail. Unique within one incarnation
   of a session, not forever: trimming never reuses numbers, but whole-session
   eviction deletes the counter with the entry, so a session re-created under
-  the same id restarts at 1. A paging client must order pages by `at`, not by
-  `seq`. A session archive moves that boundary out to disk: numbering continues
-  across restarts for as long as the archive holds the session.
+  the same id restarts at 1. A cursor does not identify the incarnation, and
+  the store cannot tell a re-created session from a trimmed one. A cursor from
+  before that point that is above every event held gets the tail. One that is
+  not, such as `before=10` on a re-created session with 20 events, gets events
+  below it (up to 1 to 9 here), and the client misses events 10 to 20. Within one
+  incarnation, order by `seq`. Across pages that may span a re-creation, order
+  by `at`, then `seq`: `at` is not unique. For example, a bridged tunnel's open
+  row takes the time of its first request. A session archive moves that boundary out to disk:
+  numbering continues
+  across restarts for as long as the archive holds the session, and a rekey
+  into an id the archive already holds is refused (the session keeps its old
+  id), because the two numberings would collide. A proxy that predates paging
+  sends no `seq`, which is how a client tells it cannot page there.
 - `a2a` / `mcp` / `inference` — protocol parser payloads (one at most).
 - `invocations` — per-plugin invocation records for every plugin that ran on
   the pipeline pass, structured `{inbound: [...], outbound: [...]}`. Each entry
@@ -274,16 +507,59 @@ Every event on `/v1/sessions/{id}` and `/v1/events` carries:
   saying which (`upstream_timeout`, `upstream_refused`, `upstream_dns`,
   `upstream_tls`, else `upstream_error`) and `error.message` naming the address
   but never the request URL, whose query string can carry an API key.
+  In praxis mode, a 503 with `error.kind: "gateway_unavailable"` is the
+  forward proxy's own answer when cortex-gateway is not ready (its startup
+  probe has not passed) or refuses the dial. The forward proxy then records
+  the request row and the 503 response row itself, because the gateway never
+  saw the request.
   `error.kind: "proxy_error"` is the one that is the proxy's own: a response
-  over the listener's body-size cap. A 499 with `error.kind: "client_canceled"`
+  over the listener's `maxBodySize` (1MB inbound, 10MB outbound), and on the
+  streamed arms the 5-minute idle read cutoff and the per-frame cap. **A
+  streamed response that breaks off mid-body has no 502 to synthesize** — the
+  status is already on the wire. Both proxies abort the client's connection
+  (h1 reset, h2 `RST_STREAM`) rather than end it cleanly, so the agent cannot
+  read a cut stream as complete. On the forward proxy's three relay arms (SSE
+  relay, SSE passthrough, unbuffered copy) the row keeps the sent status, with
+  the failure in `error` (`upstream_error` for the upstream's break,
+  `proxy_error` for the proxy's own cuts) and the sent status as `error.code`.
+  Such rows count as errors in `/v1/usage` although their status is 200, and
+  the Finisher sees `OutcomeError` (`classifyBrokenStream` resets
+  `pctx.StatusCode` to zero while the row keeps the sent status). A `skip_hosts` stream aborts the same way and
+  records nothing. Where the upstream did answer, `error.code` keeps the status
+  it sent, while `statusCode` stays what the client got. A 499 with `error.kind: "client_canceled"`
   is the client hanging up first — since neither proxy times out a slow
-  upstream, that is how a hung one usually ends. A 426 with `error.kind:
+  upstream, that is how a hung one usually ends. It counts as an error in
+  `/v1/usage` but stays out of the 5xx series, and logs no WARN. On all of
+  these the Finisher sees `OutcomeError` with `Outcome.StatusCode` 0: that zero
+  marks the request as an error, so the event and the outcome disagree about
+  the status on purpose. **A 421 with `error.kind: "misdirected_request"`** is a
+  bridged request whose `Host` names another host or port than its tunnel's
+  CONNECT target: the forward proxy refuses it before the pipeline runs and
+  forwards nothing, and both rows name the CONNECT target as `host`, because
+  policy keyed on the client's `Host` would judge a destination the bytes
+  never reach. A 426 with `error.kind:
   "upgrade_declined"` is the forward proxy's own answer to a WebSocket upgrade on
-  OpenAI's Responses API (`chatgpt.com` or `api.openai.com`): nothing is forwarded,
-  and a client such as Codex reads it as "use HTTPS" and retries at once over
-  HTTPS. It is not counted as an error in `/v1/usage`. Every other WebSocket
-  upgrade is forwarded (#1488): the 101 the origin answers with is spliced onto
-  the client's connection, the frames after it are relayed uninspected, and the
+  OpenAI's Responses API (`chatgpt.com` or `api.openai.com`) that it will not carry:
+  every one under `listener.responses_websockets: decline`, and under the default,
+  `parse`, one it cannot (not decrypted, or a plugin that rewrites response bodies or
+  redirects requests). Nothing is forwarded, and a client such as Codex reads it as
+  "use HTTPS" and retries at once over HTTPS. (Under `parse`, an HTTP/2 client
+  is refused 400 by Go's HTTP/2 server before the handler runs.) The 426 is not
+  counted as an error in `/v1/usage`, and the Finisher sees an **allow** with
+  status 426. v0.9.4's `decline_responses_websockets` is still read when the
+  new key is unset (`true` = `decline`, `false` = `forward`), with a startup
+  warning; both set is refused. A carried socket's turn the client ends early (Codex's Esc) is a 200
+  with `error.kind: "turn_interrupted"`, as an HTTPS stream the client leaves part way
+  keeps its 200, and is not counted as an error either. Every other WebSocket
+  upgrade — and a Responses one under `forward` — is forwarded (#1488): the 101
+  the origin answers with is spliced onto
+  the client's connection (the upgrade is normalized to `Connection: Upgrade` /
+  `Upgrade: websocket`, which net/http pins to HTTP/1.1). **An upgrade is both
+  headers, on both sides:** a request needs `Connection: upgrade` as well as
+  `Upgrade: websocket` or it is stripped and takes the ordinary path, and a 101
+  that switches to another protocol than the one requested is refused 502
+  before the hijack. Either check missing turns a plain request into an opaque
+  pipe no plugin inspects. Once spliced, the frames after it are relayed uninspected, and the
   session records the request row plus a **101 response row** paired to it by
   `requestId`, carrying `bytesUp` and `bytesDown` for the whole WebSocket
   session — the one response row besides a tunnel close that carries both —
@@ -307,12 +583,35 @@ Every event on `/v1/sessions/{id}` and `/v1/events` carries:
   (`listener.egress_guard`): the destination resolved into loopback,
   link-local, private or this host's own address space and no permit covered
   it. Also the proxy's own answer rather than the upstream's, and also not
-  counted as an error — the guard did what it was configured to.
+  counted as an error — the guard did what it was configured to. The Finisher
+  sees an **allow** with status 403, as for the 426. **A 403
+  `destination_denied` is the egress allow list's refusal**
+  (`listener.egress_allow_hosts`, or `MOCA_EGRESS_ALLOW`): the destination was
+  not on the deny-by-default list, and the proxy refused it by name — header
+  `X-Moca-Egress-Error`, text/plain body `destination_denied: <host>\n` —
+  before the pipeline, before DNS and before any dial. Off-list CONNECT
+  targets, absolute-form hosts and the target a plugin's redirect moved a
+  request to all land this way, as a `phase: "denied"` row carrying an
+  `egress-allowlist` invocation whose `details.host` names the host; the row's
+  own `host` is the full authority, as every outbound row's is. The two
+  403s compose: the allow list judges the **name** before DNS, the guard the
+  **address** at the dial, so an allow-list entry is not a permit for the
+  guard. **A request whose body could not be buffered** never reached the
+  pipeline, so its request row carries no parse and no Finisher runs: over the
+  forward proxy's `maxRequestBodySize` (32 MiB) it is a 413 `proxy_error` with
+  an empty `error.code`; a client that hung up mid-upload gets a 499
+  `client_canceled`, which here does log a WARN (`request body unreadable`);
+  anything else unreadable is a 400 `request_unreadable`. An opaque CONNECT
+  that could not be dialed reports the same one layer down, as
+  `tunnelReason: "dial-failed"` with `error.kind: "dial_failed"`.
 - `ttfbMs` — on a delivered response row, the wall time from request entry to
   the upstream's response **headers** arriving. `durationMs` − `ttfbMs` is then
   how long the body took — for a streamed completion, the stream time. The pair
   separates a slow-to-answer origin from one that answered and then trickled,
-  which `durationMs` alone cannot (#1251). The row is recorded when the listener
+  which `durationMs` alone cannot (#1251). All three listeners set
+  `pctx.ResponseHeadersAt` at their own headers-arrival moment, and every
+  response-event builder derives the figure with `pipeline.DurationBetween`;
+  a new listener or builder must do the same. The row is recorded when the listener
   is finished with the body — after the read on a buffered path, after the relay
   on a streamed or unbuffered one — so the difference really is the body's time.
   The one exception is the envoy-sidecar listener with a pipeline no plugin of
@@ -328,6 +627,109 @@ Every event on `/v1/sessions/{id}` and `/v1/events` carries:
 - `inference.requestedModel` — present only when a plugin changed the model:
   the model the client asked for. `inference.model` is the model the request
   was sent for, which settlement prices.
+- `inference.thinkingType`, `inference.thinkingDisplay`, `inference.effort` —
+  what the request asked for: `thinking.type` and `thinking.display` (for
+  example `adaptive` and `summarized`), and the effort level from the field the
+  dialect uses (`output_config.effort`, `reasoning_effort` or
+  `reasoning.effort`). Absent when the request did not state them.
+- `inference.anthropicBeta` — the request's `anthropic-beta` header, every
+  value joined with a comma.
+- `inference.historyThinking`, `inference.responseThinking` — counts of the
+  thinking blocks the client sent back and the model returned: `blocks`,
+  `redacted`, `textBytes`, `signatureBytes`, `redactedBytes`. Absent when there
+  were none. A history block with `signatureBytes` and no `textBytes` came back
+  as an encrypted signature only.
+- `inference.servedModel` — on a response row, present only when the upstream
+  named a model other than `inference.model`: the `x-litellm-model-name`
+  response header (a LiteLLM gateway's deployment, for example
+  `bedrock/us.anthropic.claude-opus-4-6-v1` for `claude-opus-4-6`), else the
+  response body's own `model` field (a provider's dated version). Absent when
+  the upstream answered under the requested name, as Ollama does. For display
+  only: pricing still follows `inference.model`. agentop's detail pane shows it
+  on a `served:` line.
+- `inference.messages` — the conversation the request sent, in order. Each
+  item has a `role` and a `content`. An Anthropic request's top-level system
+  prompt is the first item, with role `system`. `content` keeps only the text
+  blocks. `contentBytes` is the wire size of the content value as the client
+  sent it, so a message with no text still shows its size. It is a byte count
+  of the raw JSON, not a token count.
+- `inference.messages[].toolCallNames`, `toolUseIds`, `toolUseId` — the tool
+  blocks of a message. `toolCallNames` names the tools that an assistant
+  message called, joined by `, ` in call order. `toolUseIds` gives the ids of
+  the message's tool calls or tool results, joined by `, ` in block order.
+  They key into `inference.historyToolCalls` and `inference.toolResults`.
+  Only a chat-completions `role: "tool"` message has a `toolUseId`: the id of
+  the call that the message answers.
+- `inference.historyToolCalls` — the tool calls that earlier assistant turns
+  made, as the client sent them back in this request: `id`, `name` and
+  `arguments`. `inference.toolCalls` is a different list: the calls that the
+  model asks for in this response. No compiled plugin reads
+  `historyToolCalls`.
+- `inference.temperature`, `inference.maxTokens`, `inference.topP`,
+  `inference.stream` — the request's sampling settings and stream flag, as
+  sent. `maxTokens` is `max_tokens`, or `max_output_tokens` on the Responses
+  API. Each is absent when the request did not state it. `stream` is also
+  absent when it is false.
+- `inference.tools`, `inference.toolChoice` — the tools that the request
+  declared and its `tool_choice` value. Each tool has a `name`, a
+  `description` and `parameters`, the JSON schema as the client sent it.
+- `inference.streamedResponse` — true when the response came as an SSE
+  stream. `inference.stream` is what the request asked for. The two can
+  differ: a gateway can answer a non-streaming request with a stream. Pricing
+  reads `streamedResponse` to know if a token count is final.
+- `inference.completion`, `inference.finishReason`, `inference.toolCalls` — on
+  a response row: the model's text, the provider's stop reason, and the tool
+  calls that the model asks for. Each tool call
+  has an `id`, a `name` and `arguments`, the raw JSON text from the model.
+- `inference.inputTokens`, `inference.cacheReadTokens`,
+  `inference.cacheWriteTokens`, `inference.outputTokens`,
+  `inference.reasoningTokens` — on a response row: the token counts that the
+  provider reported, by kind. `inputTokens` are the uncached prompt tokens.
+  `reasoningTokens` are a part of `outputTokens`.
+- `inference.presentKinds` — a bitmask of the token kinds that the provider
+  reported: input 1, cache read 2, cache write 4, output 8, reasoning 16. A
+  zero count with its bit set means that the provider reported zero. A zero
+  count without its bit means that the provider did not report that kind.
+- `inference.promptTokens`, `inference.completionTokens`,
+  `inference.totalTokens` — older totals that the parser calculates from the
+  split counts. `promptTokens` is input plus cache read plus cache write.
+  `completionTokens` is output. `totalTokens` is the provider's own total when
+  it sent one, else prompt plus output.
+- `inference.messageCount`, `inference.toolCount` — set only on a
+  `view=summary` copy, which removes `messages` and `tools`: how many items
+  each list had. Zero means "not stated". When the list is present, use its
+  length.
+- `inference.isAction`, `mcp.isAction`, `a2a.isAction` — the parser's
+  classification. It is true on every inference row. It is true on the MCP
+  methods `tools/call`, `prompts/get` and `resources/read`, and on the A2A
+  methods `message/send` and `message/stream`. It is absent on protocol
+  mechanics. See
+  [Classifying requests](plugin-reference.md#classifying-requests-as-actions-vs-protocol-mechanics).
+- `mcp.method`, `mcp.rpcId`, `mcp.params` — the JSON-RPC method, id and
+  params of an MCP request. A notification has no `rpcId`. The two methods
+  that follow occur only on a configured MCP path. A body-less `DELETE` with
+  an `Mcp-Session-Id` header has the method `$transport/terminate`. A
+  body-less `GET` has the method `$transport/stream`.
+- `mcp.result`, `mcp.error` — on a response row: the JSON-RPC `result`, or the
+  `error` object with `code`, `message` and `data`.
+- `a2a.method`, `a2a.rpcId` — the JSON-RPC method and id of an A2A request.
+- `a2a.sessionId`, `a2a.taskId`, `a2a.messageId`, `a2a.role`, `a2a.parts` —
+  from the request's params. `sessionId` is `contextId`, else the older
+  `sessionId`, else `params.message.contextId`. `taskId` is
+  `params.message.taskId`, else `params.id` for a `tasks/*` method with a task
+  id param, else the older `params.taskId`. When the request has none, the
+  response sets `sessionId` and `taskId`. A Task result gives its `id`.
+  `messageId`, `role` and `parts` come from `params.message`. Each part has a
+  `kind` and a `content`: the text of a `text` part, the `data` or `uri` of a
+  `file` part, or the JSON text of a `data` part.
+- `a2a.finalStatus`, `a2a.artifact`, `a2a.errorMessage` — on a response row:
+  the last task state that the response carried (for example `completed` or
+  `failed`) and the artifact text. A stream that ends with no final status
+  event gives its last state, for example `working`. When the state is
+  `failed`, `errorMessage` is the first text part of the status message. In a
+  stream, the parser joins the text of each artifact event. The joined text has
+  a maximum of 64 KiB. A Task event in a stream replaces the joined
+  `artifact-update` text with the last text part of the Task's artifacts.
 - `bytesUp`, `bytesDown` — **body** bytes, one direction per row: a request row
   carries `bytesUp`, the body as forwarded (so a rewrite is reflected); a
   response row carries `bytesDown`, the body as it came back from the
@@ -340,14 +742,35 @@ Every event on `/v1/sessions/{id}` and `/v1/events` carries:
   it (#1251), so the bytes that crossed their own process are on the row. The
   one arm that still reports zero is the envoy-sidecar listener with a
   body-free pipeline — it asked Envoy not to send it the bytes, so zero there
-  means "not asked to see", not "not counted".
+  means "not asked to see", not "not counted" (`core/listener/parity`'s
+  `TestDivergence_InboundResponseBodyCountWhenNoPluginReadsIt` pins it). A
+  response row's `bytesDown` is the body as it came back, not as delivered,
+  because extproc records the row before it emits a response mutator's
+  replacement. Everywhere else the three listeners count the same figure for
+  the same response; `core/listener/internal/bodycount` and the parity
+  fixtures hold that line.
 - `tunnel`, `tunnelReason` — an opaque CONNECT (or transparent-redirect) tunnel
   records two rows sharing a `requestId`: the open (`phase: "request"`,
   `tunnelReason` saying why the bytes stayed opaque) and the close (`phase:
   "response"`), carrying the CONNECT's own status, the duration, and the bytes
-  each way. It is not the destination's status: that travels inside the
-  client's end-to-end TLS. Tunnel rows are kept out of `/v1/usage`: a tunnel's
-  lifetime is not a request latency. `tunnelReason: "dest-private"` is the
+  each way (up = client to destination; opaque bytes have no body/header
+  split). The close's status is 200, or 502 with the dial error when the
+  destination could not be reached and no TLS bridge took the connection
+  (`tunnelReason: "dial-failed"`). Where the bridge is enabled for the port the
+  CONNECT is answered 200 first, because a redirect can still apply, and a
+  bridge that then declines closes with that 200 and the dial error. It is not
+  the destination's status: that travels inside the client's end-to-end TLS. A
+  bridged tunnel's open is recorded with its first decrypted request — in that
+  request's session, directly before it, stamped with its time — and records
+  no close, because the request carries its own response; a bridged tunnel
+  that recorded no request gets its open and a close when it ends. Tunnel rows are kept out of `/v1/usage`: a tunnel's
+  lifetime is not a request latency. **`tunnelReason: "websocket"` is the one
+  that is not opaque:** a Responses API WebSocket the forward proxy carries
+  (`listener.responses_websockets`). Its open is the handshake `GET`, its close
+  is status 101 with the whole socket's duration and bytes, and every turn on it
+  records its own ordinary `POST` request and response rows between the two,
+  parsed and priced like an HTTPS turn. A turn runs on the pipeline it began
+  on, so a hot reload never splits one. `tunnelReason: "dest-private"` is the
   egress guard's refusal: the close row carries 403 and
   `error.kind: "destination_private"`, and no tunnel was ever opened to the
   destination — the same refusal a plain request gets, one layer down.
@@ -369,8 +792,10 @@ Every event on `/v1/sessions/{id}` and `/v1/events` carries:
   `~/.claude/projects/<dir>/<session>/subagents/agent-<id>.*`. Absent on the
   main conversation's rows and on every other client's, and absent too when
   the value was not usable (a control character, over 128 bytes), which is
-  refused rather than cleaned up. The row is still filed in its parent
-  conversation's session. **This key names an agent; it does not say the row
+  refused rather than cleaned up. `Context.Subagent` resolves it and
+  `ResolveClient` pins it, so no plugin can re-file a row. The row is still
+  filed in its parent conversation's session, so **the header must not be added
+  to `session.id_headers`**. **This key names an agent; it does not say the row
   is a subagent's.** `inference.agentRole` says that, and on a teammate's row
   it is `main` while `subagent` is set.
 - `parentSubagent` — the agent that started the one `subagent` names, from
@@ -412,12 +837,28 @@ emitted by a plugin, and neither is a verdict on the request.
   least one pipeline plugin appended an Invocation before rejecting. If you're
   debugging an unauthorized-access pattern, the default-session bucket
   (`GET /v1/sessions/default`) is where denial events aggregate.
+- **Which listener records a row.** The listeners do not record the same rows:
+  - The forward proxy and the reverse proxy record a request row and a
+    response row for every request that the pipeline sees. The forward proxy
+    does not record an agent's polls of its own service.
+  - The envoy-sidecar listener (ext_proc) records a row only when the row has
+    content: a parser result (`a2a`, `mcp` or `inference`), an invocation, or
+    a plugin payload. A request that no plugin marked leaves no row.
+  - When a plugin rejects a response, only the forward proxy records a
+    `phase: "denied"` row. ext_proc and the reverse proxy record no row for
+    that deny. The reverse proxy's missing row is a known gap, a sibling of
+    #1045 (see `errorHandler` in `core/listener/reverseproxy/server.go`).
+
+  `core/listener/parity` pins each difference
+  (`TestDivergence_*RowWhenNothingToRecord`,
+  `TestDivergence_OutboundResponseDeny`,
+  `TestParity_InboundResponseDenyRecordsNoRow`).
 - **Disabling:** set `session.enabled: false` to turn off the store (and
   implicitly the API). The session archive is separate — `session.archive.enabled: false`
   stops it without touching the in-memory store, and turning the store off
   with the archive explicitly on is refused at load. Setting
   `listener.session_api_addr: ""` alone is not supported as a selective
-  disable; if you need store-on-API-off, raise an issue.
+  disable — the preset refills it; if you need store-on-API-off, raise an issue.
 - **Memory:** the store keeps every event a session produces by default —
   `session.max_events` is unset and `session.ttl` defaults to never. What
   bounds memory by default is `session.max_sessions` (100, oldest-used evicted

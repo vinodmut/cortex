@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"errors"
 	"flag"
@@ -28,8 +27,8 @@ Usage:
 Unroutes Claude Code, OpenCode, IBM Bob, and the bob and pi shell functions and
 Pi's session extension where Cortex routed them; stops and removes the service, or the background proxy; removes the PATH
 lines setup added, unless other tools in ~/.local/bin still need them; and
-removes agentop, cortex and cortex-session-dump from ~/.local/bin. ~/.cortex
-stays unless --purge. What to remove is read from disk, not from a record of
+removes agentop, cortex, cortex-session-dump and cortex-gateway from
+~/.local/bin. ~/.cortex stays unless --purge. What to remove is read from disk, not from a record of
 the install. A removal that fails is reported with its fix and the rest still
 run, but ~/.cortex then stays; the end lists what was left behind. ~/.cortex also
 stays when a setting still points into it afterwards — one left in place, or one
@@ -148,16 +147,7 @@ var uninstallConfirm = func(w io.Writer) bool {
 // uninstallConfirmFrom reads the answer. Only y or yes goes ahead: unlike setup's
 // question, this one deletes, so Enter and EOF are no.
 func uninstallConfirmFrom(r io.Reader, w io.Writer) bool {
-	_, _ = fmt.Fprint(w, "  Continue? [y/N] ")
-	line, err := bufio.NewReader(r).ReadString('\n')
-	if err != nil && line == "" {
-		return false
-	}
-	switch strings.ToLower(strings.TrimSpace(line)) {
-	case "y", "yes":
-		return true
-	}
-	return false
+	return askYesNo(r, w, "  Continue? [y/N] ", false)
 }
 
 // parseUninstallFlags parses uninstall's flags. -h or --help is flag.ErrHelp; any
@@ -501,7 +491,7 @@ func unrouteClaudeCode(env *setupEnv, settings, state string) removal {
 // will — a left HTTPS_PROXY is a port, not a path, and holds the directory back on
 // its own account not at all.
 //
-// Five of the seven managed keys point at a file under ~/.cortex, and --purge
+// Five of the six managed keys point at a file under ~/.cortex, and --purge
 // deletes that directory. Pointing at a file that is gone is quiet exactly where it
 // is worst: NODE_EXTRA_CA_CERTS with a missing file is ignored silently — every
 // request tunnels through unparsed and nothing looks wrong — while the four
@@ -842,8 +832,8 @@ func lastLineOf(stderr, stdout string) string {
 // there. The service paths and the proxy's pid are read now, from the config
 // --purge deletes.
 func planStopService(env *setupEnv) (removal, bool) {
-	pidFile := filepath.Join(env.cortexDir, "proxy.pid")
-	sp, spErr := resolveServicePaths(env.configPath(), "", filepath.Join(env.binDir, "cortex"))
+	pidFile := filepath.Join(env.cortexDir, proxyPIDFile)
+	sp, spErr := resolveServicePaths(env.configPath(), "", filepath.Join(env.binDir, proxyBinary))
 	installed := spErr == nil && serviceInstalled(sp)
 	pid, background := preRenameProxyRunning(env.binDir, pidFile)
 	if !background {

@@ -3,7 +3,7 @@ package session
 import (
 	"time"
 
-	"github.com/rossoctl/cortex/core/pipeline"
+	"github.com/rossoctl/cortex/core/model"
 )
 
 // SeqSeeder is optionally implemented by a Recorder that keeps a session's events for longer
@@ -33,6 +33,30 @@ func (s *Store) archivedSeqLocked(id string) uint64 {
 		}
 	}
 	return last
+}
+
+// HostsKeeper is optionally implemented by a Recorder that keeps a session's history for longer
+// than the store does — the session archive. ViewFacts asks it for a session's InferenceHosts
+// table when the entry is numbered after earlier history, and when there is no entry.
+//
+// It is called under the store's lock, like LastSeq: it must be a memory lookup, and must not
+// block or call back into the store.
+type HostsKeeper interface {
+	// InferenceHosts is the table over every event the keeper wrote under sessionID. ok is false
+	// when it holds history that it has no table for. An id it does not hold gives (nil, true).
+	InferenceHosts(sessionID string) (model.InferenceHosts, bool)
+}
+
+// keeperHostsLocked is the first HostsKeeper's answer for id. With no HostsKeeper it is nil, and
+// unknown when a SeqSeeder holds history for id: the history has hosts that no recorder keeps.
+// The answer is the keeper's own slice: clone it before a change. s.mu held.
+func (s *Store) keeperHostsLocked(id string) (model.InferenceHosts, bool) {
+	for _, r := range s.recorders {
+		if k, ok := r.(HostsKeeper); ok {
+			return k.InferenceHosts(id)
+		}
+	}
+	return nil, s.archivedSeqLocked(id) == 0
 }
 
 // EntryStarter is optionally implemented by a SeqSeeder. The store calls EntryStarted under its
@@ -118,7 +142,7 @@ type History interface {
 	// Earlier calls fn, newest first, for the events recorded under sessionID numbered below
 	// before, every one when before is 0, until fn returns false or none are left. It reads
 	// from disk.
-	Earlier(sessionID string, before uint64, fn func(*pipeline.SessionEvent) bool) error
+	Earlier(sessionID string, before uint64, fn func(*model.SessionEvent) bool) error
 }
 
 // HistoryConsumer is implemented by plugins that read a session's archived events.
@@ -187,7 +211,7 @@ func (s *Store) withPriorLocked(sum *SessionSummary, id string, sess *entry) {
 	if !p.CreatedAt.IsZero() && p.CreatedAt.Before(sum.CreatedAt) {
 		sum.CreatedAt = p.CreatedAt
 	}
-	sum.PromptContext = pipeline.MergePromptContext(f.promptContext(), sum.PromptContext)
+	sum.PromptContext = model.MergePromptContext(f.promptContext(), sum.PromptContext)
 	// The entry's own when it has one: everything it holds came after the history. When it has
 	// none the row says so, since a request the entry holds is what a router's pin is made by.
 	if sum.InferenceHost == "" && f.inferenceHost != "" {

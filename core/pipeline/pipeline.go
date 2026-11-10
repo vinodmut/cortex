@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -32,6 +34,63 @@ type Pipeline struct {
 	// requestWriters[i] is plugins[i]'s WritesRequestBody, read once at New for the
 	// same reason. SetRequestModel is accepted only from a plugin that declares it.
 	requestWriters []bool
+	// held counts requests pinned to this pipeline whose RunFinish has not run.
+	held atomic.Int64
+	// drain is set by Drained and closed by the release that brings held to zero.
+	drain atomic.Pointer[drainSignal]
+}
+
+type drainSignal struct {
+	once sync.Once
+	ch   chan struct{}
+}
+
+func (d *drainSignal) close() { d.once.Do(func() { close(d.ch) }) }
+
+// pin makes p the pipeline every later phase of pctx's request runs on, and holds p
+// until that request's RunFinish. Listeners pin through Holder, which closes the race
+// with a reload's Store.
+func (p *Pipeline) pin(pctx *Context) {
+	if pctx.pinned == p {
+		return
+	}
+	if pctx.pinned != nil && !pctx.finished {
+		pctx.pinned.release()
+	}
+	pctx.pinned = p
+	if !pctx.finished {
+		p.held.Add(1)
+	}
+}
+
+func (p *Pipeline) release() {
+	if p.held.Add(-1) == 0 {
+		if d := p.drain.Load(); d != nil {
+			p.closeIfIdle(d)
+		}
+	}
+}
+
+// closeIfIdle closes d if nothing holds p now. The count is read again after d is
+// seen: a release that hit zero before a request pinned p must not close it.
+func (p *Pipeline) closeIfIdle(d *drainSignal) {
+	if p.held.Load() == 0 {
+		d.close()
+	}
+}
+
+// Held is the number of requests pinned to p whose RunFinish has not run.
+func (p *Pipeline) Held() int64 { return p.held.Load() }
+
+// Drained returns a channel closed once no request holds p. The reloader calls it
+// after Storing p's replacement, when no new request can pin p.
+func (p *Pipeline) Drained() <-chan struct{} {
+	d := &drainSignal{ch: make(chan struct{})}
+	if !p.drain.CompareAndSwap(nil, d) {
+		d = p.drain.Load()
+	}
+	p.closeIfIdle(d)
+	return d.ch
 }
 
 // Option configures pipeline construction.
@@ -115,6 +174,10 @@ func New(plugins []Plugin, opts ...Option) (*Pipeline, error) {
 // goroutine capturing pctx won't mis-attribute a late-arriving Record
 // to itself.
 func (p *Pipeline) Run(ctx context.Context, pctx *Context) Action {
+	// A listener outside this repo can set only Session. Without SessionID, session-keyed plugins such as session-budget fail open.
+	if pctx.SessionID == "" && pctx.Session != nil {
+		pctx.SessionID = pctx.Session.ID
+	}
 	for i, plugin := range p.plugins {
 		policy := p.PolicyAt(i)
 		if policy == ErrorPolicyOff {
@@ -457,6 +520,19 @@ func (p *Pipeline) WritesRequestBody() bool {
 	return false
 }
 
+// WritesDestination returns true if any plugin in the pipeline declares
+// WritesDestination: it may send a request somewhere other than where the client
+// addressed it. A carried WebSocket is already connected to its origin, so the
+// forward proxy declines one when this is true and the turns go over HTTPS instead.
+func (p *Pipeline) WritesDestination() bool {
+	for _, plugin := range p.plugins {
+		if plugin.Capabilities().Normalize().WritesDestination {
+			return true
+		}
+	}
+	return false
+}
+
 // WritesResponseBody returns true if any plugin in the pipeline declares
 // WritesResponseBody. This is the SSE streaming predicate: a response
 // mutator needs the whole response to rewrite it, so listeners fall back
@@ -585,6 +661,10 @@ func (p *Pipeline) RunFinish(ctx context.Context, pctx *Context, outcome Outcome
 		return
 	}
 	pctx.finished = true
+	if pctx.pinned == p {
+		// After the Finishers, which still run on p.
+		defer p.release()
+	}
 	if len(pctx.dispatched) == 0 {
 		return
 	}

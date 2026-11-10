@@ -575,8 +575,8 @@ func (s *store) decodeDay(path string) ([]Row, dayIssues, error) {
 		// that the CONTENT is not this process's own output and nothing downstream re-checks
 		// it. A reader that sanitises is the only place that can be sure.
 		//
-		// Idempotent by construction, so a row this writer produced is unchanged: rowLabel is
-		// truncateLabel(sanitizeLabel(...)) and both are fixed points on their own output.
+		// Idempotent by construction, so a row this writer produced is unchanged: rowLabel
+		// sanitizes then truncates, and both steps are fixed points on their own output.
 		// That is what makes doing it twice free rather than lossy.
 		//
 		// ALL FOUR, INCLUDING Provenance, which was the one left out. The write path caps every one
@@ -646,7 +646,7 @@ type dayIssues struct {
 // retention_days=10 has twenty-two absent days before this cutoff and lost nothing.
 //
 // What it CAN answer is "how far back can a request expect coverage", which is a coverage
-// question and is all its one caller asks. See sessionapi's daysOutsideRetention.
+// question and is all its one caller asks. See daysOutsideRetention.
 func (s *store) retentionCutoff(now time.Time) time.Time {
 	return s.dayOf(now).AddDate(0, 0, -(s.retainDays - 1))
 }

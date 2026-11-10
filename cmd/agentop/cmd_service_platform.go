@@ -246,6 +246,7 @@ func loadService(goos string, p servicePaths, progress io.Writer) error {
 	if out, err := exec.Command("systemctl", "--user", "enable", systemdUnit).CombinedOutput(); err != nil {
 		return fmt.Errorf("systemctl --user enable %s: %v: %s", systemdUnit, err, strings.TrimSpace(string(out)))
 	}
+	clearStartLimit()
 	if out, err := exec.Command("systemctl", "--user", "restart", systemdUnit).CombinedOutput(); err != nil {
 		return fmt.Errorf("systemctl --user restart %s: %v: %s", systemdUnit, err, strings.TrimSpace(string(out)))
 	}
@@ -503,6 +504,10 @@ func stopPID(pid int) error {
 	return fmt.Errorf("still alive after 18s")
 }
 
+// healthPollDivisor divides waitHealthy's poll interval, never its window. It is 1
+// in agentop. Tests set it, so that a stub that answers soon is seen soon.
+var healthPollDivisor time.Duration = 1
+
 func waitHealthy(url string, within time.Duration) bool {
 	c := &http.Client{Timeout: 2 * time.Second}
 	deadline := time.Now().Add(within)
@@ -514,7 +519,7 @@ func waitHealthy(url string, within time.Duration) bool {
 				return true
 			}
 		}
-		time.Sleep(500 * time.Millisecond)
+		time.Sleep(500 * time.Millisecond / healthPollDivisor)
 	}
 	return false
 }
@@ -597,10 +602,98 @@ func controlService(goos, action string, p servicePaths, progress io.Writer) err
 	case "start":
 		args = []string{"--user", "enable", "--now", systemdUnit}
 	}
+	if action != "stop" {
+		clearStartLimit()
+	}
 	if out, err := exec.Command("systemctl", args...).CombinedOutput(); err != nil {
 		return fmt.Errorf("systemctl %s: %v: %s", strings.Join(args, " "), err, strings.TrimSpace(string(out)))
 	}
+	// A stop of a unit systemd had already given up on is a no-op for systemd, so
+	// the unit stays failed, only now disabled, and status read the deliberate stop
+	// as a crash and advised a restart. Clearing it leaves inactive and disabled,
+	// which status reports as stopped. After the stop, never before: nothing is
+	// left running for the start limit to protect.
+	if action == "stop" {
+		clearStartLimit()
+	}
 	return nil
+}
+
+// clearStartLimit lifts systemd's start limit on cortex.service before agentop
+// starts it. The unit allows five starts in five minutes (StartLimitBurst), and a
+// proxy that crash-loops spends them in under a minute; systemd then marks the
+// unit failed (start-limit-hit) and refuses every start until the window passes or
+// the counter is reset. Without this, the fix-then-`service restart` that status
+// tells the user to run failed with "start of the service was attempted too often",
+// and so did `service start` and a reinstall.
+//
+// Only around a start or stop someone asked for, never on systemd's own restarts,
+// so the limit still stops a crash loop by itself. controlService also calls it
+// after a stop, for the state that leaves; see there. reset-failed on a unit that
+// is not failed changes nothing; its error, for a unit systemd has not loaded, is
+// not ours to report.
+func clearStartLimit() {
+	_ = exec.Command("systemctl", "--user", "reset-failed", systemdUnit).Run() //nolint:errcheck
+}
+
+// unitState is what systemd says about cortex.service, read once, so status can
+// name a state a health probe cannot: a probe that gets no answer is the same
+// silence whether Cortex was stopped on purpose, is crash-looping, or was given up
+// on. The zero value means systemd could not be asked.
+type unitState struct {
+	known bool
+	// LoadState: loaded when systemd has the unit; not-found when its file is not
+	// where systemd looks, masked when it is blocked. Every other field describes
+	// a loaded unit only, so status reads them only then.
+	load string
+	// ActiveState and SubState: active/running, inactive/dead after a stop,
+	// activating/auto-restart between a crash and its restart, failed/failed once
+	// the restarts run out.
+	active, sub string
+	// UnitFileState: enabled after `service start`; disabled after `service stop`,
+	// or for a unit file that was never enabled, which systemd cannot tell apart.
+	enabled string
+	// Result, as systemd words why the unit last stopped: success, exit-code,
+	// signal, start-limit-hit.
+	result   string
+	restarts int
+}
+
+// systemdUnitState asks systemd for cortex.service's state in one call. Not known
+// when there is no systemctl or the user manager will not answer: status then says
+// only what its health probe saw, as it always did.
+func systemdUnitState() unitState {
+	if _, err := exec.LookPath("systemctl"); err != nil {
+		return unitState{}
+	}
+	out, err := exec.Command("systemctl", "--user", "show", systemdUnit,
+		"-p", "LoadState", "-p", "ActiveState", "-p", "SubState", "-p", "UnitFileState", "-p", "Result", "-p", "NRestarts").Output()
+	if err != nil {
+		return unitState{}
+	}
+	var s unitState
+	for _, l := range strings.Split(string(out), "\n") {
+		k, v, ok := strings.Cut(strings.TrimSpace(l), "=")
+		if !ok {
+			continue
+		}
+		switch k {
+		case "LoadState":
+			s.load = v
+		case "ActiveState":
+			s.active = v
+		case "SubState":
+			s.sub = v
+		case "UnitFileState":
+			s.enabled = v
+		case "Result":
+			s.result = v
+		case "NRestarts":
+			s.restarts, _ = strconv.Atoi(v)
+		}
+	}
+	s.known = s.active != ""
+	return s
 }
 
 // supervisorRunning asks the supervisor whether OUR job is up, which health alone

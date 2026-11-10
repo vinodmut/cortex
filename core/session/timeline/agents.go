@@ -9,7 +9,7 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/rossoctl/cortex/core/pipeline"
+	"github.com/rossoctl/cortex/core/model"
 )
 
 // progressPrompt is the instruction Claude Code appends when it asks a model for a subagent's
@@ -47,7 +47,7 @@ const previewMax = 80
 
 // call is one inference request and, once seen, its response.
 type call struct {
-	req, resp *pipeline.SessionEvent
+	req, resp *model.SessionEvent
 	agent     string
 }
 
@@ -77,7 +77,7 @@ type toolArgs struct {
 	To           string `json:"to"`
 }
 
-func buildAgents(t *Timeline, events []pipeline.SessionEvent) {
+func buildAgents(t *Timeline, events []model.SessionEvent) {
 	calls := pairCalls(events)
 	if len(calls) == 0 {
 		return
@@ -85,16 +85,18 @@ func buildAgents(t *Timeline, events []pipeline.SessionEvent) {
 
 	type agentState struct {
 		first time.Time
-		prev  []pipeline.InferenceMessage
+		prev  []model.InferenceMessage
 	}
 	agents := map[string]*agentState{}
 	jobs := map[string]int{} // background job id → index in t.Jobs
 	var order []string
-	ends := map[string]map[string]*pipeline.InferenceToolResult{} // agent → tool id → first result
+	ends := map[string]map[string]*model.InferenceToolResult{} // agent → tool id → first result
 	endAt := map[string]map[string]time.Time{}
 	results := map[string]string{} // tool id → result text, for Agent calls only
 	agentTools := map[string]bool{}
 	seenReturn := map[string]bool{}
+	stopped := map[string]time.Time{} // agent → its latest <task-notification>: its run ended
+	var askedAt []time.Time           // per t.Tools entry: when the request that asked for it started
 	var spawns []*spawn
 
 	for _, c := range calls {
@@ -110,7 +112,7 @@ func buildAgents(t *Timeline, events []pipeline.SessionEvent) {
 		for i := range inf.ToolResults {
 			r := &inf.ToolResults[i]
 			if ends[c.agent] == nil {
-				ends[c.agent], endAt[c.agent] = map[string]*pipeline.InferenceToolResult{}, map[string]time.Time{}
+				ends[c.agent], endAt[c.agent] = map[string]*model.InferenceToolResult{}, map[string]time.Time{}
 			}
 			if _, seen := ends[c.agent][r.ToolUseID]; !seen {
 				ends[c.agent][r.ToolUseID], endAt[c.agent][r.ToolUseID] = r, c.req.At
@@ -157,6 +159,10 @@ func buildAgents(t *Timeline, events []pipeline.SessionEvent) {
 					}
 					seenReturn[key] = true
 					t.Returns = append(t.Returns, Return{Agent: from, Into: c.agent, At: c.req.At, Seq: c.req.Seq})
+					// Only a notification says the run ended: an <agent-message> can arrive mid-run.
+					if re == taskIDRe && c.req.At.After(stopped[from]) {
+						stopped[from] = c.req.At
+					}
 					// A background job ends at the first notification naming it.
 					if j, ok := jobs[from]; ok && t.Jobs[j].End == nil {
 						at := c.req.At
@@ -179,7 +185,7 @@ func buildAgents(t *Timeline, events []pipeline.SessionEvent) {
 		}
 		// No finish reason is a reply that never finished: the proxy records a stream cut
 		// mid-reply as the 200 it started as. A refusal is a call that failed too.
-		turn.Error = c.resp.Phase == pipeline.SessionDenied || c.resp.Error != nil || c.resp.StatusCode >= 400 ||
+		turn.Error = c.resp.Phase == model.SessionDenied || c.resp.Error != nil || c.resp.StatusCode >= 400 ||
 			failedFinish[turn.Finish]
 		t.Turns = append(t.Turns, turn)
 		if c.resp.Inference == nil {
@@ -190,6 +196,7 @@ func buildAgents(t *Timeline, events []pipeline.SessionEvent) {
 			_ = json.Unmarshal([]byte(tc.Arguments), &a)
 			tool := Tool{Agent: c.agent, ID: tc.ID, Name: tc.Name, Start: end, Preview: preview(tc.Name, a), Seq: c.resp.Seq}
 			t.Tools = append(t.Tools, tool)
+			askedAt = append(askedAt, c.req.At)
 			if tc.Name == "Agent" || tc.Name == "Task" {
 				agentTools[tc.ID] = true
 				spawns = append(spawns, &spawn{by: c.agent, turnAt: c.req.At, desc: a.Description, typ: a.SubagentType})
@@ -213,6 +220,17 @@ func buildAgents(t *Timeline, events []pipeline.SessionEvent) {
 	// Close each tool on its agent's first request carrying its result. Claude Code runs a
 	// tool while the response that asked for it is still streaming, so that request can be
 	// recorded before the response finished: clamp rather than draw a negative span.
+	//
+	// A tool that ends the run by design, with no result, ended it at the response that asked
+	// for it: a workflow agent stops at its StructuredOutput call, and no request carries that
+	// call's result. That response's other tools get no result either, and a workflow agent
+	// gets no notification to close them. A response's tools share its Seq.
+	endedRun := map[uint64]bool{}
+	for _, tool := range t.Tools {
+		if _, ok := endAt[tool.Agent][tool.ID]; !ok && (tool.Name == "SubagentHandback" || tool.Name == "StructuredOutput") {
+			endedRun[tool.Seq] = true
+		}
+	}
 	si := 0
 	for i := range t.Tools {
 		tool := &t.Tools[i]
@@ -222,8 +240,11 @@ func buildAgents(t *Timeline, events []pipeline.SessionEvent) {
 			}
 			tool.End = &at
 			tool.Error = ends[tool.Agent][tool.ID].IsError
-		} else if tool.Name == "SubagentHandback" || lastTurn[tool.Agent].After(tool.Start) {
-			// The agent moved on without the result, or the tool ends the run by design.
+		} else if endedRun[tool.Seq] || lastTurn[tool.Agent].After(tool.Start) || stopped[tool.Agent].After(askedAt[i]) {
+			// The agent moved on without the result, or its run ended without it (the response
+			// ended the run, or the agent was stopped). The run can end while the asking response
+			// still streams, so compare the notification with that request's start. A resumed
+			// run's request starts after the earlier notification.
 			at := tool.Start
 			tool.End, tool.Lost = &at, true
 		}
@@ -328,16 +349,16 @@ func linkAgents(order []string, first map[string]time.Time, calls []call, spawns
 // agent that made it. Progress-label calls and tool-less side calls (titler, classifier,
 // security monitor) are dropped: they are not an agent's work, and on a live session they were
 // more than half of the main role's requests.
-func pairCalls(events []pipeline.SessionEvent) []call {
+func pairCalls(events []model.SessionEvent) []call {
 	var calls []call
 	byReq := map[string]int{}
 	for i := range events {
 		e := &events[i]
-		if e.Direction != pipeline.Outbound {
+		if e.Direction != model.Outbound {
 			continue
 		}
 		switch e.Phase {
-		case pipeline.SessionRequest:
+		case model.SessionRequest:
 			if e.Inference == nil {
 				continue
 			}
@@ -347,7 +368,7 @@ func pairCalls(events []pipeline.SessionEvent) []call {
 			}
 			byReq[e.RequestID] = len(calls)
 			calls = append(calls, call{req: e, agent: id})
-		case pipeline.SessionResponse, pipeline.SessionDenied:
+		case model.SessionResponse, model.SessionDenied:
 			if j, ok := byReq[e.RequestID]; ok && calls[j].resp == nil {
 				calls[j].resp = e
 			}
@@ -360,15 +381,15 @@ func pairCalls(events []pipeline.SessionEvent) []call {
 // markers: AgentRole from its cc_is_subagent header, Subagent from its agent id header.
 // Every other known client gets the single main row — nothing on the wire says which of
 // its calls belong together beyond that.
-func agentOf(e *pipeline.SessionEvent) (string, bool) {
+func agentOf(e *model.SessionEvent) (string, bool) {
 	switch {
 	case e.Subagent != "":
 		return e.Subagent, true
-	case e.Inference.AgentRole == pipeline.AgentRoleSubagent:
+	case e.Inference.AgentRole == model.AgentRoleSubagent:
 		return UnseparatedAgent, true
-	case e.Inference.AgentRole == pipeline.AgentRoleMain:
+	case e.Inference.AgentRole == model.AgentRoleMain:
 		return MainAgent, true
-	case e.Client != nil && pipeline.IsKnownAgent(e.Client.Name):
+	case e.Client != nil && model.IsKnownAgent(e.Client.Name):
 		return MainAgent, true
 	}
 	return "", false
@@ -380,7 +401,7 @@ func agentOf(e *pipeline.SessionEvent) (string, bool) {
 // literals run for every client: they match Claude's own progress and recap prompt text, which
 // no other client sends, and a recap storm reads as turns on any session that carries one —
 // including pre-marker Claude Code traffic, attributed by client name alone.
-func isSideCall(inf *pipeline.InferenceExtension) bool {
+func isSideCall(inf *model.InferenceExtension) bool {
 	if inf.AgentRole != "" && len(inf.Tools) == 0 && inf.ToolCount == 0 {
 		return true
 	}
@@ -394,7 +415,7 @@ func isSideCall(inf *pipeline.InferenceExtension) bool {
 
 // commonPrefix is how many leading messages cur shares with prev. The store interns repeated
 // message content, so equal strings usually share a backing array and compare in O(1).
-func commonPrefix(prev, cur []pipeline.InferenceMessage) int {
+func commonPrefix(prev, cur []model.InferenceMessage) int {
 	k := 0
 	for k < len(prev) && k < len(cur) && prev[k].Role == cur[k].Role && prev[k].Content == cur[k].Content {
 		k++
@@ -402,7 +423,7 @@ func commonPrefix(prev, cur []pipeline.InferenceMessage) int {
 	return k
 }
 
-func responseEnd(req, resp *pipeline.SessionEvent) time.Time {
+func responseEnd(req, resp *model.SessionEvent) time.Time {
 	if resp.Duration > 0 {
 		return req.At.Add(resp.Duration)
 	}

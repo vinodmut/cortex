@@ -1,7 +1,7 @@
 // Package ibac implements an Intent-Based Access Control plugin for
 // authbridge. IBAC denies outbound HTTP requests that don't align with
 // the user's most-recent declared intent (extracted from inbound A2A
-// messages and surfaced via pctx.Session.LastIntent).
+// messages and surfaced via pctx.LastIntent).
 //
 // Threat model: prompt-injection attacks where an agent's tool-calling
 // LLM follows malicious instructions embedded in untrusted data —
@@ -40,6 +40,7 @@ import (
 	"github.com/rossoctl/cortex/core/llmclient"
 	"github.com/rossoctl/cortex/core/pipeline"
 	"github.com/rossoctl/cortex/core/plugins"
+	"github.com/rossoctl/cortex/core/plugins/internal/hostmatch"
 )
 
 // ibacConfig is the plugin's local config schema. See
@@ -292,7 +293,7 @@ func (p *IBAC) Capabilities() pipeline.PluginCapabilities {
 		//
 		// a2a-parser is deliberately NOT in this list. RequiresAny is
 		// a same-chain check, and a2a-parser runs in the INBOUND
-		// chain in every in-tree config (it seeds Session.LastIntent
+		// chain in every in-tree config (it seeds pctx.LastIntent
 		// from inbound A2A user turns). IBAC's a2a dependency is the
 		// inbound session-intent seeding, which the validator can't
 		// enforce cross-chain anyway — that dependency is runtime,
@@ -358,7 +359,7 @@ func (p *IBAC) OnRequest(ctx context.Context, pctx *pipeline.Context) pipeline.A
 	}
 
 	// 3. Bypass-host check (Keycloak, OTel, agent's own LLM, etc).
-	if matchesAnyHost(p.bypassHosts, pctx.Host) {
+	if hostmatch.MatchesAny(p.bypassHosts, pctx.Host) {
 		pctx.Skip("host_bypass")
 		return pipeline.Action{Type: pipeline.Continue}
 	}
@@ -427,12 +428,14 @@ func (p *IBAC) OnRequest(ctx context.Context, pctx *pipeline.Context) pipeline.A
 	// 6. Pull the user's most recent declared intent. Two distinct
 	//    nil pathways, distinguished so operator dashboards can tell
 	//    them apart:
-	//      - no_session: no inbound A2A request has populated the
+	//      - no_session: pctx.LastIntent() is FactNoSession. The request
+	//        has no session: no inbound A2A request has populated the
 	//        active session bucket yet (or session tracking is off
 	//        entirely). Common at agent startup before any user turn.
-	//      - no_intent: a session exists but contains no extractable
-	//        user message (a2a-parser missing from inbound chain, or
-	//        events present but none are user-role A2A requests).
+	//      - no_intent: a session exists but has no extractable user
+	//        message. pctx.LastIntent() is FactNone (see its reasons), or
+	//        the intent has no user-role text (a2a-parser missing from
+	//        inbound chain, for example).
 	//
 	//    Both states mean "IBAC has no user intent to align against"
 	//    — i.e., the request is either genuinely user-less (agent
@@ -445,7 +448,8 @@ func (p *IBAC) OnRequest(ctx context.Context, pctx *pipeline.Context) pipeline.A
 	//      - deny: treat as misconfiguration, Reject 403. Right for
 	//        deployments where every outbound is user-driven and a
 	//        missing intent should surface as a hard failure.
-	if pctx.Session == nil {
+	intent := pctx.LastIntent()
+	if intent.State == pipeline.FactNoSession {
 		action := describeAction(pctx, p.cfg.JudgeInference)
 		if p.cfg.NoIntentPolicy == NoIntentPolicyAllow {
 			pctx.Record(pipeline.Invocation{
@@ -470,8 +474,7 @@ func (p *IBAC) OnRequest(ctx context.Context, pctx *pipeline.Context) pipeline.A
 		})
 		return pipeline.DenyStatus(403, "ibac.no_session", "no active session for outbound request")
 	}
-	intent := pctx.Session.LastIntent()
-	intentText := extractIntentText(intent)
+	intentText := extractIntentText(intent.Event)
 	if intentText == "" {
 		action := describeAction(pctx, p.cfg.JudgeInference)
 		if p.cfg.NoIntentPolicy == NoIntentPolicyAllow {
@@ -525,7 +528,7 @@ func (p *IBAC) OnRequest(ctx context.Context, pctx *pipeline.Context) pipeline.A
 				},
 			})
 			slog.Warn("ibac: judge uncertain, failing closed",
-				"path", pctx.Path, "host", pctx.Host, "error", errPreview)
+				"path", pipeline.SanitizeLogValue(pctx.Path), "host", pipeline.SanitizeLogValue(pctx.Host), "error", errPreview)
 			return pipeline.DenyStatus(403, "ibac.judge_uncertain", errPreview)
 		}
 		pctx.Record(pipeline.Invocation{
@@ -538,7 +541,7 @@ func (p *IBAC) OnRequest(ctx context.Context, pctx *pipeline.Context) pipeline.A
 			},
 		})
 		slog.Warn("ibac: judge unavailable, failing closed",
-			"path", pctx.Path, "host", pctx.Host, "error", errPreview)
+			"path", pipeline.SanitizeLogValue(pctx.Path), "host", pipeline.SanitizeLogValue(pctx.Host), "error", errPreview)
 		return pipeline.DenyStatus(503, "ibac.judge_unavailable", errPreview)
 	}
 
@@ -572,26 +575,6 @@ func (p *IBAC) OnRequest(ctx context.Context, pctx *pipeline.Context) pipeline.A
 
 func (p *IBAC) OnResponse(_ context.Context, _ *pipeline.Context) pipeline.Action {
 	return pipeline.Action{Type: pipeline.Continue}
-}
-
-// matchesAnyHost reports whether host matches any of the configured
-// host globs. Matching is path.Match semantics; "*" does not cross "."
-// (so "keycloak.*" matches "keycloak.foo" but not "keycloak.foo.bar"
-// — operators wanting cross-segment wildcards use "keycloak.*.*").
-func matchesAnyHost(patterns []string, host string) bool {
-	if host == "" {
-		return false
-	}
-	// Strip port for matching; bypass-host config is hostname-shaped.
-	if i := strings.IndexByte(host, ':'); i >= 0 {
-		host = host[:i]
-	}
-	for _, p := range patterns {
-		if matched, _ := path.Match(p, host); matched {
-			return true
-		}
-	}
-	return false
 }
 
 // describeAction builds a one-paragraph summary of the outbound action

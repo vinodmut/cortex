@@ -14,9 +14,10 @@ import (
 // installerOneLiner is the fix for "nothing is installed": the documented install.
 const installerOneLiner = "curl -fsSL https://www.rossoctl.dev/cortex/install.sh | sh"
 
-// setupBinaryNames are what the binaries step installs; cortex-session-dump only
-// when the installer staged it (its fetch is never fatal).
-var setupBinaryNames = []string{"agentop", "cortex", "cortex-session-dump"}
+// setupBinaryNames are what the binaries step installs; cortex-session-dump and
+// cortex-gateway only when the installer staged them (the dump's fetch is never
+// fatal, and no release has a gateway yet).
+var setupBinaryNames = []string{"agentop", proxyBinary, "cortex-session-dump", "cortex-gateway"}
 
 type binariesStep struct{}
 
@@ -29,7 +30,7 @@ func (binariesStep) plan(env *setupEnv) (stepPlan, *problem) {
 	env.readVersions()
 	pair := "agentop, cortex " + env.installedVersion + " · " + env.tilde(env.binDir)
 	if env.fromDir == "" {
-		for _, n := range []string{"agentop", "cortex"} {
+		for _, n := range []string{"agentop", proxyBinary} {
 			if !isExecutable(filepath.Join(env.binDir, n)) {
 				return p, &problem{reason: n + " is not installed in " + env.tilde(env.binDir),
 					fix: []string{installerOneLiner}}
@@ -38,7 +39,7 @@ func (binariesStep) plan(env *setupEnv) (stepPlan, *problem) {
 		p.done, p.doneMsg = true, pair
 		return p, nil
 	}
-	for _, n := range []string{"agentop", "cortex"} {
+	for _, n := range []string{"agentop", proxyBinary} {
 		if !isExecutable(filepath.Join(env.fromDir, n)) {
 			return p, &problem{reason: n + " is missing from " + env.tilde(env.fromDir)}
 		}
@@ -156,8 +157,8 @@ func installBinary(env *setupEnv, src, dst string) (func() error, error) {
 	return restore, copyFile(src, dst, 0o755)
 }
 
-// installedVersion is the last word of `path --version`'s first line, as
-// install.sh's installed_version reads it; "" when there is no such binary.
+// installedVersion is the last word of `path --version`'s first line, or ""
+// when there is no such binary. install.sh reads only the "(cpex)" text of that line.
 func installedVersion(path string) string {
 	f := strings.Fields(versionLine(path))
 	if len(f) == 0 {

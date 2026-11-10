@@ -10,8 +10,7 @@ import (
 	"github.com/rossoctl/cortex/core/cost/event"
 	"github.com/rossoctl/cortex/core/cost/pricing"
 	"github.com/rossoctl/cortex/core/cost/usage"
-	"github.com/rossoctl/cortex/core/pipeline"
-	"github.com/rossoctl/cortex/core/session"
+	"github.com/rossoctl/cortex/core/model"
 )
 
 // opsBuffer is how many batches the writer goroutine can be behind by.
@@ -108,6 +107,9 @@ type Writer struct {
 	// loggedDrops is the cumulative drop count already reported. Atomic only because
 	// submit's post-Close inline path can reach write from a caller's goroutine.
 	loggedDrops atomic.Int64
+	// loggedReadDrops is the drop count Snapshot has already warned about, so its warning
+	// fires once per increase rather than once per read.
+	loggedReadDrops atomic.Int64
 
 	// betweenWindowReads is a TEST SEAM and nothing else: Window calls it, when
 	// non-nil, between reading the accumulator and reading the day files.
@@ -253,7 +255,7 @@ func New(dir string, opts ...Option) (*Writer, error) {
 	return w, nil
 }
 
-// agentLabel is the ledger's STORAGE-side spelling of pipeline.EventClient.Label:
+// agentLabel is the ledger's STORAGE-side spelling of model.EventClient.Label:
 // the same label for a client that exists, and "" instead of "unknown" for one that
 // does not.
 //
@@ -263,7 +265,7 @@ func New(dir string, opts ...Option) (*Writer, error) {
 // indistinguishable from an agent that really did call itself that. labelFor puts the
 // display string back at the query boundary, so nothing a client sees differs. See
 // Row.Agent.
-func agentLabel(c *pipeline.EventClient) string {
+func agentLabel(c *model.EventClient) string {
 	if c == nil {
 		return ""
 	}
@@ -315,7 +317,7 @@ func agentLabel(c *pipeline.EventClient) string {
 // PresentKinds is left as the parser set it. Clearing the bit for the offending kind would
 // be the fuller reading of "absent" — a set bit with a zero value means "reported zero"
 // where an unset bit means "not exposed" — but the bit layout is parsercommon's, restated in
-// pipeline.InferenceExtension precisely to avoid an import, and re-deriving it here would
+// model.InferenceExtension precisely to avoid an import, and re-deriving it here would
 // put a third copy in the tree with nothing keeping the three in agreement. So the residual
 // is that a refused count reads as "reported zero" rather than "not exposed", a smaller
 // error than a wrong total and smaller still because PresentKinds is a UNION over the
@@ -327,20 +329,13 @@ func tokenCount(n int) int64 {
 	return int64(n)
 }
 
-// A BUILD ERROR RATHER THAN A COMMENT. Record's doc and row.go's design both rest on this Writer
-// being a second session.Recorder beside the aggregator, and nothing checked it: this package had no
-// importer outside itself, so neither side's signature drifting would have broken any build. Review
-// found the claim holding today and unenforced — which is the same shape as the pins this review has
-// already turned into tests, one level down in the type system.
-var _ session.Recorder = (*Writer)(nil)
-
 // Record implements session.Recorder.
 //
 // Never returns an error and never touches disk: this runs on the synchronous
 // session-append path, under the store's write lock, and the ledger is
 // observability. Neither a failure nor a delay here may become a failed or a slow
 // request. See the type doc for how the hand-off works.
-func (w *Writer) Record(_ string, e *pipeline.SessionEvent) {
+func (w *Writer) Record(_ string, e *model.SessionEvent) {
 	if e == nil {
 		return
 	}
@@ -356,7 +351,7 @@ func (w *Writer) Record(_ string, e *pipeline.SessionEvent) {
 	// json.Unmarshal, and this method executes under session.Store.Append's write lock.
 	// Decoding a request event's plugin map there would put parsing work in front of every
 	// request to answer a question this guard already settles.
-	if e.Phase != pipeline.SessionResponse && e.Phase != pipeline.SessionDenied {
+	if e.Phase != model.SessionResponse && e.Phase != model.SessionDenied {
 		return
 	}
 	ev, hasCost := event.Record(e)
@@ -436,7 +431,7 @@ func (w *Writer) Record(_ string, e *pipeline.SessionEvent) {
 		// written to an append-only file an operator reads. One over-long line permanently
 		// ends every future read of that day at its offset (see maxLabelLen for the
 		// arithmetic); one escape sequence rewrites the terminal of whoever cats the file
-		// (see sanitizeLabel). rowLabel applies both, in the order that keeps the length
+		// (see rowLabel). rowLabel applies both, in the order that keeps the length
 		// bound true.
 		//
 		// Host is the event's field name; endpoint is what it means here. See Row.Endpoint.
@@ -451,7 +446,7 @@ func (w *Writer) Record(_ string, e *pipeline.SessionEvent) {
 		// where the live aggregator displays it as "unknown". See Row.Agent for why the two
 		// representations differ and why they still mean the same thing.
 		//
-		// Capped as well. pipeline.maxClientLen already holds the retained User-Agent to
+		// Capped as well. model.maxClientLen already holds the retained User-Agent to
 		// 128, so this is not the unbounded case Model is — but the ring truncates the same
 		// label to maxLabelLen before it becomes a byAgent key, so cutting at 96 here is
 		// what keeps group=agent spelled identically whichever half answers. Sanitised for
@@ -933,10 +928,8 @@ func (w *Writer) logDrops() {
 // writer, not about anybody's read: it happened once, no later read can rediscover it, and
 // every reader of this ledger is equally short because of it.
 //
-// Called by sessionapi's /v1/usage handler, which surfaces it beside the
-// read-side Caveats. It stays exported for out-of-tree readers of the ledger
-// too, who need the same completeness signal.
-// to withdraw the number.
+// Snapshot surfaces it beside the read-side Caveats. Exported for out-of-tree readers of
+// the ledger, who need the same completeness signal.
 func (w *Writer) Dropped() int64 { return w.dropped.Load() }
 
 // run is the ONLY goroutine that touches the filesystem after construction.

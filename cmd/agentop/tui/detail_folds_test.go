@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 	"testing"
@@ -54,6 +55,86 @@ func cursorTo(t *testing.T, m *model, sub string) {
 		m.Update(keyRune('j'))
 	}
 	t.Fatalf("no line holds %q", sub)
+}
+
+// An earlier assistant turn that only called tools has no content; its label names the tools.
+func TestDetailFolds_EarlierToolOnlyTurnShowsToolNames(t *testing.T) {
+	m := newSearchEventsModel(t, "h")
+	ev := turnEvent()
+	ev.Inference.Messages[1] = pipeline.InferenceMessage{Role: "assistant", ContentBytes: 90, ToolCallNames: "Read, Bash"}
+	m.events["s"] = []pipeline.SessionEvent{ev}
+	m.rebuildEventsTable()
+	setCursorVisible(&m.eventsTbl, 0)
+	m.selectedEventKey = keyOf(m.selectedEvent())
+	press(m, tea.KeyEnter)
+	cursorTo(t, m, "earlier message")
+	press(m, tea.KeyEnter)
+	cursorTo(t, m, "Read, Bash")
+}
+
+// This turn's tool call shows its arguments under the assistant message that made it, and
+// its result under the message that sent it back. A result no message names stays in the
+// top-level list.
+func TestDetailFolds_ToolBlocksNestUnderTheirMessage(t *testing.T) {
+	m := newSearchEventsModel(t, "h")
+	ev := turnEvent()
+	ev.Inference.Messages[2] = pipeline.InferenceMessage{
+		Role: "assistant", ContentBytes: 90, ToolCallNames: "Bash", ToolUseIDs: "toolu_1",
+	}
+	ev.Inference.Messages[3] = pipeline.InferenceMessage{Role: "user", ContentBytes: 40, ToolUseIDs: "toolu_1"}
+	ev.Inference.HistoryToolCalls = []pipeline.InferenceToolCall{
+		{ID: "toolu_1", Name: "Bash", Arguments: `{"command":"rm -rf /tmp/pa"}`},
+	}
+	ev.Inference.ToolResults = []pipeline.InferenceToolResult{
+		{ToolUseID: "toolu_1", Content: "removed-needle"},
+		{ToolUseID: "toolu_orphan", Content: "orphan-needle"},
+	}
+
+	data, err := json.Marshal(ev)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := filterForDetail(data, pipeline.SessionRequest)
+	var v struct {
+		Inference struct {
+			Messages []struct {
+				Role        string                         `json:"role"`
+				ToolUseIDs  string                         `json:"toolUseIds"`
+				ToolCalls   []pipeline.InferenceToolCall   `json:"toolCalls"`
+				ToolResults []pipeline.InferenceToolResult `json:"toolResults"`
+			} `json:"messages"`
+			HistoryToolCalls []pipeline.InferenceToolCall   `json:"historyToolCalls"`
+			ToolResults      []pipeline.InferenceToolResult `json:"toolResults"`
+		} `json:"inference"`
+	}
+	if err := json.Unmarshal(got, &v); err != nil {
+		t.Fatal(err)
+	}
+	call, res := v.Inference.Messages[2], v.Inference.Messages[3]
+	if len(call.ToolCalls) != 1 || call.ToolCalls[0].Arguments != `{"command":"rm -rf /tmp/pa"}` || call.ToolResults != nil {
+		t.Errorf("assistant message = %+v, want only its Bash call", call)
+	}
+	if len(res.ToolResults) != 1 || res.ToolResults[0].Content != "removed-needle" || res.ToolCalls != nil {
+		t.Errorf("user message = %+v, want only the toolu_1 result", res)
+	}
+	if call.ToolUseIDs != "" || res.ToolUseIDs != "" {
+		t.Error("toolUseIds still shown after nesting")
+	}
+	if v.Inference.HistoryToolCalls != nil {
+		t.Errorf("historyToolCalls = %+v, want it gone once every call nested", v.Inference.HistoryToolCalls)
+	}
+	if len(v.Inference.ToolResults) != 1 || v.Inference.ToolResults[0].ToolUseID != "toolu_orphan" {
+		t.Errorf("top-level toolResults = %+v, want only the orphan", v.Inference.ToolResults)
+	}
+
+	// And on screen: this turn's messages are open, so the command and the result show.
+	m.events["s"] = []pipeline.SessionEvent{ev}
+	m.rebuildEventsTable()
+	setCursorVisible(&m.eventsTbl, 0)
+	m.selectedEventKey = keyOf(m.selectedEvent())
+	press(m, tea.KeyEnter)
+	cursorTo(t, m, "rm -rf /tmp/pa")
+	cursorTo(t, m, "removed-needle")
 }
 
 func TestDetailFolds_EnterOpensAndClosesTheFoldAtTheCursor(t *testing.T) {
@@ -111,6 +192,8 @@ func TestDetailFolds_EnterOnATunnelRowDoesNothing(t *testing.T) {
 	setCursorVisible(&m.eventsTbl, 0)
 	m.selectedEventKey = keyOf(m.selectedEvent())
 	press(m, tea.KeyEnter)
+	// Off the REQUEST title, which is a fold now (#1681), onto the tunnel's own line.
+	cursorTo(t, m, "h:443")
 	press(m, tea.KeyEnter)
 	if m.pane != paneDetail || !strings.Contains(detailScreen(m), "h:443") {
 		t.Errorf("pane %v, screen:\n%s", m.pane, detailScreen(m))
@@ -217,7 +300,7 @@ func BenchmarkRenderDetailAllOpen(b *testing.B) {
 	e := fatTurn()
 	m := &model{detailVp: newDetailViewportForBench()}
 	m.showDetail(eventRow{event: &e}, true)
-	m.detailFolds = map[string]foldChoice{"inference.messages[<19]": {open: true}, "inference.messages[<19][1]": {open: true}, "inference.messages[<19][1].content": {open: true}}
+	m.detailFolds = map[string]foldChoice{"request.inference.messages[<19]": {open: true}, "request.inference.messages[<19][1]": {open: true}, "request.inference.messages[<19][1].content": {open: true}}
 	m.renderDetail()
 	b.Run("render", func(b *testing.B) {
 		for b.Loop() {
@@ -235,7 +318,7 @@ func TestFatTurn_AllOpenShowsTheBigMessage(t *testing.T) {
 	e := fatTurn()
 	m := &model{detailVp: newDetailViewportForBench()}
 	m.showDetail(eventRow{event: &e}, true)
-	m.detailFolds = map[string]foldChoice{"inference.messages[<19]": {open: true}, "inference.messages[<19][1]": {open: true}, "inference.messages[<19][1].content": {open: true}}
+	m.detailFolds = map[string]foldChoice{"request.inference.messages[<19]": {open: true}, "request.inference.messages[<19][1]": {open: true}, "request.inference.messages[<19][1].content": {open: true}}
 	m.renderDetail()
 	if n := len(m.detailLines); n < 1595 {
 		t.Fatalf("the big message did not open: %d lines", n)

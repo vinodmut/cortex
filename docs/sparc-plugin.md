@@ -114,7 +114,7 @@ pipeline:
 | `timeout_ms` | No | `30000` | Per-call reflection timeout. Rejected below `100`. Reflection is **out-of-band** (the plugin calls the SPARC service directly), so this is independent of the forward proxy's upstream timeout — raise it for slow/CPU-bound providers (e.g. an in-cluster Ollama). |
 | `skip_tools` | No | — | Tool-name globs (`path.Match`) to NOT reflect on (e.g. trivial read tools). |
 | `reflect_tools` | No | — | If non-empty, ONLY reflect tools matching these globs; all others skipped. |
-| `bypass_hosts` / `bypass_paths` | No | built-in | Host / path globs skipped without reflecting. |
+| `bypass_hosts` / `bypass_paths` | No | built-in | Host / path globs skipped without reflecting. Hosts match case-insensitively, with the port and IPv6 brackets stripped. |
 
 ### Pipeline composition
 
@@ -171,7 +171,7 @@ service never echoes provider exception text back to callers; details stay in it
 
 ## See also
 - [`deploy/sparc-service/README.md`](../deploy/sparc-service/README.md) — the reflection service.
-- [`demos/finance-sparc/`](../demos/finance-sparc/README.md) — the end-to-end demo.
+- [`cortex-demos/finance-sparc/`](https://github.com/rossoctl/cortex-demos/blob/main/finance-sparc/README.md) — the end-to-end demo.
 - [`ibac-plugin.md`](ibac-plugin.md) — the complementary intent control.
 
 ## Files

@@ -27,7 +27,7 @@ func throughLines(t *testing.T, evs []pipeline.SessionEvent) []pipeline.SessionE
 			}
 			lines = append(lines, b)
 		}
-		b, err := eventLine(stripped, r)
+		b, err := eventLine(stripped, r, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -125,6 +125,43 @@ func TestSplit_ToolResultIsAReference(t *testing.T) {
 	got := throughLines(t, []pipeline.SessionEvent{e})
 	if w, g := onceThroughJSON(t, e), mustJSON(t, got[0]); w != g {
 		t.Fatalf("tool results differ after the round trip:\nwant %s\ngot  %s", w, g)
+	}
+}
+
+// History tool-call arguments dedup on disk under the same threshold, and come back intact.
+func TestSplit_HistoryToolCallArgumentsAreAReference(t *testing.T) {
+	e := pipeline.SessionEvent{Inference: &pipeline.InferenceExtension{HistoryToolCalls: []pipeline.InferenceToolCall{
+		{ID: "toolu_1", Name: "Bash", Arguments: `{"command":"` + strings.Repeat("a", session.InternMinLen) + `"}`},
+		{ID: "toolu_2", Name: "Read", Arguments: `{}`},
+	}}}
+	stripped, r, _ := split(e, map[string]struct{}{})
+	if r == nil || len(r.TA) != 2 || r.TA[0] == nil || stripped.Inference.HistoryToolCalls[0].Arguments != "" {
+		t.Fatalf("long arguments must be a reference: refs %+v", r)
+	}
+	if r.TA[1] != nil || stripped.Inference.HistoryToolCalls[1].Arguments != `{}` {
+		t.Fatalf("short arguments must stay inline: refs %+v", r)
+	}
+	got := throughLines(t, []pipeline.SessionEvent{e})
+	if w, g := onceThroughJSON(t, e), mustJSON(t, got[0]); w != g {
+		t.Fatalf("history tool calls differ after the round trip:\nwant %s\ngot  %s", w, g)
+	}
+}
+
+// The thinking and effort fields are short scalars and counts: they ride in the event record
+// itself and come back intact.
+func TestSplitJoin_ThinkingFieldsRoundTrip(t *testing.T) {
+	e := pipeline.SessionEvent{Inference: &pipeline.InferenceExtension{
+		ThinkingType: "adaptive", ThinkingDisplay: "summarized", Effort: "high",
+		AnthropicBeta:    "interleaved-thinking-2025-05-14",
+		HistoryThinking:  &pipeline.InferenceThinking{Blocks: 3, Redacted: 1, SignatureBytes: 2944, RedactedBytes: 5},
+		ResponseThinking: &pipeline.InferenceThinking{Blocks: 1, TextBytes: 7, SignatureBytes: 1300},
+	}}
+	got := throughLines(t, []pipeline.SessionEvent{e})
+	if w, g := onceThroughJSON(t, e), mustJSON(t, got[0]); w != g {
+		t.Fatalf("thinking fields differ after the round trip:\nwant %s\ngot  %s", w, g)
+	}
+	if got[0].Inference.HistoryThinking == nil || got[0].Inference.HistoryThinking.SignatureBytes != 2944 {
+		t.Fatalf("historyThinking = %+v, want the counts back", got[0].Inference.HistoryThinking)
 	}
 }
 

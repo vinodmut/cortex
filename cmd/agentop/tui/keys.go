@@ -89,6 +89,12 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 		return m.serverNoticeKey(msg)
 	}
 
+	// Esc while a details search runs drops its answer. Esc again backs out.
+	if msg.String() == "esc" && m.pane == paneEvents && m.detailSearching() {
+		m.cancelDetailSearch()
+		return nil
+	}
+
 	// `/`, n and N search the pane, on every pane. Above the pickers, which handle their own
 	// keys and return. Not over the column picker or an edit, which own their keys.
 	if m.editState.phase == editPhaseDone && !(m.colPicker && m.pane == paneEvents) {
@@ -98,8 +104,7 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 			return nil
 		case "n", "N":
 			if m.surface(m.pane) != nil {
-				m.searchStep(m.pane, msg.String() == "n")
-				return nil
+				return m.searchStep(m.pane, msg.String() == "n")
 			}
 		}
 	}
@@ -707,6 +712,7 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 				// typed for that session's events, and re-entering it keeps them.
 				delete(m.search, paneEvents)
 				delete(m.search, paneDetail)
+				m.resetDetailSearch()
 			}
 			m.selectedSess = id
 			m.pane = paneEvents
@@ -729,6 +735,9 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 			// Enter on a subagent block's header collapses/expands it, the tree
 			// convention; on a message it stays the detail drill-down. One key,
 			// the row decides — same as the pickers.
+			if m.onOlderRow() {
+				return m.loadOlderFromRow()
+			}
 			if m.toggleSubagentBlock() {
 				return nil
 			}
@@ -739,11 +748,23 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 			// Render from the summary immediately, then fill the message bodies in
 			// when they arrive — the timeline no longer carries them. See
 			// fetchDetailEventCmd for why this is not a blocking spinner.
+			// A details match opens on its highlight: the detail search gets the same query.
+			if q := m.search[paneEvents]; m.searchDetails && q != "" && m.search[paneDetail] != q {
+				m.clearFoldQueries()
+				m.search[paneDetail] = q
+			}
+			er.raw, _ = m.heldRaw(er.event)
+			if er.resp != nil {
+				er.respRaw, _ = m.heldRaw(er.resp)
+			}
+			m.detailNum = m.shownNum()
 			m.showDetail(er, true)
 			m.pane = paneDetail
-			if m.needsFullEvent(er.event) && m.client != nil {
-				return fetchDetailEventCmd(m, eventSession(m.selectedSess, er.event), er.event.Seq)
+			if cmd := m.fetchDetailHalves(er); cmd != nil {
+				return cmd
 			}
+			m.openRawMatch()
+			m.revealDetailMatch()
 			return nil
 		case panePipeline:
 			p := m.selectedPlugin()
@@ -768,11 +789,26 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 		}
 		return nil
 
+	case "tab":
+		// The detail page's two sections (#1681): Tab is bound nowhere else, and ← already
+		// means back.
+		if m.pane == paneDetail {
+			m.jumpDetailSection()
+		}
+		return nil
+
 	case "y":
 		if m.pane != paneDetail || m.detailEvent == nil {
 			return nil
 		}
-		path, err := yankEventToFile(m.detailEvent)
+		half := m.detailHalf()
+		if half == nil {
+			// The section's own note says why the half is missing, and what to do.
+			lost := rowLost(m.detailRow, nil, 0, m.lostRef(m.events[m.selectedSess]))
+			m.setFlash("nothing to yank: " + missingNote(m.detailRow, sectionOf(m.detailCursorPath), lost))
+			return nil
+		}
+		path, err := yankEventToFile(half)
 		if err != nil {
 			// Sticky, like the success case: checkYankDir's message names the
 			// directory and the chmod that fixes it, which is useless if it
@@ -823,14 +859,6 @@ func (m *model) handleKey(msg tea.KeyMsg) tea.Cmd {
 	case "G":
 		m.goBottom()
 		return nil
-
-	case "o":
-		// Load the page before the oldest event held. Only in the timeline: the other
-		// panes have nothing to page.
-		if m.pane != paneEvents {
-			return nil
-		}
-		return m.loadOlderPage()
 
 	case "t":
 		// Back to the live tail from a paged-back timeline.
@@ -1193,6 +1221,9 @@ func (m *model) setStickyFlash(s string) {
 // enough to fit on a single row at 80 cols.
 func (m *model) helpView() string {
 	if m.searching {
+		if m.searchPane == paneEvents {
+			return "type to search · [tab] details · [enter] done · [esc] cancel"
+		}
 		return "type to search · [enter] done · [esc] cancel"
 	}
 	switch m.pane {
@@ -1278,11 +1309,9 @@ func (m *model) helpView() string {
 		if m.hideInactive && m.hiddenInactive > 0 {
 			base = fmt.Sprintf("%s  ·  %d hidden", base, m.hiddenInactive)
 		}
-		// Older events the snapshot did not ask for. Same reasoning as the hidden count
-		// one line up — a partial timeline should not read as the whole one — and it now
-		// names the key that fetches them, because there is one.
+		// The older-events row is the timeline's first row, off the screen at the tail.
 		if n := m.olderNotFetched[m.selectedSess]; n > 0 {
-			base = fmt.Sprintf("%s  ·  %d older ([o] to load)", base, n)
+			base = fmt.Sprintf("%s  ·  %d older (▲ at top)", base, n)
 		}
 		// Paging backward suspends this session's live appends, and dropping a page at
 		// the cap means the timeline no longer reaches the present. Both are states the
@@ -1304,7 +1333,16 @@ func (m *model) helpView() string {
 		}
 		return base + "  [?] keys  [q] quit"
 	case paneDetail:
-		return "[↑↓] move  [↵] fold  [y] yank  [u] usage  " + m.searchHints(m.pane) + "  [esc] back  [?] keys  [q] quit"
+		other, half := "response", "request"
+		if sectionOf(m.detailCursorPath) == "response" {
+			other, half = "request", "response"
+		}
+		yank := "  [y] yank " + half
+		if m.detailHalf() == nil {
+			yank = "" // y has nothing to write in a missing half
+		}
+		return "[↑↓] move  [↵] fold  [tab] " + other + yank + "  [u] usage  " +
+			m.searchHints(m.pane) + "  [esc] back  [?] keys  [q] quit"
 	case panePipeline:
 		// ONE SPELLING NOW, where there used to be two. The picker/bypass split
 		// existed only because esc meant different things in the two modes — "back
@@ -1392,209 +1430,4 @@ func (m *model) helpView() string {
 		return "[↑↓] nav" + enterHint + escHint + serverHint + "  [w] window" + spendHint + "  " + m.searchHints(m.pane) + "  [?] keys  [q] quit"
 	}
 	return "[?] keys  [q] quit"
-}
-
-// layout recomputes component sizes to fit the current terminal. Called on
-// every WindowSizeMsg. The footer reserves two lines; the title one.
-func (m *model) layout() {
-	if m.width == 0 || m.height == 0 {
-		return
-	}
-	// Reserve 3 rows: the title row and the footer's two.
-	//
-	// NOT "title + blank + footer", which is what this said and was never true — there is
-	// no blank row to borrow, and a reader who believes there is one reclaims a row the
-	// footer is standing on.
-	bodyH := m.height - 3
-	// And one for the rule that closes the top block.
-	//
-	// UNCONDITIONAL, unlike the two reservations below it: paneView draws the rule on every pane
-	// that renders a body, so there is no pane-dependent condition here to get wrong and none
-	// that can go stale between resizes.
-	//
-	// The two states that do NOT draw it — the edit overlay and `m.width == 0` — are full-screen
-	// takeovers that never read bodyHeight, so this row cannot be stranded in a body that does
-	// not exist. That is the exemption's reason, and it is narrower than "it always draws"; see
-	// renderDivider for what it means for anyone adding a third early return.
-	//
-	// TestLayout_EveryPaneFitsTheTerminal reports the reservation's absence as "one line too
-	// many", on every pane and every size.
-	bodyH -= dividerLines
-	// And one for the spend strip, which View() draws directly under the title.
-	//
-	// BY HEIGHT ALONE, deliberately blind to the pane: there is no setPane choke point to
-	// hook (the pane is assigned in twenty-odd places, and layout() runs on resizes, drawer
-	// toggles and pane transitions alike), so a reservation that read m.pane would go stale
-	// the moment the user moved between a picker and a data pane, leaving bodyHeight wrong
-	// until the next layout() — which on a pane the strip DOES draw means a body one row too
-	// tall and a footer pushed off the bottom. The cost is that the two picker panes render
-	// one row shorter than they need, which is invisible next to that. See
-	// spendStripReservesRow and spendStripVisible for the same asymmetry stated from the
-	// other side.
-	if m.spendStripReservesRow() {
-		// spendBandLines, not one row: the band stacks labels over values. paneView fills
-		// exactly this many, and the two must move together — see paneView.
-		bodyH -= spendBandLines
-	}
-	// And the drawer's rows when it is open. Reserving nothing for them made the view
-	// spendDrawerLines taller than the terminal the moment `$` was pressed, pushing the footer
-	// off the bottom on every pane — the failure the strip's own reservation exists to prevent,
-	// five rows at a time instead of one. See spendDrawerReservesRows.
-	if m.spendDrawerReservesRows() {
-		bodyH -= spendDrawerLinesFor(m.width)
-	}
-	// And one more while the search prompt is open: View() prepends searchInput above the body,
-	// so the line exists on screen whether or not the budget admits it. Unreserved, the view
-	// came out one line taller than the terminal at every size, the terminal scrolled, and the
-	// bottom row went missing for as long as the operator was typing — the same symptom as a
-	// mis-sized table, from a line nobody counted.
-	if m.searching {
-		bodyH--
-	}
-	if bodyH < 4 {
-		bodyH = 4
-	}
-
-	// Fit every fixed-width table to the terminal. Only the events table fitted itself (see
-	// fitColumns); these three declared their widths in their constructors and rendered wider
-	// than an 80-column terminal, wrapping every row. Applied from the constructors' own
-	// definitions each time rather than to the live columns, so widening the terminal back up
-	// restores what a narrower one took away.
-	// The sessions table is NOT fitted here. Its header and its rows have to change together —
-	// the money columns come and go with the width, and TITLE grows into a wide terminal's
-	// slack — and setting columns with the old rows still loaded panics inside bubbles'
-	// SetColumns. rebuildSessionsTable owns both; see its doc. It is called below, after the
-	// heights are set.
-	m.pipelineTbl.SetColumns(fitTableColumns(pipelineColumns(), m.width))
-	m.catalogTbl.SetColumns(fitTableColumns(catalogColumns(), m.width))
-	m.rebuildAgentsTable()
-
-	m.sessionsTbl.SetHeight(bodyH)
-	m.bodyHeight = bodyH
-	// AFTER the height, so the cursor-visibility maths inside it uses the new window. This is
-	// what fits the sessions header to the new width, rows included — which is also what
-	// re-truncates the TITLE cells, since rebuildSessionsTable computes the new TITLE width and
-	// passes it to sessionTitleCell. It does NOT read the live table — doing that was the
-	// stale-width bug, where a narrowing resize truncated against the previous width. An
-	// earlier revision added a second rebuild above for that, claiming nothing else
-	// reconciled them; this call already did, and only the height changes in between.
-	m.rebuildSessionsTable()
-	// Picker tables share the same body area as the session tables so the
-	// terminal real estate stays constant as the user navigates panes.
-	m.namespacesTbl.SetHeight(bodyH)
-	m.podsTbl.SetHeight(bodyH)
-	// The events table's height depends on whether the IDENTITY banner
-	// is rendered for the selected session. rebuildEventsTable() applies
-	// the banner-aware adjustment; call it so the size is correct after
-	// a window resize too.
-	m.rebuildEventsTable()
-	m.pipelineTbl.SetHeight(bodyH)
-	// The catalog table had no height set anywhere: it kept bubbles' table.New
-	// default of 20 rows for the life of the process, so on a terminal shorter than
-	// that the pane rendered past the bottom (scrolling the title away) and on a
-	// taller one it left the remaining rows unused. TestLayout_EveryPaneFitsTheTerminal
-	// covered this pane but never populated m.catalog, so it only ever measured the
-	// "loading catalog…" line.
-	m.catalogTbl.SetHeight(bodyH)
-	// The agents table had the catalog's bug, whose comment above is this one's history: nothing
-	// sized it anywhere, so it kept bubbles' table.New default for the life of the process and
-	// rendered past the bottom of any shorter terminal. The catalog's blind spot was an empty
-	// fixture; this one was a size larger, and it is the class that will recur:
-	// TestLayout_EveryPaneFitsTheTerminal enumerates the panes it measures in a HAND-WRITTEN
-	// map, and paneAgents was simply not in it — so no fixture could have helped, and adding a
-	// pane means adding it to that map too.
-	m.agentsTbl.SetHeight(bodyH)
-	m.detailVp.Width = m.width
-	m.detailVp.Height = bodyH
-	// Re-clamp the scroll offset to the new height, for the PLUGIN detail pane:
-	// nothing re-renders that one on a resize, so this is the only place its offset can
-	// be reconciled. The events detail pane is re-rendered just below and clamps itself
-	// (see showDetail), which is why this line cannot simply move down there — the
-	// re-render would land after it either way.
-	m.detailVp.SetYOffset(m.detailVp.YOffset)
-
-	m.searchInput.Width = m.width - 4
-
-	// Re-wrap the detail viewport to the new width so long JSON values continue to fit
-	// after a terminal resize. Not a scroll reset: the reader stays where they were, as
-	// in the help overlay.
-	//
-	// Only while that pane is the one on screen. detailVp is shared with the PLUGIN
-	// detail pane, and m.detailEvent outlives the pane that set it — nothing clears it
-	// on the way out, only the pod/session reset does — so read an event, esc, open a
-	// plugin, resize, and this call replaced the plugin's content with the old event's
-	// JSON under a "pipeline · tool-prune" title. The clamp above then reconciled the
-	// offset against content the operator had not asked for.
-	if m.pane == paneDetail && m.detailEvent != nil {
-		m.showDetail(m.detailRow, false)
-	}
-}
-
-// handleEditKey is the keymap that takes over while an edit is in flight.
-func (m *model) handleEditKey(msg tea.KeyMsg) tea.Cmd {
-	switch m.editState.phase {
-	case editPhaseDiff:
-		switch msg.String() {
-		case "y", "Y":
-			m.editState.phase = editPhaseApplying
-			newSubtree := m.editState.editedRaw
-			newInner := edit.Splice(
-				m.editState.fetched.InnerYAML,
-				m.editState.fetched.PipelineStart,
-				m.editState.fetched.PipelineEnd,
-				newSubtree,
-			)
-			payload, err := m.editState.store.Build(m.editState.fetched, newInner)
-			if err != nil {
-				m.editState.phase = editPhaseError
-				m.editState.err = "build payload: " + err.Error()
-				return nil
-			}
-			return withGen(m.editState.generation, edit.ApplyCmd(
-				m.ctx, m.editState.store, m.editState.fetched, payload))
-		case "n", "N", "esc":
-			m.editState = editState{phase: editPhaseDone}
-			return nil
-		}
-		return nil
-	case editPhaseError:
-		switch msg.String() {
-		case "r":
-			// If the fetch never completed (tempPath empty), retry the
-			// fetch instead of opening $EDITOR on "" (which leaves the
-			// user with nothing to edit and a misleading flow). A retry
-			// bumps gen so any straggling messages from the failed
-			// attempt are dropped.
-			if m.editState.tempPath == "" {
-				gen := m.editState.generation + 1
-				// The store the failed attempt used, not a fresh
-				// pipelineStore(): a retry is the same transaction, so
-				// re-resolving could silently retarget it.
-				store, statusURL := m.editState.store, m.editState.statusURL
-				m.editState = editState{phase: editPhaseFetching, generation: gen, store: store, statusURL: statusURL}
-				return withGen(gen, edit.FetchCmd(m.ctx, store, m.client, catalogPlugins(m.catalog)))
-			}
-			m.editState.phase = editPhaseEditing
-			return openEditorCmd(m.editState.generation, m.editState.tempPath)
-		case "esc":
-			m.editState = editState{phase: editPhaseDone}
-			return nil
-		}
-		return nil
-	}
-	// Other phases: Esc backgrounds (Waiting / Rollback) so the in-flight
-	// Cmd's eventual result lands as a footer flash, or cancels outright
-	// (Fetching / Editing / Applying — phases where the result is still
-	// safe to drop).
-	if msg.String() == "esc" {
-		switch m.editState.phase {
-		case editPhaseWaiting, editPhaseRollback:
-			m.editState.phase = editPhaseBackground
-			m.setFlash("hot-reload watch moved to background; you'll be notified")
-		default:
-			m.editState = editState{phase: editPhaseDone}
-		}
-		return nil
-	}
-	return nil
 }

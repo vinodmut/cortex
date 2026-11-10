@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"slices"
@@ -9,64 +10,33 @@ import (
 	"github.com/rossoctl/cortex/core/cost/event"
 	"github.com/rossoctl/cortex/core/cost/usage"
 	"github.com/rossoctl/cortex/core/pipeline"
+	"github.com/rossoctl/cortex/core/sessionapi"
 )
 
-// showDetail loads the row's event into the detail viewport as colorized
-// JSON and remembers the focused row so yank (y) can find the event and
-// layout() can re-render on resize.
+// showDetail renders one exchange on the detail page (#1681): a REQUEST section, then a
+// RESPONSE section, each its own event's tree under a title and its header lines. One page
+// rather than two panes side by side, because the detail is for reading long JSON, and half
+// a screen wraps it badly.
 //
-// resetScroll follows showPluginDetail and syncHelpViewport: true when the pane is
-// being OPENED, false when layout() re-renders what it already shows. The re-render
-// exists to re-wrap the JSON for a new width, and it used to GotoTop as well — so
-// resizing the terminal, or merely pressing "/" to search, threw a reader
-// back to the top of a long event.
+// Each half is marshalled with SessionEvent.MarshalJSON (readable wire form — string enums,
+// durationMs), then filterForDetail keeps the half's own inference fields. The response also
+// leaves out the fields equal to the request's (dropShared). Yank still writes the full
+// event.
 //
-// Marshal with SessionEvent.MarshalJSON first (readable wire form — string
-// enums, durationMs), then filter inference/mcp extensions so request
-// events show only request-side fields and response events show only
-// response-side fields (TUI readability only — wire format is unchanged,
-// and yank still writes the full JSON).
-//
-// The whole event is rendered — all plugin invocations, both directions —
-// because the timeline is now one row per message; the per-plugin breakdown
-// lives here in the detail, not in separate rows.
-//
-// When a CONNECT tunnel was folded into this row (TLS bridge), a one-block
-// summary of the tunnel is prepended so the operator sees the bridged
-// origin and the connection-level decision without a separate row. When the
-// event arrived over TLS (SessionEvent.TLS non-nil), a small TLS header
-// block is prepended too. Both absent for plaintext, non-bridged events.
+// resetScroll is false for a re-render of the same exchange — a resize, a fetched body, a
+// response that just arrived — which keeps the reader's folds, cursor and scroll.
 func (m *model) showDetail(r eventRow, resetScroll bool) {
-	e := r.event
 	m.detailRow = r
-	m.detailEvent = e
-	// The header blocks first, each followed by a blank line, in the order they have always
-	// had: TLS, what plugins rewrote, then the folded tunnel. Lines like the JSON below them,
-	// so a search reads them too.
-	m.detailHead = nil
-	m.detailTree = nil
-	if data, err := json.Marshal(e); err != nil {
-		m.detailHead = []string{"error marshaling event: " + err.Error()}
-	} else {
-		var tunnel string
-		if r.tunnel != nil {
-			tunnel = tunnelHeader(r.tunnel)
-		}
-		for _, h := range []string{tlsHeader(e.TLS), rewriteHeader(e), timingHeader(e), tunnel} {
-			if h != "" {
-				m.detailHead = append(m.detailHead, strings.Split(h, "\n")...)
-				m.detailHead = append(m.detailHead, "")
-			}
-		}
-		filtered := filterForDetail(data, e.Phase)
-		if root, err := treeFromJSON(filtered); err == nil {
-			m.detailTree = root
-		} else {
-			m.detailHead = append(m.detailHead, ColorizeJSONBytes(filtered))
-		}
+	m.detailEvent = r.event
+	// The fixed line above the viewport takes one row of the body.
+	if m.bodyHeight > 1 {
+		m.detailVp.Height = m.bodyHeight - 1
 	}
+	lost := rowLost(r, nil, 0, m.lostRef(m.events[m.selectedSess]))
+	m.detailSummary = exchangeSummary(r, m.detailNum, lost)
+	m.detailTree = detailContent(r, lost)
 	if resetScroll {
-		// A new event: the folds the reader opened were for the last one.
+		// A new exchange: the folds the reader opened were for the last one.
 		m.detailFolds = nil
 		m.detailCursorPath, m.detailCursorOff = "", 0
 	}
@@ -85,16 +55,220 @@ func (m *model) showDetail(r eventRow, resetScroll bool) {
 	m.scrollToDetailCursor()
 }
 
+// detailContent is the page showDetail draws for r: its REQUEST and RESPONSE sections. detailHas
+// searches it too, so a details search matches exactly what opening the row shows. lost picks
+// the missing response's note.
+func detailContent(r eventRow, lost bool) *node {
+	req, resp, reqRaw, respRaw := detailHalves(r)
+	return sectionsRoot(
+		detailSection("request", "REQUEST", req, nil, reqRaw, r.tunnel, missingNote(r, "request", lost)),
+		detailSection("response", "RESPONSE", resp, req, respRaw, nil, missingNote(r, "response", lost)),
+	)
+}
+
+// detailHalves splits row r into its request and response and their captures. Either half can
+// be nil: a response-only row has no request held, and a request has no response until one
+// arrives. A denial on a row of its own is the request half.
+func detailHalves(r eventRow) (req, resp *pipeline.SessionEvent, reqRaw, respRaw *pipeline.RawCapture) {
+	if r.event != nil && r.event.Phase == pipeline.SessionResponse {
+		return nil, r.event, nil, r.raw
+	}
+	return r.event, r.resp, r.raw, r.respRaw
+}
+
+// detailSection builds one half's section. other is the request when e is the response: the
+// response leaves out what other already shows. tunnel is a CONNECT folded into the request.
+// note is what the section says when e is nil.
+func detailSection(path, name string, e, other *pipeline.SessionEvent, raw *pipeline.RawCapture,
+	tunnel *pipeline.SessionEvent, note string) *node {
+	if e == nil {
+		sec, _ := sectionTree(path, "━━ "+name, nil, nil, note)
+		return sec
+	}
+	invs := allInvocations(e)
+	if tunnel != nil {
+		invs = append(invs, allInvocations(tunnel)...)
+	}
+	title := sectionTitle(name, e, invs)
+	data, err := json.Marshal(e)
+	if err != nil {
+		sec, _ := sectionTree(path, title, nil, nil, "error marshaling event: "+err.Error())
+		return sec
+	}
+	data = filterForDetail(data, e.Phase)
+	if other != nil {
+		if od, err := json.Marshal(other); err == nil {
+			data = dropShared(data, filterForDetail(od, other.Phase))
+		}
+	}
+	data = withRaw(data, raw)
+	var heads []string
+	var tun string
+	if tunnel != nil {
+		tun = tunnelHeader(tunnel)
+	}
+	// The header blocks in the order they have always had: TLS, what plugins rewrote, the
+	// served model, the timing, then the folded tunnel. Each helper returns nothing for an
+	// event without its field, so the request and the response each get their own.
+	for _, h := range []string{tlsHeader(e.TLS), rewriteHeader(e), servedHeader(e), timingHeader(e), tun} {
+		if h != "" {
+			heads = append(heads, h)
+		}
+	}
+	sec, err := sectionTree(path, title, heads, data, "")
+	if err != nil {
+		sec, _ = sectionTree(path, title, heads, nil, ColorizeJSONBytes(data))
+	}
+	return sec
+}
+
+// sectionTitle is a section's title line: the half, its time, and the plugins that acted on
+// it. The events row's ACTION cell merges both halves, so this is where the direction is.
+func sectionTitle(name string, e *pipeline.SessionEvent, invs []pipeline.Invocation) string {
+	t := "━━ " + name + " · " + e.At.Format("15:04:05.00")
+	if acted := actedPlugins(invs); acted != "" {
+		t += " · " + acted
+	}
+	return t
+}
+
+// actedPlugins names the plugins that did more than skip, by action in rank order:
+// "modify tool-prune, thinking-fill · observe inference-parser". A shadow action keeps its
+// "*", as the ACTION cell does.
+func actedPlugins(invs []pipeline.Invocation) string {
+	by := map[pipeline.InvocationAction][]string{}
+	for _, iv := range invs {
+		if actionRank(iv.Action) <= actionRank(pipeline.ActionSkip) {
+			continue
+		}
+		name := iv.Plugin
+		if iv.Shadow {
+			name += "*"
+		}
+		if !slices.Contains(by[iv.Action], name) {
+			by[iv.Action] = append(by[iv.Action], name)
+		}
+	}
+	var parts []string
+	for _, a := range []pipeline.InvocationAction{pipeline.ActionDeny, pipeline.ActionModify, pipeline.ActionObserve, pipeline.ActionAllow} {
+		if len(by[a]) > 0 {
+			parts = append(parts, string(a)+" "+strings.Join(by[a], ", "))
+		}
+	}
+	return strings.Join(parts, " · ")
+}
+
+// missingNote is what a section says when its half is not there (#1681).
+func missingNote(r eventRow, path string, lost bool) string {
+	if path == "request" {
+		return "request not loaded: Enter on the ▲ row in events loads it"
+	}
+	e := r.event
+	switch {
+	case e != nil && e.Phase == pipeline.SessionDenied:
+		d, _ := topInvocation(allInvocations(e), func(iv pipeline.Invocation) bool {
+			return iv.Action == pipeline.ActionDeny && !iv.Shadow
+		})
+		if d.Plugin != "" {
+			return "denied by " + d.Plugin + ": no upstream call"
+		}
+		return "denied: no upstream call"
+	case e != nil && e.Tunnel:
+		return "no close recorded yet"
+	case lost:
+		return "no response recorded"
+	}
+	return "waiting for response…"
+}
+
+// exchangeSummary is the fixed line's figures: the # the row showed, then what the row's
+// cells say — method, status, duration, bytes, tokens, cost — each left out when blank.
+func exchangeSummary(r eventRow, num string, lost bool) string {
+	var parts []string
+	add := func(s string) {
+		if s != "" {
+			parts = append(parts, s)
+		}
+	}
+	if num != "" {
+		add("#" + num)
+	}
+	add(eventMethodValue(*r.event))
+	if lost {
+		add("lost")
+	} else {
+		add(statusCell(*answer(r)))
+	}
+	add(durationCell(*answer(r)))
+	e := *answer(r)
+	e.BytesUp, e.BytesDown = exchangeBytes(r)
+	add(bytesCell(e))
+	if tok := exchangeTokensCell(r); tok != "" {
+		add(tok + " tok")
+	}
+	add(exchangeCostCell(r))
+	return strings.Join(parts, " · ")
+}
+
+// detailFixedLine is the line above the detail viewport (#1681): the name of the section that
+// holds the top visible line, then the exchange's figures. The reader always sees which half
+// is on screen, and never scrolls to the response for its status. Cut to the terminal, never
+// wrapped: a wrapped line would take a row the viewport already has.
+func (m *model) detailFixedLine() string {
+	name := "REQUEST"
+	if i := m.detailDoc.lineAtRow(m.detailVp.YOffset); i >= 0 && i < len(m.detailLines) &&
+		sectionOf(m.detailLines[i].path) == "response" {
+		name = "RESPONSE"
+	}
+	return truncToWidth(styleTitle.Render(name)+" │ "+m.detailSummary, max(m.width, 20))
+}
+
+// jumpDetailSection is Tab on the detail page: the cursor goes to the other section's title,
+// and the title scrolls to the top. On inference calls the request is one to two screens
+// long, so this is how the reader reaches the response.
+func (m *model) jumpDetailSection() {
+	want := "response"
+	if sectionOf(m.detailCursorPath) == "response" {
+		want = "request"
+	}
+	for i, l := range m.detailLines {
+		if l.path == want && l.head {
+			m.moveDetailCursor(i)
+			m.detailVp.SetYOffset(m.detailDoc.firsts[i])
+			return
+		}
+	}
+}
+
+// detailHalf is the event of the section the cursor is in: what y writes. Nil when that half
+// is missing.
+func (m *model) detailHalf() *pipeline.SessionEvent {
+	req, resp, _, _ := detailHalves(m.detailRow)
+	if sectionOf(m.detailCursorPath) == "response" {
+		return resp
+	}
+	return req
+}
+
+// shownNum is the # cell of the events row under the cursor, so the fixed line quotes the
+// number the reader just saw — a subagent block's own number inside a block. "" when # is
+// not shown.
+func (m *model) shownNum() string {
+	cols, _ := layoutColumns(m.eventColumns, m.eventColWidths, m.width)
+	rows, cur := m.eventsTbl.Rows(), m.eventsTbl.Cursor()
+	for i, c := range cols {
+		if c.id == colIndex && cur >= 0 && cur < len(rows) && i < len(rows[cur]) {
+			return strings.TrimSpace(rows[cur][i])
+		}
+	}
+	return ""
+}
+
 // renderDetail draws the event detail pane from the tree showDetail built, with the folds the
 // reader chose and the search query in force, and puts the cursor back on its node.
 func (m *model) renderDetail() {
 	q := m.searchQuery(paneDetail)
 	m.detailLines = m.detailLines[:0]
-	for _, h := range m.detailHead {
-		for _, l := range strings.Split(h, "\n") {
-			m.detailLines = append(m.detailLines, treeLine{text: l})
-		}
-	}
 	if m.detailTree != nil {
 		m.detailLines = append(m.detailLines, renderTree(m.detailTree, foldState{open: m.detailFolds, query: q})...)
 	}
@@ -110,7 +284,7 @@ func (m *model) renderDetail() {
 
 // cursorLineFor is the line the cursor goes back to after a re-render: line off of the node at
 // path, else that node's last line, else the first line of the nearest node above it still
-// drawn. The header lines and the root are the node "".
+// drawn. The root is the node "".
 func (m *model) cursorLineFor(path string, off int) int {
 	for p := path; ; p = parentPath(p) {
 		first, last := -1, -1
@@ -187,6 +361,51 @@ func (m *model) toggleDetailFold() {
 	m.detailCursorPath, m.detailCursorOff = l.path, 0
 	m.renderDetail()
 	m.moveDetailCursor(m.cursorLineFor(l.path, 0))
+}
+
+// openRawMatch opens a capture when the details search's query matches in it and nowhere the
+// pane draws: a query does not open the capture by itself (isOpen). Each half has its own capture,
+// under its section (#1681). A fold the reader chose holds.
+func (m *model) openRawMatch() {
+	q := m.searchQuery(paneDetail)
+	if !m.searchDetails || q == "" || q != m.searchQuery(paneEvents) || len(m.detailDoc.matches) > 0 || m.detailTree == nil {
+		return
+	}
+	r := renderer{fs: foldState{query: q}, memo: map[*node]bool{}}
+	for _, sec := range m.detailTree.kids {
+		if len(sec.kids) == 0 {
+			continue // a missing half
+		}
+		raw := sec.kids[0].child("raw")
+		if raw == nil {
+			continue
+		}
+		if _, chosen := m.detailFolds[raw.path]; chosen || !r.hasMatch(raw) {
+			continue
+		}
+		if m.detailFolds == nil {
+			m.detailFolds = map[string]foldChoice{}
+		}
+		m.detailFolds[raw.path] = foldChoice{open: true, query: q}
+		m.renderDetail()
+		return
+	}
+}
+
+// revealDetailMatch puts the cursor on the first match of the details search's query while the
+// reader has not moved it from the top: on a long event the match is often below the first
+// screen. It runs when the row opens, and again when its full event arrives.
+func (m *model) revealDetailMatch() {
+	q := m.searchQuery(paneDetail)
+	if !m.searchDetails || q == "" || q != m.searchQuery(paneEvents) ||
+		m.detailCursorPath != "" || m.detailCursorOff != 0 || m.detailVp.YOffset != 0 {
+		return
+	}
+	if s := m.surface(paneDetail); s != nil {
+		if rows := s.matchLines(); len(rows) > 0 {
+			s.reveal(rows[0])
+		}
+	}
 }
 
 // clearFoldQueries is a changed search on the event detail pane: a fold the reader closed
@@ -319,7 +538,7 @@ func redirectHeader(e *pipeline.SessionEvent) string {
 // user blames Cortex. Cortex must not forward Upgrade (RFC 9110 makes it hop-by-hop),
 // so the request either reaches the origin as a bare GET — which an endpoint wanting
 // a POST or an upgrade answers 405 — or, on a Responses API path, is answered 426 by
-// the proxy itself (listener.decline_responses_websockets). Codex falls back to
+// the proxy itself (listener.responses_websockets). Codex falls back to
 // HTTPS after either.
 //
 // The wording holds for both because this line is drawn from the REQUEST row, which
@@ -348,6 +567,21 @@ func modelHeader(e *pipeline.SessionEvent) string {
 	// RequestedModel is the client's model name, and the session API is
 	// unauthenticated: both names pass sanitizeLabel before they reach the terminal.
 	return fmt.Sprintf("model:       %s → %s", sanitizeLabel(e.Inference.RequestedModel), sanitizeLabel(e.Inference.Model))
+}
+
+// servedHeader names the model the upstream says answered, when that is not the model
+// the request was sent for: a gateway that resolved an alias, or a provider that answered
+// with a dated version. The events table's model column keeps the requested name. Empty
+// when the upstream named no other model.
+//
+//	served:      bedrock/us.anthropic.claude-opus-4-6-v1
+func servedHeader(e *pipeline.SessionEvent) string {
+	if e.Inference == nil || e.Inference.ServedModel == "" {
+		return ""
+	}
+	// Upstream-supplied, and the session API is unauthenticated: sanitizeLabel, as for every
+	// label agentop prints.
+	return "served:      " + sanitizeLabel(e.Inference.ServedModel)
 }
 
 // rewriteHeader is how the request that went upstream differs from the one the
@@ -414,19 +648,17 @@ func filterForDetail(data []byte, phase pipeline.SessionPhase) []byte {
 	if err := json.Unmarshal(data, &m); err != nil {
 		return data
 	}
-	keep := inferenceReqKeys
-	mcpKeep := mcpReqKeys
-	if phase == pipeline.SessionResponse {
-		keep = inferenceRespKeys
-		mcpKeep = mcpRespKeys
-	}
-	a2aKeep := a2aReqKeys
-	if phase == pipeline.SessionResponse {
-		a2aKeep = a2aRespKeys
-	}
+	resp := phase == pipeline.SessionResponse
+	keep := sessionapi.DetailKeys("inference", resp)
+	mcpKeep := sessionapi.DetailKeys("mcp", resp)
+	a2aKeep := sessionapi.DetailKeys("a2a", resp)
 	if inf, ok := m["inference"].(map[string]any); ok {
 		restoreReportedZeroSplits(inf)
-		m["inference"] = filterFields(inf, keep)
+		inf = filterFields(inf, keep)
+		if phase != pipeline.SessionResponse {
+			nestToolBlocks(inf)
+		}
+		m["inference"] = inf
 	}
 	if mcp, ok := m["mcp"].(map[string]any); ok {
 		m["mcp"] = filterFields(mcp, mcpKeep)
@@ -460,43 +692,37 @@ func filterForDetail(data []byte, phase pipeline.SessionPhase) []byte {
 	return out
 }
 
-// Field classifications for phase-based filtering. Order is not significant —
-// ColorizeJSONBytes sorts keys alphabetically for stable display.
-var (
-	inferenceReqKeys = []string{
-		"model", "requestedModel", "messages", "temperature", "maxTokens", "topP",
-		"stream", "tools", "toolChoice", "toolResults",
+// sharedWithRequest are the response fields that repeat the request's on almost every
+// exchange: about 10 rows of every RESPONSE section on real traffic (#1681).
+var sharedWithRequest = []string{"client", "direction", "host", "httpMethod", "httpPath", "requestId", "sessionId"}
+
+// dropShared leaves out of resp each sharedWithRequest field whose value equals req's. A field
+// that differs stays — a redirected response's host is news. at always stays: it is the
+// response's own time. Both inputs are filterForDetail's output, so equal values are equal
+// bytes. Any decode failure returns resp as it was.
+func dropShared(resp, req []byte) []byte {
+	var a, b map[string]json.RawMessage
+	if json.Unmarshal(resp, &a) != nil || json.Unmarshal(req, &b) != nil {
+		return resp
 	}
-	// reasoningTokens is a SUBSET of completionTokens, not a sibling: it is the share
-	// of the generated tokens the model spent reasoning, billed at the output rate.
-	// Adding the two double-counts every one of them.
-	//
-	// THIS PANE IS WHERE THE EXACT FIGURE LIVES. The events table shows one total per
-	// row and the spend drawer shows a proportion, so a reader who wants the number
-	// rather than the shape comes here — which is also why the key needs no
-	// abbreviating: there is room for the whole word, unlike a table column.
-	inferenceRespKeys = []string{
-		"model", "requestedModel", "completion", "finishReason", "promptTokens",
-		"completionTokens", "reasoningTokens", "totalTokens", "toolCalls",
-		"cacheWriteTokens", "cacheReadTokens",
+	for _, k := range sharedWithRequest {
+		if v, ok := a[k]; ok && bytes.Equal(v, b[k]) {
+			delete(a, k)
+		}
 	}
-	mcpReqKeys  = []string{"method", "rpcId", "params"}
-	mcpRespKeys = []string{"method", "rpcId", "result", "error"}
-	// A2A: OnResponse captures the server-assigned contextId plus a summary
-	// of the final result (finalStatus / artifact / errorMessage / taskId).
-	// Drop the request-side message fields (messageId, role, parts) on
-	// response rows so the detail view reflects what the response phase
-	// actually contributed.
-	a2aReqKeys  = []string{"method", "rpcId", "sessionId", "messageId", "taskId", "role", "parts"}
-	a2aRespKeys = []string{"method", "rpcId", "sessionId", "taskId", "finalStatus", "artifact", "errorMessage"}
-)
+	out, err := json.Marshal(a)
+	if err != nil {
+		return resp
+	}
+	return out
+}
 
 // restoreReportedZeroSplits puts back a split the provider MEASURED AND FOUND TO BE ZERO.
 //
 // InferenceExtension.ReasoningTokens is omitempty, so a provider that measured the split and
 // got none serialises identically to one that never measured at all — and filterFields keeps
 // only keys the map actually has, so both read as "no reasoning" in the pane that
-// inferenceRespKeys' own doc calls the place the exact figure lives. A measured zero is a
+// the response list of sessionapi.DetailKeys calls the place the exact figure lives. A measured zero is a
 // figure; absence is the lack of one. PresentKinds is the only thing that separates them,
 // and it travels in the same object.
 //
@@ -505,7 +731,7 @@ var (
 // JSON tests forbid. So the repair belongs here, at the surface that lost the distinction.
 //
 // NO PHASE GUARD. Reasoning is response-side, but what keeps it off a request row is
-// inferenceReqKeys not listing it — one allow-list deciding visibility, per this file's
+// the request list of sessionapi.DetailKeys not listing it — one allow-list deciding visibility, per this file's
 // existing rule about a second copy of a predicate. A phase check here would be a guard the
 // allow-list already makes unreachable, so nothing could prove it worked.
 //
@@ -522,6 +748,70 @@ func restoreReportedZeroSplits(inf map[string]any) {
 	}
 	if uint8(bits)&usage.KindReasoning != 0 {
 		inf["reasoningTokens"] = 0
+	}
+}
+
+// nestToolBlocks moves each history tool call and tool result under the message that
+// carried it, named by the message's toolUseIds, so a turn reads as "called Bash with this
+// command" and "got this back" in place. The parser keeps both out of the message on purpose
+// (no plugin may read tool output as conversation); the view puts them back together. An
+// entry no message names stays in its top-level list, and a list left empty is dropped.
+func nestToolBlocks(inf map[string]any) {
+	msgs, _ := inf["messages"].([]any)
+	// Each top-level list, the key that holds its id, the key it takes under a message
+	// ("toolCalls" reads as what the message asked for, as on a response row), and which
+	// messages it goes under: the same id names the call on the assistant message and the
+	// result on the message after it.
+	for _, l := range [...]struct {
+		from, id, to string
+		assistant    bool
+	}{
+		{"historyToolCalls", "id", "toolCalls", true},
+		{"toolResults", "toolUseId", "toolResults", false},
+	} {
+		entries, _ := inf[l.from].([]any)
+		byID := map[string]int{}
+		for i, e := range entries {
+			obj, _ := e.(map[string]any)
+			if id, _ := obj[l.id].(string); id != "" {
+				if _, dup := byID[id]; !dup {
+					byID[id] = i
+				}
+			}
+		}
+		nested := make([]bool, len(entries))
+		for _, raw := range msgs {
+			msg, _ := raw.(map[string]any)
+			ids, _ := msg["toolUseIds"].(string)
+			if ids == "" || (msg["role"] == "assistant") != l.assistant {
+				continue
+			}
+			for _, id := range strings.Split(ids, ", ") {
+				if i, ok := byID[id]; ok && !nested[i] {
+					got, _ := msg[l.to].([]any)
+					msg[l.to] = append(got, entries[i])
+					nested[i] = true
+				}
+			}
+		}
+		var rest []any
+		for i, e := range entries {
+			if !nested[i] {
+				rest = append(rest, e)
+			}
+		}
+		if len(rest) == 0 {
+			delete(inf, l.from)
+		} else {
+			inf[l.from] = rest
+		}
+	}
+	// The ids did their job: each one is on the entry it names, under its message, or on an
+	// entry still in its top-level list.
+	for _, raw := range msgs {
+		if msg, ok := raw.(map[string]any); ok {
+			delete(msg, "toolUseIds")
+		}
 	}
 }
 

@@ -8,9 +8,11 @@ import (
 	"testing"
 )
 
-// cmdDir and repoRoot are resolved relative to the process working directory,
-// matching the `go -C <this-module>` convention every call site uses.
+// regDir, cmdDir and repoRoot are resolved relative to the process working
+// directory, matching the `go -C <this-module>` convention every call site uses.
+// regDir is the one registration package every binary imports.
 const (
+	regDir   = "../../core/plugins/all"
 	cmdDir   = "../../cmd"
 	repoRoot = "../.."
 )
@@ -42,15 +44,16 @@ var profileInvocations = []*regexp.Regexp{
 	regexp.MustCompile(`profiles="([a-z0-9_ ]+)"`),
 }
 
-// skipDir reports directories no guard should descend into. .worktrees matters
-// most: sibling worktrees hold other branches, and scanning them would fail this
-// module's tests based on code that is not in this tree.
-func skipDir(name string) bool {
+// skipDir reports directories no guard should descend into. The in-repo worktree
+// directories matter most: worktrees hold other branches, and scanning them would
+// fail this module's tests based on code that is not in this tree.
+func skipDir(path string) bool {
+	name := filepath.Base(path)
 	switch name {
 	case ".git", "vendor", "node_modules", ".worktrees", ".venv":
 		return true
 	}
-	return false
+	return name == "worktrees" && filepath.Base(filepath.Dir(path)) == ".claude"
 }
 
 // buildFile reports whether a file can plausibly carry a build tag or name a
@@ -88,7 +91,7 @@ func TestNoExcludePluginTagsRemain(t *testing.T) {
 			return err
 		}
 		if d.IsDir() {
-			if skipDir(d.Name()) {
+			if skipDir(path) {
 				return filepath.SkipDir
 			}
 			return nil
@@ -125,11 +128,10 @@ func TestNoExcludePluginTagsRemain(t *testing.T) {
 
 // TestEveryPluginFileIsTagged closes the gap that would reintroduce the very bug
 // this convention removes. A file named plugins_foo.go with a blank import and NO
-// build directive is skipped by the unconditional-import guard (it matches the
-// plugins_ prefix) and invisible to discoverPlugins (no directive to find), so it
+// build directive is invisible to discoverPlugins (no directive to find), so it
 // links its plugin into every artifact unconditionally and nothing reports it.
 func TestEveryPluginFileIsTagged(t *testing.T) {
-	files, err := pluginFiles(cmdDir)
+	files, err := pluginFiles(regDir)
 	if err != nil {
 		t.Fatalf("pluginFiles: %v", err)
 	}
@@ -149,18 +151,42 @@ func TestEveryPluginFileIsTagged(t *testing.T) {
 	}
 }
 
+// TestRegDirImportsPluginsOnlyFromTaggedFiles covers the files in regDir that
+// TestEveryPluginFileIsTagged does not read. A plugin import in any other file there,
+// such as doc.go or a new extra.go, compiles into every binary that imports regDir,
+// whatever tags the build names.
+func TestRegDirImportsPluginsOnlyFromTaggedFiles(t *testing.T) {
+	goFiles, err := filepath.Glob(filepath.Join(regDir, "*.go"))
+	if err != nil {
+		t.Fatalf("glob: %v", err)
+	}
+	if len(goFiles) == 0 {
+		t.Fatalf("no .go files in %s — the registration package moved and this guard went blind", regDir)
+	}
+	for _, f := range goFiles {
+		base := filepath.Base(f)
+		if strings.HasSuffix(base, "_test.go") || strings.HasPrefix(base, "plugins_") {
+			continue
+		}
+		data, err := os.ReadFile(f)
+		if err != nil {
+			t.Fatalf("read %s: %v", f, err)
+		}
+		for _, m := range blankPluginImport.FindAllStringSubmatch(string(data), -1) {
+			t.Errorf("%s imports plugin %q outside a tagged plugins_<name>.go file, so every "+
+				"binary links it unconditionally", f, m[1])
+		}
+	}
+}
+
 // TestNoUnconditionalPluginImports guards the hole that shipped in
 // cortex-envoy and cortex-cpex: both blank-imported plugin packages
 // straight from main.go, so those plugins could not be excluded by any tag and
-// no error said so. Every plugin must enter through a tagged plugins_*.go file.
+// no error said so. Every plugin must enter through a tagged file in regDir.
+// A binary's own plugins_*.go file is no exception: a per-binary copy is the
+// drift #1577 removed, where one binary silently lacked a plugin.
 func TestNoUnconditionalPluginImports(t *testing.T) {
 	var hits []string
-	// Matches inside the plugins_*.go files this scan deliberately skips. Those are
-	// where a blank plugin import legitimately lives, so they are the pattern's
-	// positive control: zero hits below is the pass, and a blankPluginImport whose
-	// hardcoded module path has gone stale also produces zero. Counting the
-	// sanctioned sites separates "the tree is clean" from "the regexp is blind".
-	sanctioned := 0
 	entries, err := os.ReadDir(cmdDir)
 	if err != nil {
 		t.Fatalf("read %s: %v", cmdDir, err)
@@ -174,15 +200,7 @@ func TestNoUnconditionalPluginImports(t *testing.T) {
 			t.Fatalf("glob: %v", err)
 		}
 		for _, f := range goFiles {
-			base := filepath.Base(f)
-			// plugins_*.go files are the sanctioned entry point; that they actually
-			// carry a directive is TestEveryPluginFileIsTagged's job.
-			if strings.HasPrefix(base, "plugins_") || strings.HasSuffix(base, "_test.go") {
-				if strings.HasPrefix(base, "plugins_") {
-					if data, err := os.ReadFile(f); err == nil {
-						sanctioned += len(blankPluginImport.FindAllStringSubmatch(string(data), -1))
-					}
-				}
+			if strings.HasSuffix(f, "_test.go") {
 				continue
 			}
 			data, err := os.ReadFile(f)
@@ -190,17 +208,99 @@ func TestNoUnconditionalPluginImports(t *testing.T) {
 				t.Fatalf("read %s: %v", f, err)
 			}
 			for _, m := range blankPluginImport.FindAllStringSubmatch(string(data), -1) {
-				hits = append(hits, f+" imports "+m[1])
+				if m[1] != "all" { // the registration package itself
+					hits = append(hits, f+" imports "+m[1])
+				}
 			}
 		}
 	}
 	if len(hits) > 0 {
-		t.Errorf("%d unconditional plugin import(s) outside a tagged plugins_*.go:\n  %s",
-			len(hits), strings.Join(hits, "\n  "))
+		t.Errorf("%d plugin import(s) in a binary; register the plugin in %s instead:\n  %s",
+			len(hits), regDir, strings.Join(hits, "\n  "))
+	}
+	// plugins_*.go files are where a blank plugin import legitimately lives, so
+	// they are the pattern's positive control: zero hits is the pass, and a
+	// blankPluginImport whose hardcoded module path has gone stale also produces
+	// zero. Counting the sanctioned sites separates "the tree is clean" from "the
+	// regexp is blind". That they carry a directive is TestEveryPluginFileIsTagged's job.
+	regFiles, err := filepath.Glob(filepath.Join(regDir, "*.go"))
+	if err != nil {
+		t.Fatalf("glob: %v", err)
+	}
+	var strays []string
+	sanctioned := 0
+	for _, f := range regFiles {
+		if strings.HasSuffix(f, "_test.go") {
+			continue
+		}
+		data, err := os.ReadFile(f)
+		if err != nil {
+			t.Fatalf("read %s: %v", f, err)
+		}
+		n := len(blankPluginImport.FindAllStringSubmatch(string(data), -1))
+		if strings.HasPrefix(filepath.Base(f), "plugins_") {
+			sanctioned += n
+		} else if n > 0 {
+			strays = append(strays, f)
+		}
+	}
+	if len(strays) > 0 {
+		t.Errorf("plugin import(s) in %s outside a tagged plugins_<name>.go file:\n  %s",
+			regDir, strings.Join(strays, "\n  "))
 	}
 	if sanctioned == 0 {
 		t.Fatal("blankPluginImport matched no import in any plugins_*.go, so it can no longer " +
 			"match a real registration — the pattern is stale, not the tree clean")
+	}
+}
+
+// TestEveryRegisteringBinaryLinksTheRedisDriver closes the one gap regDir cannot.
+// The redis driver is its own module, which requires core, so core/plugins/all
+// cannot import it and each binary does. A binary that imports core/plugins/all
+// without it builds, then refuses every session-budget config with
+// `storage: unknown scheme "redis"`.
+func TestEveryRegisteringBinaryLinksTheRedisDriver(t *testing.T) {
+	const allImport = `_ "github.com/rossoctl/cortex/core/plugins/all"`
+	const redisImport = `_ "github.com/rossoctl/cortex/core/storage/redis"`
+	entries, err := os.ReadDir(cmdDir)
+	if err != nil {
+		t.Fatalf("read %s: %v", cmdDir, err)
+	}
+	checked := 0
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		goFiles, err := filepath.Glob(filepath.Join(cmdDir, e.Name(), "*.go"))
+		if err != nil {
+			t.Fatalf("glob: %v", err)
+		}
+		var registers, linksRedis bool
+		for _, f := range goFiles {
+			if strings.HasSuffix(f, "_test.go") {
+				continue
+			}
+			data, err := os.ReadFile(f)
+			if err != nil {
+				t.Fatalf("read %s: %v", f, err)
+			}
+			text := string(data)
+			registers = registers || strings.Contains(text, allImport)
+			linksRedis = linksRedis || (strings.Contains(text, redisImport) &&
+				strings.Contains(text, "//go:build include_plugin_sessionbudget\n"))
+		}
+		if !registers {
+			continue
+		}
+		checked++
+		if !linksRedis {
+			t.Errorf("cmd/%s imports core/plugins/all but has no file gated on "+
+				"include_plugin_sessionbudget that imports core/storage/redis", e.Name())
+		}
+	}
+	if checked == 0 {
+		t.Fatal("no binary imports core/plugins/all — the registration convention changed " +
+			"and this guard went blind")
 	}
 }
 
@@ -221,10 +321,10 @@ var reservedFileSuffixes = map[string]bool{
 // causes. A file named plugins_sparc.go carries an implicit GOARCH=sparc
 // constraint, so it compiles on no normal machine — the plugin vanishes with no
 // build error, and a tag-scanning guard still "finds" it because the directive is
-// right there in the source. cmd/cortex already worked around this by
-// naming its file plugins_sparcplugin.go; nothing enforced it until now.
+// right there in the source. The sparc plugin's file is named
+// plugins_sparcplugin.go for this reason.
 func TestNoPluginFileShadowedByGOOSGOARCH(t *testing.T) {
-	files, err := pluginFiles(cmdDir)
+	files, err := pluginFiles(regDir)
 	if err != nil {
 		t.Fatalf("pluginFiles: %v", err)
 	}
@@ -245,7 +345,7 @@ func TestNoPluginFileShadowedByGOOSGOARCH(t *testing.T) {
 // fails. Every plugin discovered in the tree must have an entry — one listing
 // profiles, or an empty one marking it deliberately optional.
 func TestEveryPluginIsAccountedFor(t *testing.T) {
-	found, err := discoverPlugins(cmdDir)
+	found, err := discoverPlugins(regDir)
 	if err != nil {
 		t.Fatalf("discoverPlugins: %v", err)
 	}
@@ -288,7 +388,7 @@ func TestOptionalSetIsExplicit(t *testing.T) {
 // longer exists yields `-tags include_plugin_gone`, which Go accepts silently, so
 // the artifact quietly ships without it.
 func TestNoStaleMembershipEntries(t *testing.T) {
-	found, err := discoverPlugins(cmdDir)
+	found, err := discoverPlugins(regDir)
 	if err != nil {
 		t.Fatalf("discoverPlugins: %v", err)
 	}
@@ -299,7 +399,7 @@ func TestNoStaleMembershipEntries(t *testing.T) {
 	for plugin := range membership {
 		if !exists[plugin] {
 			t.Errorf("membership names %q, which has no plugins_%s.go anywhere under %s",
-				plugin, plugin, cmdDir)
+				plugin, plugin, regDir)
 		}
 	}
 }
@@ -344,7 +444,7 @@ func TestCallSitesUseKnownProfiles(t *testing.T) {
 			return err
 		}
 		if d.IsDir() {
-			if skipDir(d.Name()) {
+			if skipDir(path) {
 				return filepath.SkipDir
 			}
 			return nil

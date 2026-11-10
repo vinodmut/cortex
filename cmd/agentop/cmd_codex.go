@@ -1,7 +1,6 @@
 package main
 
 import (
-	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -187,53 +186,15 @@ Flags:
 `
 
 func runCodex(args []string, stdout, stderr io.Writer) int {
-	if len(args) == 0 {
-		fmt.Fprint(stderr, codexUsage)
-		return 2
+	var envPath, cortexCfgPath *string
+	a, code, done := parseAgentArgs("codex", codexUsage, args, stdout, stderr, func(fs *flag.FlagSet) {
+		envPath = fs.String("env", "", "Codex's dotenv file")
+		cortexCfgPath = fs.String("config", "", "Cortex config file")
+	})
+	if done {
+		return code
 	}
-	action := args[0]
-	// Help before the verb check, and the verb before anything touches the
-	// machine: the same order runClaudeCode and runOpenCode use, for their
-	// reasons.
-	switch action {
-	case "-h", "--help", "help":
-		fmt.Fprint(stdout, codexUsage)
-		return 0
-	case "enable", "disable", "status":
-	default:
-		fmt.Fprintf(stderr, "agentop: unknown codex action %q (enable, disable, status)\n", action)
-		return 2
-	}
-
-	fs := flag.NewFlagSet("configure codex "+action, flag.ContinueOnError)
-	fs.SetOutput(stderr)
-	fs.Usage = func() {}
-	envPath := fs.String("env", "", "Codex's dotenv file")
-	cortexCfgPath := fs.String("config", "", "Cortex config file")
-	// Not for status, which changes nothing: accepting --yes there would be a
-	// flag that parses and does nothing, same reasoning as runOpenCode's.
-	var yesFlag *bool
-	if action != "status" {
-		yesFlag = fs.Bool("yes", false, "do not prompt for confirmation")
-	}
-	if err := fs.Parse(args[1:]); err != nil {
-		if errors.Is(err, flag.ErrHelp) {
-			fmt.Fprint(stdout, codexUsage)
-			return 0
-		}
-		return 2
-	}
-	if fs.NArg() > 0 {
-		fmt.Fprintf(stderr, "agentop: codex %s takes no arguments (got %q)\n", action, fs.Arg(0))
-		return 2
-	}
-	yes := yesFlag != nil && *yesFlag
-
-	home, err := os.UserHomeDir()
-	if err != nil || home == "" {
-		fmt.Fprintf(stderr, "agentop: cannot determine your home directory: %v\n", err)
-		return 1
-	}
+	action, yes, home := a.action, a.yes, a.home
 	if *envPath == "" {
 		*envPath = defaultCodexEnvPath(home)
 	}
@@ -609,9 +570,8 @@ func planCodexDisable(envPath string) (codexDisablePlan, error) {
 
 // applyCodexDisable puts back what enable recorded, removes what it added, and
 // deletes the record. It returns the keys restored to a value the user had
-// set. Matches applyClaudeCodeDisable's restore logic exactly, including its
-// known limitation: it restores Prior unconditionally, with no check on
-// whether the value changed since enable (tracked for a future fix by #1289).
+// set. It restores Prior unconditionally, with no check on whether the value
+// changed since enable.
 //
 // IN PRACTICE THE RESTORE BRANCH IS UNREACHABLE TODAY, and it is worth knowing
 // that before reading the warning below as a live case. planCodexEnable refuses
@@ -622,10 +582,8 @@ func planCodexDisable(envPath string) (codexDisablePlan, error) {
 // file (which is how TestCodexDisable_RestoresRecordedPriorValue reaches it).
 //
 // The machinery is kept rather than dropped so that all three dotenv-adjacent
-// integrations carry the same state shape: #1289 is one pass over claude-code,
-// opencode and this, and a Codex-only design would have to be reconciled back
-// into it. The docs say the record is always empty today rather than implying a
-// restore a user could observe.
+// integrations carry the same state shape. The docs say the record is always
+// empty today rather than implying a restore a user could observe.
 func applyCodexDisable(pl codexDisablePlan, statePath string, stderr io.Writer) ([]string, error) {
 	if len(pl.present) == 0 {
 		return nil, nil

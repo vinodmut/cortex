@@ -37,6 +37,20 @@ agents added mid-session — verified across `KeepAlive`, `StartInterval` and
 `RunAtLoad` — so the supervisor is what makes crash recovery work. On Linux there is
 one process; systemd handles it.
 
+In praxis mode (`praxis.enabled: true`), the supervisor has a second child,
+`cortex-gateway`, so you see three processes. At each start the supervisor writes
+`~/.cortex/gateway.token` and `~/.cortex/gateway.yaml`. A restart of the proxy does
+not restart the gateway. When the supervisor exits, the gateway exits too. The
+supervisor reads `praxis.*` only when it starts, so after you change `praxis.*`, run
+`agentop service restart`. Until then, the next restart of the proxy fails at each
+try.
+
+**On Linux, do not set `praxis.enabled` for the service yet.** The systemd unit does
+not use `--supervise`, so nothing starts the gateway or writes `gateway.token`. Then
+`cortex` refuses to start (`praxis.enabled needs CORTEX_GATEWAY_TOKEN_FILE …`) and
+systemd stops after five tries. A later step (#1722) makes the unit supervise in
+praxis mode.
+
 ## Linux: staying up after you log out
 
 On Linux, Cortex is a systemd **user** unit, which runs under your own systemd
@@ -84,9 +98,12 @@ uninstall: turn it off with `loginctl disable-linger` if you no longer want it.
 
 ## Re-running the installer is safe
 
-The one-liner is how you upgrade, so it is meant to be run repeatedly. When nothing has
-changed it changes nothing. It still downloads the release, but `agentop setup` finds
-the staged binaries identical to the installed ones, asks nothing, and ends on one line,
+`agentop update` is how you upgrade. It runs the one-liner with the flags that keep the
+install as it is (`agentop update --help` lists them), and when the newest release is
+already installed it prints `Already at vX.` and downloads nothing. The one-liner is
+meant to be run repeatedly too. When nothing has changed it changes nothing. It still
+downloads the release, but `agentop setup` finds the staged binaries identical to the
+installed ones, asks nothing, and ends on one line,
 `cortex v0.9.0 is installed and healthy.`, leaving the running proxy alone rather than
 restarting it. When something has changed it lists what, and asks first. An upgrade keeps
 the previous binaries until the new Cortex answers its health check, and puts them back
@@ -136,13 +153,14 @@ cortex --version                                         # cortex (cpex) v0.9.3
 curl -s http://127.0.0.1:47601/v1/plugins | grep -c '"name":"cpex"'   # 1
 ```
 
-The tarballs carry build provenance as well as their `checksums.txt` entry:
-`gh attestation verify cortex-cpex_<version>_<os>_<arch>.tar.gz --repo rossoctl/cortex`.
+Every release tarball, cpex or not, carries build provenance as well as its `checksums.txt`
+entry: `gh attestation verify <tarball> --repo rossoctl/cortex`.
 
-The choice is not remembered. Re-running the installer without `--cpex` installs the
-default build again, and says so first; keep passing `--cpex` to stay on it. Against a
-release from before `--cpex` existed, the installer stops before staging anything and
-says that release has no cpex build.
+The installer does not remember the choice. Re-running it without `--cpex` installs the
+default build again, and says so first; keep passing `--cpex` to stay on it.
+`agentop update` passes `--cpex` for you when the installed cortex is the cpex build.
+Against a release from before `--cpex` existed, the installer stops before staging
+anything and says that release has no cpex build.
 
 ## How traffic is grouped into sessions
 
@@ -332,6 +350,10 @@ that is a promise a test asserts against the serialized bytes, not a convention.
 **Who can read them.** Anything that can read your home directory, and anything that can
 reach the session API, which is **unauthenticated** (the proxy logs `UNAUTHENTICATED; contains
 raw user content; never expose via ingress` when it starts). On a laptop it binds to localhost.
+It also refuses, with a 403, every request whose `Host` is not `localhost`, `127.0.0.1` or
+`[::1]`, and every request that carries an `Origin` header. That stops a web page from reading
+your sessions through DNS rebinding. The stats server (`:47602`, which serves `/config`) refuses
+them the same way.
 
 `agentop` is one of those readers now, and the distinction is worth being exact about:
 `GET /v1/usage` reaches these files only for the symbolic windows `today`, `7d` and `month`,
@@ -401,14 +423,51 @@ home directory. The directories are created `0700` and the files `0600`. The pro
 the archive holds in its startup log line, so `grep 'session archive' ~/.cortex/proxy.log`
 shows which state you are in.
 
-**It runs only on a local install** — a config inside `~/.cortex`, which is what `agentop
-service install` and `--local` produce. Anywhere else it is off, and `enabled: true` is refused
-with a WARN naming the reason. On a local install it is on by default only while
-`listener.bind_loopback_only` is true, as the generated config sets it, because that is the one
-setting under which [clearing it](#clearing-it) works; with the binds widened, it stays off
-unless `enabled: true` opts in, and the startup line then says a clear will be refused. There
-is deliberately no `dir` setting: raw prompts on a cluster's volume are a decision of their
-own, and a cluster should not reach it by mounting a path.
+**It also keeps each inference request exactly as it was sent.** For a request that
+`inference-parser` reads as inference, and for each Responses WebSocket turn, the archive keeps
+the body the agent sent, the body Cortex forwarded when a plugin rewrote it, the request headers
+and the query. Other requests, such as an OAuth token refresh, keep their event only. Cortex
+removes a header or a query parameter when its name, split at `-` and `_`, has one of the
+words `key`, `apikey`, `token`, `auth`, `authorization`, `cookie`, `secret`, `signature`,
+`password`, `credential` or `credentials`, with case ignored. So `x-api-key`,
+`Idempotency-Key` and `Sec-WebSocket-Key` are removed, and a camelCase name such as
+`accessToken` is kept. Cortex does not redact the body. Images,
+files the agent read and thinking blocks are kept too. Each part of a body that repeats from
+one request to the next is stored once per segment, so this costs about 8–20 KB per request
+in the measured sessions. The response is kept as the proxy read it: its status, its headers
+without credential headers such as `set-cookie`, and up to 10 MiB of its body. The body is as it came off the wire,
+still compressed when the origin compressed it, unless the proxy decompressed it to read it
+for a plugin; the capture is then marked `decoded`. A longer body is marked truncated, and a stream that broke off is marked
+incomplete. A WebSocket turn's response is the origin's messages for the turn, one per line.
+
+**It runs on a local install, or where `session.archive.dir` is set.** A local install is a
+config inside `~/.cortex`, which is what `agentop service install` and `--local` produce. A
+config outside `~/.cortex` runs the archive only when it names a `dir`. Without one the archive
+is off, and `enabled: true` is refused with a WARN naming the reason. So a cluster cannot start
+it by mounting a volume over `~/.cortex`.
+
+Where it can run, it is on by default only while `listener.bind_loopback_only` is true, as the
+generated config sets it. That is the one setting under which [clearing it](#clearing-it) works.
+With the binds widened, it stays off unless `enabled: true` opts in, and the startup line
+then says a clear will be refused. A cluster cannot bind loopback only, so it needs both `dir`
+and `enabled: true`.
+
+**A second Cortex keeps its own history.** To run a Cortex beside your everyday one, for
+development or a demo, copy `~/.cortex/config.yaml` outside `~/.cortex`, change its ports, and
+give it its own directories:
+
+```yaml
+cost_ledger:
+  dir: /absolute/path/to/demo/cost
+session:
+  archive:
+    dir: /absolute/path/to/demo/sessions
+```
+
+The copy keeps `tls_bridge.ca_dir` pointing at `~/.cortex/ca`, so agents trust the same CA.
+Cortex owns everything under the archive `dir`: a clear deletes its `data/` directory whole.
+Give it an empty directory that nothing else uses. Do not give two Cortex processes the same
+archive `dir`: a clear in one deletes the files the other is writing.
 
 **How big it gets.** Each session's events are written as zstd-compressed segments that store
 a repeated message once rather than once per turn — the same saving the in-memory store makes,
@@ -418,9 +477,10 @@ first by the time they were last written:
 
 | Setting | Default | Notes |
 |---|---|---|
-| `session.archive.enabled` | on for a local install bound to loopback only | `false` always wins; `true` opts in without the loopback bind |
+| `session.archive.enabled` | on when bound to loopback only | `false` always wins; `true` opts in without the loopback bind |
 | `session.archive.retention_days` | 30 | how long a segment is kept after its last write; at most 3650 |
 | `session.archive.max_bytes` | 2 GiB | the archive's total size; past it, the oldest segments go first |
+| `session.archive.dir` | `~/.cortex/sessions` | must be an absolute path; a config outside `~/.cortex` needs it to run the archive |
 
 A full disk does not stop the proxy. The archive stops writing until its next hourly pass,
 and requests are served as before; only the history has a gap.
@@ -430,7 +490,9 @@ that a burst the writer cannot keep up with is dropped *from the archive*, never
 unclean kill loses at most the last second.
 `GET /v1/sessions?archived=true` reports both the archive's size and what it lost, under
 `archive` (`bytes`, `maxBytes`, `retentionDays`, and `droppedEvents`, `writeErrors`,
-`droppedRenames`, `paused` when any is nonzero); nonzero means what you are reading has gaps.
+`droppedRenames`, `droppedCaptures`, `paused` when any is nonzero); nonzero means what you are
+reading has gaps. `droppedCaptures` counts requests kept without their exact bytes, because
+more than 256 MB of them waited for the writer.
 
 ### Clearing it
 
@@ -591,6 +653,25 @@ agentop service status
 that answered. If it says `Cortex is NOT answering`, the proxy is loaded but not
 serving — check `~/.cortex/proxy.log`.
 
+On Linux, when nothing answers, status asks systemd why, and says which of these it is:
+
+| Status says | What happened | Exit |
+|---|---|---|
+| `Cortex is stopped, and stays stopped` | Stopped and disabled, as `agentop service stop` leaves it. It stays stopped across logins and reboots until `agentop service start` | 0 |
+| `Cortex is stopped, but still enabled` | Stopped some other way, such as `systemctl --user stop`; it starts again at the next login or boot | 1 |
+| `it exited … and systemd is restarting it` | It crashed, and systemd brings it back within 10 seconds | 1 |
+| `systemd stopped restarting it` | It crashed five times in five minutes, so systemd gave up. Fix the cause in the log, then `agentop service restart` | 1 |
+
+A stopped Cortex exits 0, like a healthy one, because a stop is not a failure. So in a
+script, the exit code alone does not say Cortex is serving: check for
+`Cortex is healthy according to` in the output as well. Before, a stopped Cortex
+exited 1. On macOS it still does.
+
+`service start`, `service restart` and `service install` clear systemd's record of the
+crashes first, so they can start a unit systemd had given up on without waiting out
+its five-minute window. `service stop` clears it after, so stopping a unit systemd had
+given up on reads as stopped, not as a crash.
+
 If it says `config: … will not load`, an edit to `~/.cortex/config.yaml` broke it
 (`config: no config at …` means the file is gone). A proxy that was already running
 rejected that edit and keeps serving the config it last loaded. Status looks for one on
@@ -652,7 +733,7 @@ agentop configure claude-code disable
 ```
 
 This removes only the keys Cortex added to `~/.claude/settings.json`
-(`HTTPS_PROXY`, `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`, and the CA variables
+(`HTTPS_PROXY` and the CA variables
 `NODE_EXTRA_CA_CERTS` / `SSL_CERT_FILE` / `GIT_SSL_CAINFO` / `REQUESTS_CA_BUNDLE` /
 `CURL_CA_BUNDLE`) and leaves anything else in that file alone. Claude Code goes
 straight to the API again. Restart `claude` to pick it up.
@@ -817,7 +898,7 @@ The other reasons you may see, and what each one asks of you:
 | `bridge-disabled` | No TLS bridge is configured. | only if you wanted one |
 | `client-hung-up` | The client vanished mid-handshake. Often a cancelled request; not evidence about trust, which is why it carries no advice. OpenCode hangs up rather than rejecting the CA; see [its page](agents/opencode.md#ca-trust). | usually no |
 | `handshake-failed` | Some other handshake failure — a version, cipher or ALPN mismatch, or Cortex failing to mint a certificate. | check `error=` in the log |
-| `origin-unverified` | **Cortex** could not verify the destination's certificate, so it declined to vouch for it. Bridging would have meant terminating TLS for a server we could not authenticate. | investigate the destination |
+| `origin-unverified` | **Cortex** could not verify the destination's certificate, so it declined to vouch for it. Bridging would have meant terminating TLS for a server we could not authenticate. The first failure for each host logs a WARN (`reason=upstream-verify`). Later failures for that host log at INFO. | investigate the destination |
 | `dial-failed` | Cortex could not reach the destination at all — a DNS failure, a refused connection or a timeout. Without the TLS bridge the CONNECT is answered `502` and no tunnel opened. With the bridge on (this install's default) the CONNECT is answered `200` first, because a redirect can still send the request to a live server; when nothing rescued it, the close row carries that `200` with the dial error in `error`. The TCP dial is bounded at 10s, so a destination that silently drops the SYN (off the VPN that reaches it, a dead NAT) fails within that rather than hanging the agent for longer. | check the destination and the network path to it |
 
 Only a CA rejection asks you to restart anything: `client-rejected-ca` itself, and
@@ -938,7 +1019,7 @@ It unroutes Claude Code, OpenCode, IBM Bob and the bob shell function where Cort
 routed them, restarting OpenCode's background service when it finds it running. It
 stops and removes the service, or the background proxy. It removes the PATH lines setup
 added, unless other tools in `~/.local/bin` still need them, and removes `agentop`,
-`cortex` and `cortex-session-dump` from `~/.local/bin`. A step that fails is reported
+`cortex`, `cortex-session-dump` and `cortex-gateway` from `~/.local/bin`. A step that fails is reported
 with its fix, the rest still run, and the end lists what was left behind.
 
 `--purge` also deletes `~/.cortex`: config, CA, logs, cost history, session history,
@@ -1019,7 +1100,7 @@ rm -f ~/.config/systemd/user/cortex.service
 ```
 
 Then delete the Cortex keys from the `env` block of `~/.claude/settings.json`
-yourself. There are **seven**:
+yourself. There are **six**:
 
 ```
 HTTPS_PROXY
@@ -1028,15 +1109,17 @@ SSL_CERT_FILE
 GIT_SSL_CAINFO
 REQUESTS_CA_BUNDLE
 CURL_CA_BUNDLE
-CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC
 ```
 
-**Remove all seven, and do it before `rm -rf ~/.cortex`.** The middle four point at
+An older Cortex also set `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`, which stops
+Claude Code's auto-updates. Delete it too, unless you set it yourself.
+
+**Remove all six, and do it before `rm -rf ~/.cortex`.** The middle four point at
 `~/.cortex/ca/bundle.crt`, and unlike `NODE_EXTRA_CA_CERTS` each of them *replaces*
 its tool's trust store rather than adding to it. Leave them behind with the file
 deleted and git, curl and Python fail **every** TLS call — including calls that have
 nothing to do with Cortex — with `error setting certificate verify locations`, on a
-machine you believe you have just cleaned. `agentop uninstall` removes all seven first,
+machine you believe you have just cleaned. `agentop uninstall` removes all six first,
 as `agentop configure claude-code disable` does, and `--purge` deletes `~/.cortex` last,
 and not at all if a removal before it failed; this list is only for when that binary is
 already gone.
@@ -1056,5 +1139,5 @@ variables. Remove the ones that point at Cortex with the `opencode` CLI, as
 [Undoing it by hand](agents/opencode.md#undoing-it-by-hand) shows, also before
 `rm -rf ~/.cortex`.
 
-Last, the files setup installed: `rm -f ~/.local/bin/cortex ~/.local/bin/cortex-session-dump`,
+Last, the files setup installed: `rm -f ~/.local/bin/cortex ~/.local/bin/cortex-session-dump ~/.local/bin/cortex-gateway`,
 and the two lines it marked in your shell profile, the first starting `# added by Cortex`.

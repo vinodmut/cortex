@@ -106,6 +106,7 @@ jobs:
         run: |
           TAGS=$(go -C ../../scripts/profile-tags run . local)
           go build -tags "${TAGS}" ./...
+          go vet -tags "praxis_e2e,${TAGS}" .
           go test -race -tags "${TAGS}" ./...
 
       - name: Build and test cmd/agentop
@@ -265,34 +266,6 @@ jobs:
       - name: Test
         run: go test -v -race -cover ./...
 
-  # The demo modules build against core through a replace directive, so a core
-  # API change can break them; nothing else compiles them.
-  go-ci-demos:
-    name: Go CI (demos/${{ matrix.demo }})
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    strategy:
-      fail-fast: false
-      matrix:
-        demo: [echo, finance-sparc, ibac]
-    defaults:
-      run:
-        working-directory: demos/${{ matrix.demo }}
-    env:
-      GOWORK: "off"
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
-
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
-        with:
-          go-version-file: demos/${{ matrix.demo }}/go.mod
-          cache-dependency-path: demos/${{ matrix.demo }}/go.sum
-
-      - name: Vet and build
-        run: |
-          go vet ./...
-          go build ./...
-
   go-ci-readme-demo:
     name: Go CI (README demo)
     runs-on: ubuntu-latest
@@ -339,13 +312,10 @@ jobs:
           # everywhere else resolved it, and the per-module release build did
           # not — surfacing only when a tag was cut.
           - agentop
-          # cortex-praxis was in no workflow at all, which is how it ended
-          # up broken under GOWORK=off by the same missing go.sum entry. Any
-          # cmd/* module absent from every workflow will drift this way — the
+          # Any cmd/* module absent from every workflow drifts this way: the
           # workspace hides exactly this class of breakage. (cmd/cortex's cpex
           # builds need CGO and libcpex_ffi.a from a pinned release, so
           # go-ci-cpex covers them instead.)
-          - cortex-praxis
     defaults:
       run:
         working-directory: cmd/${{ matrix.binary }}

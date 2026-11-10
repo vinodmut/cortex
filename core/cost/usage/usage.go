@@ -14,19 +14,14 @@
 package usage
 
 import (
-	"math"
-	"net"
 	"net/http"
-	"sort"
 	"strconv"
-	"strings"
 	"sync"
 	"time"
-	"unicode/utf8"
 
 	"github.com/rossoctl/cortex/core/cost/event"
 	"github.com/rossoctl/cortex/core/cost/pricing"
-	"github.com/rossoctl/cortex/core/pipeline"
+	"github.com/rossoctl/cortex/core/model"
 )
 
 const (
@@ -57,7 +52,7 @@ type Counts struct {
 	Errors   int64 `json:"errors,omitempty"`
 	Tokens   int64 `json:"tokens,omitempty"`
 	// The four billed token kinds, plus reasoning. Names match
-	// pipeline.InferenceExtension exactly: one vocabulary from parser to aggregate
+	// model.InferenceExtension exactly: one vocabulary from parser to aggregate
 	// to ledger to collector, because aggregate-side synonyms are how two halves
 	// of a system come to disagree about what a field means.
 	//
@@ -296,13 +291,13 @@ type Counts struct {
 //
 // EXPORTED, AND HERE, because PresentKinds is where the layout is documented and this is the
 // package every consumer of it already imports. The authority is
-// core/plugins/internal/parsercommon.Kind, which cannot be imported from outside
-// core/plugins — so before these existed, every reader spelled the bits itself: agentop's
+// core/internal/parsercommon.Kind, which cannot be imported from outside
+// core — so before these existed, every reader spelled the bits itself: agentop's
 // `cost` command, agentop's spend strip, and this package's own tests as a bare `1 | 8`. Three
 // uncoordinated copies of a wire format, with nothing comparing them.
 //
-// TestKindBits_MatchTheParserThatProducesThem, which lives with parsercommon because that is
-// the one place both sets are visible, is what pins these to it.
+// TestKindBits_MatchTheParserThatProducesThem, which lives with parsercommon, is what pins
+// these to it.
 //
 // WIRE FORMAT: they are serialised in PresentKinds and stored in the cost ledger, so they
 // cannot be renumbered whatever any Go identifier is called.
@@ -396,7 +391,7 @@ func (c *Counts) Add(o Counts) {
 // separately because the point is to write two places — the field and the disclosure — from
 // one call, so a saturating add cannot record the clamp and lose the fact that it clamped.
 func (c *Counts) addInto(dst *int64, v int64) {
-	sum, saturated := addSat(*dst, v)
+	sum, saturated := event.AddSat(*dst, v)
 	*dst = sum
 	if saturated {
 		c.Saturated = true
@@ -435,7 +430,7 @@ const maxPlausibleRequestTokens = pricing.MaxPlausibleTokens
 // which is the direction an attacker actually wants.
 //
 // The nil check is the caller's; every call site here has already tested it.
-func plausibleTokenReport(inf *pipeline.InferenceExtension) bool {
+func plausibleTokenReport(inf *model.InferenceExtension) bool {
 	for _, n := range [...]int{
 		inf.TotalTokens, inf.InputTokens, inf.CacheReadTokens,
 		inf.CacheWriteTokens, inf.OutputTokens, inf.ReasoningTokens,
@@ -445,94 +440,6 @@ func plausibleTokenReport(inf *pipeline.InferenceExtension) bool {
 		}
 	}
 	return true
-}
-
-// addSat is a + b, clamped to the int64 range instead of wrapping, and whether it clamped.
-//
-// The test is written as `a > math.MaxInt64-b` rather than by inspecting the sign of the
-// result, because computing the wrapped sum first and then reasoning about it is signed
-// overflow — undefined in most languages and merely unhelpful in Go, where it silently
-// produces the very number this function exists to avoid returning.
-//
-// BOTH DIRECTIONS. No producer in this package can settle a negative cost — cost/event refuses
-// one and MicrosFromUSD rejects it — so the lower clamp is unreachable through the aggregator
-// today. It is here because Add is exported, because "unreachable today" is how the wrap
-// arrived in the first place, and because a half-guarded accumulator invites a reader to
-// conclude the other half was considered and ruled out.
-func addSat(a, b int64) (int64, bool) {
-	if b > 0 && a > math.MaxInt64-b {
-		return math.MaxInt64, true
-	}
-	if b < 0 && a < math.MinInt64-b {
-		return math.MinInt64, true
-	}
-	return a + b, false
-}
-
-// CostSum is a running total of money in micros that clamps instead of wrapping, and
-// remembers that it clamped.
-//
-// IT EXISTS BECAUSE Counts.Add IS NOT THE ONLY PLACE MONEY IS SUMMED. Counts.addInto routes
-// every field of an aggregate through addSat — the reasoning is on Counts.Saturated and
-// pricing.MaxCostMicros — but three money accumulates sit outside it, all of them totals
-// DERIVED from Counts rather than fields of one:
-//
-//	seriesCost              sums CostMicros across a label breakdown
-//	Snapshot's ungrouped    the residual, per raw bucket
-//	ledger.Fold's       the same residual, per ledger row
-//
-// Each was a bare `+=` on an int64 that a saturating add had already been chosen for one call
-// frame away. Two saturated buckets or two saturated rows wrap them — reachable at the ~1,024
-// requests pricing.MaxCostMicros documents, and immediately from a hand-edited day file.
-//
-// AND THE RESIDUAL IS THE WORST PLACE FOR IT TO HAPPEN, which is why this is a type rather
-// than an exported function. A wrapped residual goes NEGATIVE, and Snapshot.SetUngroupedCost
-// reads a negative residual as the series having overshot its own total — a condition whose
-// field doc tells the reader this process is wrong about its own arithmetic and to file a bug.
-// So the wrap does not merely produce a wrong number: it fabricates a defect report about
-// correct data and suppresses the real residual while doing it. Clamping alone would still be
-// a lie; the flag is what makes it honest, exactly as Counts.Saturated is for the fields.
-//
-// A TYPE, NOT `func AddCostMicros(a, b int64) (int64, bool)`, for the reason given on
-// Counts.addInto: the point is that one call writes both the figure and the disclosure, so
-// there is no shape in which a caller takes the clamped sum and drops the fact that it
-// clamped. An exported saturating add would have been one `_` away from restoring this bug.
-type CostSum struct {
-	// Micros is the total so far, clamped to the int64 range.
-	Micros int64
-	// Saturated says Micros is a bound rather than a sum. Callers surface it by setting
-	// Counts.Saturated on the totals the residual belongs to: that field already means
-	// "read every money figure here as a bound", and a second flag for the same fact
-	// would let a client trust one while the other contradicted it.
-	Saturated bool
-}
-
-// Add accumulates micros into s.
-func (s *CostSum) Add(micros int64) {
-	sum, saturated := addSat(s.Micros, micros)
-	s.Micros = sum
-	if saturated {
-		s.Saturated = true
-	}
-}
-
-// Sub subtracts micros from s, which is how a residual is computed: a bucket's total
-// minus what its breakdown accounted for.
-//
-// Separate from Add(-micros) for one input only, and it is the input that made
-// SetUngroupedCost need its own guard: math.MinInt64 has no positive counterpart, so
-// negating it yields math.MinInt64 again and SUBTRACTING it would add. Reachable only
-// from an already-clamped figure, and clamped to the ceiling with the flag set rather
-// than being special-cased into exactness — the true answer is out of range in that
-// direction whatever s holds, and pretending otherwise for the sub-case where it
-// happens to fit would put a branch nothing can test in the middle of the one
-// arithmetic in this file that must be obviously right.
-func (s *CostSum) Sub(micros int64) {
-	if micros == math.MinInt64 {
-		s.Micros, s.Saturated = math.MaxInt64, true
-		return
-	}
-	s.Add(-micros)
 }
 
 // Bucket is one BucketWidth slice of time, as served to clients.
@@ -594,7 +501,7 @@ type bucket struct {
 	// redundant. That is deliberate: a uniform call site in foldInto cannot fall out
 	// of step with itself, and one key costs nothing.
 	bySession map[string]Counts
-	// byAgent tallies by the coding agent that made the request, as AgentLabel
+	// byAgent tallies by the coding agent that made the request, as event.AgentLabel
 	// names it ("claude-code", every version together).
 	//
 	// NO INFERENCE GUARD, unlike byMethod. It is folded for every event, so MCP, A2A
@@ -607,11 +514,11 @@ type bucket struct {
 	// Bounded by maxLabelsPerBucket and maxLabelLen like every other label map, and here
 	// the bound is load-bearing for the same reason bySession's is: the key is derived from
 	// a REQUEST HEADER, so both its length and its cardinality are set off-host. Capped
-	// twice on the way in — pipeline.maxClientLen when the header is first retained, then
+	// twice on the way in — model.maxClientLen when the header is first retained, then
 	// truncateLabel at the addLabel call in foldInto.
 	//
 	// The value is CLIENT-ASSERTED AND TRIVIALLY SPOOFABLE, so this is a display axis and
-	// never a basis for a policy decision; see pipeline.EventClient.
+	// never a basis for a policy decision; see model.EventClient.
 	//
 	// An event with no client folds under the reserved "unknown" bucket rather than "" —
 	// Label() is nil-safe and answers that — because a blank key renders as a blank row,
@@ -761,7 +668,7 @@ type eventCost struct {
 // figure, and event.Record is a JSON unmarshal — see Record's call site. The pricedness
 // rule is applied here, which is the only thing event.Decode did that Record does not,
 // so this arm still means exactly "a priced record was published".
-func (a *Aggregator) costOf(e *pipeline.SessionEvent, ce event.Event, haveRec bool) eventCost {
+func (a *Aggregator) costOf(e *model.SessionEvent, ce event.Event, haveRec bool) eventCost {
 	if haveRec && ce.Priced() {
 		prov := ce.Provenance
 		if prov == "" {
@@ -813,7 +720,7 @@ func (a *Aggregator) costOf(e *pipeline.SessionEvent, ce event.Event, haveRec bo
 		// denial after the parser ran, reports a model with zero usage. Naming it
 		// would advertise a missing rate for a model that may well have one, and
 		// adding that entry would never make the row disappear.
-		if e.StatusCode >= 400 || e.Phase == pipeline.SessionDenied {
+		if e.StatusCode >= 400 || e.Phase == model.SessionDenied {
 			return eventCost{}
 		}
 		// A SUCCEEDED one is a coverage gap and must be counted as one. Returning a
@@ -885,20 +792,6 @@ func (a *Aggregator) costOf(e *pipeline.SessionEvent, ce event.Event, haveRec bo
 	return ec
 }
 
-// unlabelledLabel is the reserved key for a caveat a producer disclosed WITHOUT saying
-// which kind it was: an event from a version predating the field that names it.
-//
-// One spelling for both maps that need one — PricedBy's provenance and IncompleteBy's
-// reason — because it is the same situation in both: the producer stated the fact and not
-// the label. It cannot collide with a real value; pricing's reasons are hyphenated
-// lowercase ("output-uncounted", "split-unreported") and its provenance levels are
-// ("authoritative", "configured", "discovered", "bundled").
-//
-// LABELLED, never dropped, so IncompleteBy's counts sum to Counts.IncompleteRequests. A
-// client subtracting the map from the counter to find "the rest" must get zero; silently
-// omitting a row would make that difference read as requests whose figures are exact.
-const unlabelledLabel = "unlabelled"
-
 // Aggregator is a fixed ring of per-minute buckets. Safe for concurrent use.
 //
 // Expiry is implicit: a slot is indexed by minutes-since-epoch modulo
@@ -912,12 +805,12 @@ type Aggregator struct {
 	mu       sync.RWMutex
 	all      []bucket
 	sessions map[string]*sessionRing
-	// agents holds a whole ring per RECOGNISED coding agent, keyed by AgentLabel, so agent= can
+	// agents holds a whole ring per RECOGNISED coding agent, keyed by event.AgentLabel, so agent= can
 	// be answered with any grouping. The agent axis alone cannot do that: a bucket tallies each
 	// axis separately, so once a snapshot reads byAgent to find one agent there is nothing left
 	// to break that agent's traffic down by.
 	//
-	// ONLY pipeline.IsKnownAgent NAMES GET ONE, and that gate is the memory bound. An
+	// ONLY model.IsKnownAgent NAMES GET ONE, and that gate is the memory bound. An
 	// unrecognised agent's label is its raw User-Agent, set off-host, so a ring per label would
 	// let a caller grow this process by varying a header. The known names are a closed set in
 	// code, so nothing here is capped or evicted — and because nothing is evicted, a ring holds
@@ -1046,7 +939,7 @@ func New(opts ...Option) *Aggregator {
 // gets the response's own tokens and latency and one turn counts once. Pairing on
 // the id rather than positionally matters because a client can have several
 // requests in flight at a time.
-func (a *Aggregator) Record(sessionID string, e *pipeline.SessionEvent) {
+func (a *Aggregator) Record(sessionID string, e *model.SessionEvent) {
 	if e == nil {
 		return
 	}
@@ -1087,7 +980,7 @@ func (a *Aggregator) Record(sessionID string, e *pipeline.SessionEvent) {
 	// warns about, in the other direction. Pinned both ways by
 	// TestRecord_WebSocket101IsNotARequestLatency and
 	// TestRecord_InboundWebSocket101IsStillARequest (#1549 review).
-	if e.Tunnel || (e.Direction == pipeline.Outbound && e.StatusCode == http.StatusSwitchingProtocols) {
+	if e.Tunnel || (e.Direction == model.Outbound && e.StatusCode == http.StatusSwitchingProtocols) {
 		return
 	}
 
@@ -1096,7 +989,7 @@ func (a *Aggregator) Record(sessionID string, e *pipeline.SessionEvent) {
 	// Store.Append on the request hot path. Checked before the lock so that path
 	// stays lock-free: neither guard touches aggregator state, so there is nothing
 	// to protect.
-	if e.Phase == pipeline.SessionRequest && (e.RequestID == "" || e.Invocations == nil) {
+	if e.Phase == model.SessionRequest && (e.RequestID == "" || e.Invocations == nil) {
 		return
 	}
 
@@ -1119,7 +1012,7 @@ func (a *Aggregator) Record(sessionID string, e *pipeline.SessionEvent) {
 	// figure travel on separate wires and no expression can add one to the other by
 	// resembling it. See Counts.AvoidedMicros.
 	var avoided int64
-	if e.Phase != pipeline.SessionRequest {
+	if e.Phase != model.SessionRequest {
 		// ONE unmarshal, feeding both. costOf wants the record only when it priced
 		// something and this wants it either way, so each calling cost/event for itself
 		// would decode the same JSON twice per event — and foldInto runs twice, which is
@@ -1145,11 +1038,11 @@ func (a *Aggregator) Record(sessionID string, e *pipeline.SessionEvent) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
-	if e.Phase == pipeline.SessionRequest {
+	if e.Phase == model.SessionRequest {
 		a.holdRequestPluginsLocked(e, at)
 		return
 	}
-	if e.Phase != pipeline.SessionResponse && e.Phase != pipeline.SessionDenied {
+	if e.Phase != model.SessionResponse && e.Phase != model.SessionDenied {
 		return
 	}
 
@@ -1167,7 +1060,7 @@ func (a *Aggregator) Record(sessionID string, e *pipeline.SessionEvent) {
 
 	// BEFORE the session ring, whose branch below returns early on both of its paths. See the
 	// agents field for why only a recognised agent gets a ring.
-	if agent := AgentLabel(e.Client); pipeline.IsKnownAgent(agent) {
+	if agent := event.AgentLabel(e.Client); model.IsKnownAgent(agent) {
 		ring, ok := a.agents[agent]
 		if !ok {
 			ring = make([]bucket, NumBuckets)
@@ -1204,7 +1097,7 @@ func (a *Aggregator) Record(sessionID string, e *pipeline.SessionEvent) {
 //
 // Nothing is counted here — no requests, no tokens, no latency. The request event
 // contributes only the LABELS its plugins need in order to be attributed later.
-func (a *Aggregator) holdRequestPluginsLocked(e *pipeline.SessionEvent, at time.Time) {
+func (a *Aggregator) holdRequestPluginsLocked(e *model.SessionEvent, at time.Time) {
 	if e.RequestID == "" || e.Invocations == nil {
 		// Without an id there is nothing to pair against, and pairing positionally
 		// misattributes as soon as two requests are in flight — the reason
@@ -1248,13 +1141,13 @@ func (a *Aggregator) expirePendingLocked(now time.Time) {
 //
 // Deduped because one plugin can append several invocations to a single pass, and
 // counting it twice would inflate its share of a stacked bar.
-func invocationPlugins(inv *pipeline.Invocations) []string {
+func invocationPlugins(inv *model.Invocations) []string {
 	if inv == nil {
 		return nil
 	}
 	seen := make(map[string]bool, len(inv.Outbound)+len(inv.Inbound))
 	var out []string
-	for _, list := range [][]pipeline.Invocation{inv.Outbound, inv.Inbound} {
+	for _, list := range [][]model.Invocation{inv.Outbound, inv.Inbound} {
 		for _, iv := range list {
 			if iv.Plugin == "" || seen[iv.Plugin] {
 				continue
@@ -1300,22 +1193,23 @@ func (a *Aggregator) evictColdestLocked() {
 // keeps the sent 200 with the failure in Error (#1543). Keying on status alone counted
 // those as healthy, which is what #1543's rows exist to stop.
 //
-// Except a proxy-declined WebSocket upgrade (pipeline.ErrorKindUpgradeDeclined). Its
+// Except a proxy-declined WebSocket upgrade (model.ErrorKindUpgradeDeclined). Its
 // 426 is Cortex telling Codex to use HTTPS, which it then does, once per session: by
 // design and on the default path, so counting it would give every healthy Codex
 // fleet a nonzero error rate. The Finisher sees it as an allow for the same reason.
 //
-// And except the egress guard's refusal (pipeline.ErrorKindDestinationPrivate). Same
+// And except the egress guard's refusal (model.ErrorKindDestinationPrivate). Same
 // shape, same reasoning: its 403 is the guard doing exactly what the operator
 // configured it to, on traffic that was never going to be allowed through — a
 // nonzero "error rate" made of refusals is the policy working, not the proxy
 // failing. The Finisher sees it as an allow for the same reason.
-func CountsAsError(e *pipeline.SessionEvent) bool {
-	if e.Error != nil && (e.Error.Kind == pipeline.ErrorKindUpgradeDeclined ||
-		e.Error.Kind == pipeline.ErrorKindDestinationPrivate) {
+func CountsAsError(e *model.SessionEvent) bool {
+	if e.Error != nil && (e.Error.Kind == model.ErrorKindUpgradeDeclined ||
+		e.Error.Kind == model.ErrorKindTurnInterrupted ||
+		e.Error.Kind == model.ErrorKindDestinationPrivate) {
 		return false
 	}
-	return e.Error != nil || e.StatusCode >= 400 || e.Phase == pipeline.SessionDenied
+	return e.Error != nil || e.StatusCode >= 400 || e.Phase == model.SessionDenied
 }
 
 // PriceableRequest is the ledger's definition of "this request could have been
@@ -1326,14 +1220,14 @@ func CountsAsError(e *pipeline.SessionEvent) bool {
 // made coverage read "9/9 priced" while real spend was missing. A FAILED
 // response WITH usage is priceable: the counters exist and the rates apply.
 // Usage is read through pricing.UsageFromInference, as costOf reads it.
-func PriceableRequest(e *pipeline.SessionEvent) bool {
+func PriceableRequest(e *model.SessionEvent) bool {
 	if e.Inference == nil || e.Inference.Model == "" {
 		return false
 	}
 	if pricing.UsageFromInference(e.Inference) != (pricing.Usage{}) {
 		return true
 	}
-	return e.StatusCode < 400 && e.Phase != pipeline.SessionDenied
+	return e.StatusCode < 400 && e.Phase != model.SessionDenied
 }
 
 // foldInto accumulates one event into one ring.
@@ -1342,14 +1236,14 @@ func PriceableRequest(e *pipeline.SessionEvent) bool {
 // which session it belongs to: a.all is shared and a sessionRing holds only
 // buckets. Both call sites pass the same id, which is what lets the bySession
 // label be recorded uniformly instead of only on the all-sessions ring.
-func (a *Aggregator) foldInto(ring []bucket, t time.Time, sessionID string, e *pipeline.SessionEvent, requestPlugins []string, ec eventCost, avoided int64) {
+func (a *Aggregator) foldInto(ring []bucket, t time.Time, sessionID string, e *model.SessionEvent, requestPlugins []string, ec eventCost, avoided int64) {
 	b := &ring[slot(t)]
 	if !b.start.Equal(t) {
 		*b = bucket{start: t} // stale lap: reset rather than accumulate onto old data
 	}
 
 	var tokens int64
-	var model string
+	var modelName string
 	// split is read from the wire event's own split counters rather than derived
 	// from tokens: the parser is the only component that knows the breakdown, and
 	// there is no way to recover it from the total afterwards.
@@ -1358,7 +1252,7 @@ func (a *Aggregator) foldInto(ring []bucket, t time.Time, sessionID string, e *p
 	// counted rather than silent. See Counts.RefusedTokenRequests.
 	var refusedTokens int64
 	if e.Inference != nil {
-		model = e.Inference.Model
+		modelName = e.Inference.Model
 		if plausibleTokenReport(e.Inference) {
 			tokens = int64(e.Inference.TotalTokens)
 			split = Counts{
@@ -1437,8 +1331,8 @@ func (a *Aggregator) foldInto(ring []bucket, t time.Time, sessionID string, e *p
 	if ec.priced == 0 && avoided == 0 {
 		unit = ""
 	}
-	if model != "" {
-		b.noteUnit(GroupModel, addLabel(&b.byMethod, ringLabel(model), one), unit)
+	if modelName != "" {
+		b.noteUnit(GroupModel, addLabel(&b.byMethod, ringLabel(modelName), one), unit)
 	}
 	// Host is the :authority as the listener saw it, so it is request-controlled
 	// and goes through truncateLabel like the model name. Guarded on empty for the
@@ -1482,10 +1376,10 @@ func (a *Aggregator) foldInto(ring []bucket, t time.Time, sessionID string, e *p
 	// so there is no empty key to guard against — and folding unconditionally is what
 	// makes this axis's series sum to the bucket total. That is also what gives it a
 	// different denominator from group=model's; see byAgent.
-	b.noteUnit(GroupAgent, addLabel(&b.byAgent, AgentLabel(e.Client), one), unit)
+	b.noteUnit(GroupAgent, addLabel(&b.byAgent, event.AgentLabel(e.Client), one), unit)
 	if e.StatusCode > 0 {
 		addLabel(&b.byStatus, strconv.Itoa(e.StatusCode), one)
-	} else if e.Phase == pipeline.SessionDenied {
+	} else if e.Phase == model.SessionDenied {
 		addLabel(&b.byStatus, "denied", one)
 	}
 	// Per-plugin attribution counts the request once per plugin that ran, so
@@ -1517,376 +1411,6 @@ func (a *Aggregator) foldInto(ring []bucket, t time.Time, sessionID string, e *p
 		}
 		addLabel(&b.byPlugin, ringLabel(name), one)
 	}
-}
-
-// maxLabelsPerBucket caps distinct keys in one bucket's grouping map.
-//
-// The model name comes off the request body, so its cardinality is set by
-// whatever the client sends, not by anything this process controls. Unbounded, a
-// caller varying the model string every request would add a retained map entry
-// and a retained string per request, in a ring that only frees a slot when it is
-// reused a full lap later — 6h at one minute. That is memory growth driven from
-// off-host, on the synchronous session-append path.
-//
-// 64 is well above any real deployment: a pod talks to a handful of models, a
-// few status codes and its own plugin list. Past the cap, further keys fold into
-// overflowLabel so the totals stay correct and the excess is visible rather than
-// silently dropped.
-const maxLabelsPerBucket = 64
-
-// overflowLabel collects everything past maxLabelsPerBucket. Named rather than
-// dropped so a chart's segments still sum to the bucket total, and so an
-// operator can see that cardinality was capped instead of wondering why a model
-// is missing.
-const overflowLabel = "(other)"
-
-// MaxSeriesInResponse bounds how many label series ONE RESPONSE carries, per bucket.
-//
-// A SEPARATE BOUND FROM maxLabelsPerBucket, and the reason both exist is that they bound
-// different things. That one is a MEMORY bound at record time: 64 per axis, so a caller
-// varying a label per request cannot grow this process. This one is a RESPONSE bound, and
-// nothing was enforcing it — the two multiply. Measured on the endpoint as shipped:
-// window=6h&resolution=1m&group=session is 360 buckets times up to 64 series, which produced
-// a 4.7 MB response from a single unauthenticated GET.
-//
-// SIXTEEN, because the response is something a person reads. A by-model or by-agent breakdown
-// past a dozen rows is not a breakdown anyone consumes; the rest belongs in the (other) band,
-// which every client already renders because the record-time cap has always produced it. That
-// is the property that makes this cheap: no new wire vocabulary, and a client written against
-// the old shape shows a correct total with one extra row.
-//
-// RANKED ACROSS THE WHOLE WINDOW, not per bucket, which is the part that has to be got right.
-// Capping each bucket independently would let the SAME label be a series in one minute and
-// part of (other) in the next, so a chart would show a line appearing and vanishing while the
-// traffic behind it was steady. The ranking is by cost, because this is a cost API and the
-// question "where did the money go" is the one the top of the list has to answer.
-const MaxSeriesInResponse = 16
-
-// MaxLabelLen bounds one retained label. The model name is request-controlled, so
-// without this a caller could park a megabyte of string in a bucket that lives
-// for a full ring lap. Long enough for any real model id, including provider
-// prefixes and dated suffixes.
-//
-// EXPORTED SO THE DURABLE COPY CAN BE PINNED TO IT. cost/ledger caps its own labels at the same
-// number and said so in a comment — "matched deliberately rather than chosen again" — while both
-// copies were unexported, so no test could compare them and raising one to 4096 left both suites
-// green. Same defect and same fix as MaxRetentionDays.
-const MaxLabelLen = 96
-
-// maxLabelLen is the internal spelling, so this package's call sites read unchanged.
-const maxLabelLen = MaxLabelLen
-
-// hostLabel reduces an :authority to the host alone, so "api.anthropic.com:443"
-// and "api.anthropic.com" are one series rather than two.
-//
-// net.SplitHostPort, not a Cut on ":": an IPv6 literal is full of colons, and
-// splitting on the first turns "[::1]:9094" into "[". SplitHostPort errors on an
-// authority carrying no port at all, so that case falls through to the input.
-//
-// The brackets then have to come off separately, or IPv6 splits the very way this
-// function exists to prevent: SplitHostPort unwraps them when it succeeds
-// ("[::1]:9094" -> "::1"), leaving a port-less "[::1]" as its own band for the
-// same upstream.
-//
-// A port with no host (":443") reduces to "", which the caller treats as absent
-// and folds into the renderer's "(unlabelled)" remainder. That is the right
-// answer for an authority that names no host: there is nothing to label it with,
-// and inventing a band for it would be worse than counting it as unattributed.
-//
-// The same reduction exists in three listeners and in agentop's events pane, each
-// private to its package; this is a fourth rather than a shared helper because
-// core/cost/usage must not import a listener, and hoisting one is a refactor this
-// change does not need.
-func hostLabel(authority string) string {
-	if h, _, err := net.SplitHostPort(authority); err == nil {
-		return h
-	}
-	// No port: still strip brackets, so a bare "[::1]" matches the "::1" that the
-	// ported form reduces to.
-	return strings.TrimSuffix(strings.TrimPrefix(authority, "["), "]")
-}
-
-// truncateLabel caps a label at maxLabelLen BYTES, cutting on a rune boundary.
-//
-// BYTES, because that is what bounds the memory a label occupies and the line it becomes in
-// the ledger; RUNE BOUNDARY, because a byte cut breaks the very byte cap it enforces. A plain
-// s[:maxLabelLen] can split a multi-byte sequence and leave an invalid trailing fragment, and
-// encoding/json then expands each invalid byte into a 3-byte U+FFFD — so a 121-byte label cut
-// at 96 SERIALISES AT 100 BYTES (measured in cost/ledger, where the same defect was fixed
-// first). The invalid fragment is the smaller problem; the cap silently not holding is the
-// reason this is a fix rather than tidying.
-//
-// Walking back off continuation bytes shortens the label by at most three bytes, which no
-// real model id notices.
-func truncateLabel(s string) string {
-	if len(s) <= maxLabelLen {
-		return s
-	}
-	cut := maxLabelLen
-	// At most three steps: no UTF-8 sequence is longer than four bytes.
-	for cut > 0 && !utf8.RuneStart(s[cut]) {
-		cut--
-	}
-	return s[:cut]
-}
-
-// AgentLabel is the label byAgent keys traffic from c by, before addLabel's overflow; agent=
-// matches it. Versionless — see pipeline.AgentName.
-func AgentLabel(c *pipeline.EventClient) string {
-	return ringLabel(pipeline.AgentName(c.Label()))
-}
-
-// ringLabel prepares one string for a bucket's label map: sanitised, then capped.
-//
-// THE ORDER MATTERS, for the reason ledger.rowLabel gives: sanitising can triple a
-// string's length — every replaced byte becomes a 3-byte U+FFFD — so capping first would let
-// 96 control bytes become 288 and break the bound. Capping last is exact now that
-// truncateLabel cuts on a rune boundary.
-func ringLabel(s string) string {
-	return truncateLabel(sanitizeLabel(s))
-}
-
-// sanitizeLabel replaces C0 controls, DEL, C1 controls and invalid UTF-8 with U+FFFD.
-//
-// THE RING IS A SERVING SURFACE OF ITS OWN. The model comes off the parsed request body and
-// the endpoint is the host the workload asked for, so without this GET /v1/usage serves a
-// model name containing an ANSI escape straight out of memory — while the ledger's copy of the
-// very same label is clean, because cost/ledger sanitises on write. Two surfaces, one request,
-// different bytes: group=model shows the label as two series, and the unsanitised one can
-// reposition an operator's cursor. CWE-150.
-//
-// REPLACED, NOT DROPPED, so tampering stays visible rather than collapsing into a
-// plausible-looking label: "m\x1b[31mx" reads as "m�[31mx" rather than as "m[31mx",
-// which nobody would question.
-//
-// C1 IS INCLUDED — U+0080–U+009F — and so are the bidi and zero-width runes; isControlRune
-// names the set and pipeline.sanitizeUA carries the argument for it. The short version: U+009B
-// is a single-character CSI, so a byte scan for anything below 0x20 steps straight past a
-// working escape sequence, which is why the scan below decodes runes.
-//
-// FOUR SANITISING SURFACES, ONE RULE, AND THE RULE IS NOW SHARED:
-//
-//   - pipeline.sanitizeUA is PRIMARY for the Agent label, at the point a User-Agent header
-//     becomes a value, so it already covers this package's byAgent.
-//   - ledger.sanitizeLabel is PRIMARY for the durable row — the copy in front of a file
-//     retained for retentionDays that cannot be edited afterwards.
-//   - THIS one is primary for the RING's byMethod and byEndpoint, which reach /v1/usage
-//     without passing through either of the other two.
-//   - agentop's tui.sanitizeLabel is a render-time copy in a main module this library must not
-//     import, and still filters C0 and DEL only.
-//
-// The first three no longer each carry their own copy of WHICH RUNES COUNT: that predicate is
-// pipeline.IsControlRune, and both this package and cost/ledger import pipeline, so there is one
-// definition repo-wide. This comment used to argue the opposite — that referencing pipeline's
-// would "invert the layering into a cycle" and so the rule had to be copied — which was wrong
-// in the direction that matters: nothing in pipeline imports this package. Three byte-identical
-// copies existed on the strength of that paragraph, only one of them tested for the bidi marks.
-//
-// What is still per-surface is the SHAPE of the sanitiser around it (what it replaces with, and
-// whether it caps), and agentop's is deliberately narrower and out of this module's reach.
-func sanitizeLabel(s string) string {
-	if !hasControlRunes(s) {
-		// The overwhelmingly common case, and no allocation for it: this runs on the fold path,
-		// once per label per event, under the aggregator's write lock.
-		return s
-	}
-	var b strings.Builder
-	b.Grow(len(s))
-	for i := 0; i < len(s); {
-		r, size := utf8.DecodeRuneInString(s[i:])
-		if pipeline.IsControlRune(r) || (r == utf8.RuneError && size == 1) {
-			b.WriteRune('�')
-			i += size
-			continue
-		}
-		b.WriteString(s[i : i+size])
-		i += size
-	}
-	return b.String()
-}
-
-// hasControlRunes reports whether s carries anything sanitizeLabel would replace.
-//
-// A RUNE scan for the reason in sanitizeLabel: a byte scan is exact for C0 and DEL and blind
-// to C1. An INVALID byte reports true (RuneError at size 1 is the decoder saying "this is not
-// UTF-8"); a legitimately encoded U+FFFD does not, because it decodes at size 3, so an
-// already-sanitised label does not read as still hostile.
-func hasControlRunes(s string) bool {
-	for i := 0; i < len(s); {
-		r, size := utf8.DecodeRuneInString(s[i:])
-		if pipeline.IsControlRune(r) || (r == utf8.RuneError && size == 1) {
-			return true
-		}
-		i += size
-	}
-	return false
-}
-
-// CapSeries folds everything past the n costliest entries into the (other) band.
-//
-// EXPORTED FOR cost/ledger, which serves the symbolic windows from disk and had no bound of its
-// own at all: its rows come from day files, so the number of distinct (endpoint, model, agent)
-// keys in a response is however many a month of traffic produced. One map rather than a whole
-// snapshot, because that source answers with a single bucket.
-//
-// Ranked by cost, ties broken by requests and then by label, so the answer is deterministic —
-// a breakdown whose membership changed between two identical requests would be worse than an
-// unbounded one, because a client could not tell a traffic change from a tie-break.
-//
-// The (other) entry is Counts.Add-ed, so every field it carries is summed by the one
-// summation point and a field added to Counts is carried here with no edit.
-func CapSeries(series map[string]Counts, n int) map[string]Counts {
-	if len(series) <= n {
-		return series
-	}
-	keys := make([]string, 0, len(series))
-	for k := range series {
-		keys = append(keys, k)
-	}
-	sort.Slice(keys, func(i, j int) bool {
-		a, b := series[keys[i]], series[keys[j]]
-		if a.CostMicros != b.CostMicros {
-			return a.CostMicros > b.CostMicros
-		}
-		if a.Requests != b.Requests {
-			return a.Requests > b.Requests
-		}
-		return keys[i] < keys[j]
-	})
-	out := make(map[string]Counts, n+1)
-	var other Counts
-	for i, k := range keys {
-		if i < n {
-			out[k] = series[k]
-			continue
-		}
-		other.Add(series[k])
-	}
-	// Merged rather than assigned: a label spelled "(other)" by a caller is already in the
-	// map, and overwriting it would drop that traffic. The band is not a reserved key — see
-	// cost/ledger's overflowLabel, which makes the same point about spoofability.
-	cur := out[overflowLabel]
-	cur.Add(other)
-	out[overflowLabel] = cur
-	return out
-}
-
-// FoldSeriesAcrossWindow sums each series label's Counts over every bucket, giving one total
-// per label for the whole window.
-//
-// EXTRACTED FROM capSeriesAcrossWindow, which carried this loop inline to build the ranking it
-// caps by, and exported because two consumers outside this package need the same answer:
-// agentop's AGENTS pane, which renders one row per agent for the window, and
-// `agentop cost --agent`, which needs one label's total plus the set of labels to name in a
-// "no such agent" error. Either writing the loop again would be a second definition of what a
-// window total means.
-//
-// THROUGH Counts.Add, which is the reason it is worth sharing rather than retyping: Add
-// saturates and records it in Saturated, where a hand-written `+=` wraps negative. The
-// consumers that RANK OR COMPARE the result are the ones that argument is for: a wrapped cost
-// total sorts BELOW a ten-micro one, so in the pane that orders agents by spend it silently
-// moves the biggest spender to the bottom. rankSeriesByCost's godoc in agentop records the same
-// trap being hit for real. `agentop cost --agent` looks up a single label and does neither, and
-// wants the same saturating answer anyway — one definition of a window total, not two.
-//
-// Returns an empty map rather than nil for no buckets, so "no traffic" is an empty answer and
-// not something a caller has to nil-check.
-func FoldSeriesAcrossWindow(buckets []Bucket) map[string]Counts {
-	window := map[string]Counts{}
-	for _, b := range buckets {
-		for k, v := range b.Series {
-			cur := window[k]
-			cur.Add(v)
-			window[k] = cur
-		}
-	}
-	return window
-}
-
-// SortSeriesLabels orders labels IN PLACE by what they cost, descending, breaking ties on the
-// label.
-//
-// ONE DEFINITION FOR EVERY SURFACE THAT RANKS A BREAKDOWN. agentop's AGENTS pane and
-// `agentop cost --by` show the same series in the same order, and the rule lives here so the two
-// cannot drift — the spend drawer's rankSeriesByCost records what it cost the last time a
-// consumer wrote its own.
-//
-// THE TIE-BREAK IS LOAD-BEARING, not tidiness. Every UNPRICED series has CostMicros 0, so until
-// billing units land the label is the entire order for all of them; and these rows are rebuilt
-// on every poll, so without it equal-cost entries swap places between reads under a reader
-// trying to compare them.
-//
-// A SLICE, NOT A MAP, and the signature is the point. Ranking straight out of a map takes the
-// tie order from Go's randomised walk, and sort.Slice is unstable, so the tied block is permuted
-// by the sort itself — a test for the tie-break could then only catch its deletion when the
-// random order happened to be wrong. Given a slice the result is a pure function of the input and
-// the assertion holds every run.
-//
-// A label absent from series sorts as zero cost: the map lookup yields the zero Counts, which
-// keeps the ordering total rather than panicking, and the label tie-break still places it
-// stably.
-func SortSeriesLabels(labels []string, series map[string]Counts) {
-	sort.Slice(labels, func(i, j int) bool {
-		a, b := series[labels[i]].CostMicros, series[labels[j]].CostMicros
-		if a != b {
-			return a > b
-		}
-		return labels[i] < labels[j]
-	})
-}
-
-// capSeriesAcrossWindow applies MaxSeriesInResponse to every bucket using ONE ranking taken
-// over the whole window, so a label is either a series everywhere or (other) everywhere.
-//
-// See MaxSeriesInResponse for why per-bucket capping is the wrong shape. The ranking is built
-// from the same Counts.Add the totals use, so "costliest" means the same thing here as in the
-// figure the client renders above the chart.
-func capSeriesAcrossWindow(buckets []Bucket, n int) {
-	window := FoldSeriesAcrossWindow(buckets)
-	if len(window) <= n {
-		return
-	}
-	keep := make(map[string]bool, n)
-	for k := range CapSeries(window, n) {
-		keep[k] = true
-	}
-	for i := range buckets {
-		if len(buckets[i].Series) == 0 {
-			continue
-		}
-		out := make(map[string]Counts, n+1)
-		var other Counts
-		for k, v := range buckets[i].Series {
-			if keep[k] {
-				out[k] = v
-				continue
-			}
-			other.Add(v)
-		}
-		if other != (Counts{}) {
-			cur := out[overflowLabel]
-			cur.Add(other)
-			out[overflowLabel] = cur
-		}
-		buckets[i].Series = out
-	}
-}
-
-// addLabel adds c under key, or under overflowLabel once the map is full, and returns the key it
-// used — which a caller keeping a second tally in step with this one must key on.
-func addLabel(m *map[string]Counts, key string, c Counts) string {
-	if *m == nil {
-		*m = make(map[string]Counts, 4)
-	}
-	// Reserve the last slot for overflowLabel: switching to it only once the map
-	// is already full would make the overflow key itself the (cap+1)th entry.
-	if _, ok := (*m)[key]; !ok && len(*m) >= maxLabelsPerBucket-1 {
-		key = overflowLabel
-	}
-	cur := (*m)[key]
-	cur.Add(c)
-	(*m)[key] = cur
-	return key
 }
 
 func slot(t time.Time) int {

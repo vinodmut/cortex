@@ -2,6 +2,8 @@ package config
 
 import (
 	"fmt"
+	"log/slog"
+	"net/netip"
 
 	"github.com/rossoctl/cortex/core/cost/pricing"
 )
@@ -37,6 +39,9 @@ func Validate(cfg *Config) error {
 	if err := validateSessionArchive(cfg); err != nil {
 		return err
 	}
+	if err := validatePraxis(cfg); err != nil {
+		return err
+	}
 	return validatePricing(cfg)
 }
 
@@ -70,6 +75,42 @@ func validateCostLedger(cfg *Config) error {
 		"the ledger records through the session store (it is registered as a Recorder on it), so with the " +
 		"store off nothing can reach it and no cost history would be written — set session.enabled: true, " +
 		"or drop cost_ledger.enabled")
+}
+
+// validatePraxis refuses praxis mode outside a loopback-only laptop install, and
+// beside mtls: the ingest endpoint and the hop to cortex-gateway are loopback
+// plaintext, so neither combination can work.
+func validatePraxis(cfg *Config) error {
+	if !cfg.PraxisEnabled() {
+		return nil
+	}
+	if cfg.MTLS != nil {
+		return fmt.Errorf("praxis.enabled: true cannot be used with mtls: drop the mtls block or praxis.enabled")
+	}
+	if !cfg.Listener.BindLoopbackOnly {
+		return fmt.Errorf("praxis.enabled: true requires listener.bind_loopback_only: true")
+	}
+	// The rows reach Cortex only through POST /v1/ingest, which needs the session store.
+	if !cfg.Session.SessionEnabled() {
+		return fmt.Errorf("praxis.enabled: true cannot be used with session.enabled: false: Cortex ingests the gateway's rows into the session store")
+	}
+	if err := validatePraxisAddr("praxis.listen", cfg.Praxis.Listen); err != nil {
+		return err
+	}
+	return validatePraxisAddr("praxis.egress", cfg.Praxis.Egress)
+}
+
+// validatePraxisAddr accepts an empty addr (the default applies) or a literal
+// loopback host:port with a non-zero port.
+func validatePraxisAddr(field, addr string) error {
+	if addr == "" {
+		return nil
+	}
+	ap, err := netip.ParseAddrPort(addr)
+	if err != nil || !ap.Addr().IsLoopback() || ap.Port() == 0 {
+		return fmt.Errorf("%s: %q must be a loopback IP and a non-zero port, such as %q", field, addr, "127.0.0.1:47605")
+	}
+	return nil
 }
 
 // validatePricing builds the rate table and discards it, so a fault in the
@@ -111,6 +152,21 @@ func validateListeners(cfg *Config) error {
 		default:
 			return fmt.Errorf("listener.inbound_interception: %q is not valid (use %q or %q)",
 				cfg.Listener.InboundInterception, InboundInterceptionReverseProxy, InboundInterceptionTransparent)
+		}
+		if v := cfg.Listener.DeclineResponsesWebSockets; v != nil {
+			if cfg.Listener.ResponsesWebSockets != "" {
+				return fmt.Errorf("listener.decline_responses_websockets and listener.responses_websockets are both set; " +
+					"remove decline_responses_websockets, which responses_websockets replaced")
+			}
+			slog.Warn("listener.decline_responses_websockets is deprecated; use listener.responses_websockets",
+				"decline_responses_websockets", *v, "responses_websockets", cfg.Listener.ResponsesWebSocketsMode())
+		}
+		switch cfg.Listener.ResponsesWebSockets {
+		case "", ResponsesWebSocketsParse, ResponsesWebSocketsDecline, ResponsesWebSocketsForward:
+			// valid
+		default:
+			return fmt.Errorf("listener.responses_websockets: %q is not valid (use %q, %q or %q)",
+				cfg.Listener.ResponsesWebSockets, ResponsesWebSocketsParse, ResponsesWebSocketsDecline, ResponsesWebSocketsForward)
 		}
 		roles := cfg.Listener.ActiveRoles()
 		if cfg.Listener.InboundTransparent() && !roles[RoleReverse] {

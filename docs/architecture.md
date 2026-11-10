@@ -2,7 +2,7 @@
 
 Cortex provides **secure, transparent token management** for Kubernetes workloads. The shared library is at [`core/`](../core/); the sidecar binaries live under [`cmd/`](../cmd/) (see [`cmd/README.md`](../cmd/README.md) for which pins which mode). Keycloak client registration is handled by the [operator](https://github.com/rossoctl/operator)'s `ClientRegistrationReconciler` (no in-pod registration sidecar). Together with [SPIFFE/SPIRE](https://spiffe.io), this enables zero-trust authentication flows.
 
-> **📘 Looking to run the demo?** See the [Weather Agent](../demos/weather-agent/demo-ui.md) or [GitHub Issue Agent](../demos/github-issue/demo.md) demos for step-by-step instructions, and [Token-Exchange Routes](../demos/token-exchange-routes/README.md) for route configuration.
+> **📘 Looking to run the demo?** See the [Weather Agent](https://github.com/rossoctl/cortex-demos/blob/main/weather-agent/demo-ui.md) or [GitHub Issue Agent](https://github.com/rossoctl/cortex-demos/blob/main/github-issue/demo.md) demos for step-by-step instructions, and [Token-Exchange Routes](https://github.com/rossoctl/cortex-demos/blob/main/token-exchange-routes/README.md) for route configuration.
 
 ## Deployment Modes
 
@@ -25,7 +25,7 @@ mode with a trimmed plugin set (see the profile table below).
 
 The operator resolves the mode per workload from `AgentRuntime.Spec.AuthBridgeMode` → namespace ConfigMap → deprecated `rossoctl.io/authbridge-mode` annotation → cluster default (`proxy-sidecar`). See operator#361.
 
-The runtime library at [`core/`](../core/) holds the plugin framework, every listener (the Envoy ext_proc server and the HTTP proxies), the cost pipeline, the session store, and the auth primitives — auth being 1.6% of its non-test lines. It is not protocol-free: `listener/extproc` depends on gRPC and `envoyproxy/go-control-plane`. See [`core/README.md`](../core/README.md) for the package reference and the measured breakdown.
+The runtime library at [`core/`](../core/) holds the plugin framework, every listener (the Envoy ext_proc server and the HTTP proxies), the cost pipeline, the session store, and the auth primitives — auth being about 1% of its non-test lines. It is not protocol-free: `listener/extproc` depends on gRPC and `envoyproxy/go-control-plane`. See [`core/README.md`](../core/README.md) for the package reference and the measured breakdown.
 
 ## Plugin Catalog
 
@@ -387,7 +387,7 @@ The easiest way to get all prerequisites is to use the [Rossoctl Quickstart](htt
 
 ## Getting Started
 
-See [`demos/README.md`](../demos/README.md) for the full demo index and a
+See [`cortex-demos/README.md`](https://github.com/rossoctl/cortex-demos/blob/main/README.md) for the full demo index and a
 recommended learning path — from the Weather Agent (inbound validation, webhook
 injection) through the GitHub Issue Agent (transparent token exchange +
 scope-based access) to the token-exchange routes reference.
@@ -468,18 +468,20 @@ a typo silently drops a plugin — prefer a profile name over a hand-written lis
 
 To make a plugin excludable:
 
-1. Create a `plugins_<name>.go` file in each `cmd/` binary that imports the plugin:
+1. Create one `core/plugins/all/plugins_<name>.go` file that imports the plugin.
+   Every binary imports `core/plugins/all`, so do not copy the file into `cmd/`:
 
 ```go
 //go:build include_plugin_<name>
 
-package main
+package all
 
 import _ "github.com/rossoctl/cortex/core/plugins/<name>"
 ```
 
-2. Never import a plugin package from `main.go`. An unconditional import cannot be
-   excluded by any tag, and nothing reports that.
+2. Never import a plugin package from a `cmd/` binary. An unconditional import
+   cannot be excluded by any tag, and nothing reports that. A guard test enforces
+   this.
 
 3. Name the plugin in every profile that should carry it, in
    `scripts/profile-tags/profiles.go` — or add it to `optional` if it deliberately

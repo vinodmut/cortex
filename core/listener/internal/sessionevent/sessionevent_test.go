@@ -235,3 +235,186 @@ func keysOf[V any](m map[string]V) []string {
 	}
 	return out
 }
+
+// withProtocolParses adds the two extensions each listener used to keep for one
+// direction only, plus a response the pipeline saw.
+func withProtocolParses(pctx *pipeline.Context) *pipeline.Context {
+	pctx.Body = []byte(`{"jsonrpc":"2.0"}`)
+	pctx.ResponseBytes = 42
+	pctx.ResponseHeadersAt = time.Now()
+	pctx.Extensions.A2A = &pipeline.A2AExtension{Method: "message/send"}
+	pctx.Extensions.MCP = &pipeline.MCPExtension{Method: "tools/call"}
+	pctx.Extensions.Inference = &pipeline.InferenceExtension{Model: "m"}
+	return pctx
+}
+
+// Request and Response carry every extension in BOTH directions (#1575). Each listener
+// used to build its own literal, and the copies kept A2A inbound only and MCP outbound
+// only, while the parsers run on either chain.
+func TestRequestResponse_CarryEveryProtocolInEitherDirection(t *testing.T) {
+	for _, dir := range []pipeline.Direction{pipeline.Inbound, pipeline.Outbound} {
+		pctx := withProtocolParses(richContext())
+		for _, ev := range []pipeline.SessionEvent{
+			Request(pctx, dir),
+			Response(pctx, dir, 200, nil),
+		} {
+			name := dir.String() + "/" + ev.Phase.String()
+			if ev.Direction != dir {
+				t.Errorf("%s: Direction = %v", name, ev.Direction)
+			}
+			if ev.A2A == nil || ev.A2A.Method != "message/send" {
+				t.Errorf("%s: A2A = %+v, want the parse", name, ev.A2A)
+			}
+			if ev.MCP == nil || ev.MCP.Method != "tools/call" {
+				t.Errorf("%s: MCP = %+v, want the parse", name, ev.MCP)
+			}
+			if ev.Inference == nil || ev.Inference.Model != "m" {
+				t.Errorf("%s: Inference = %+v, want the parse", name, ev.Inference)
+			}
+			if ev.Identity == nil || ev.Identity.Subject != "alice" {
+				t.Errorf("%s: Identity = %+v", name, ev.Identity)
+			}
+			if _, ok := ev.Plugins["parity-spy-a"]; !ok {
+				t.Errorf("%s: Plugins missing the spy's event", name)
+			}
+			if ev.TLS == nil || ev.Client == nil || ev.Subagent == "" || ev.ParentSubagent == "" {
+				t.Errorf("%s: TLS=%v Client=%v Subagent=%q ParentSubagent=%q, want all set",
+					name, ev.TLS, ev.Client, ev.Subagent, ev.ParentSubagent)
+			}
+		}
+	}
+}
+
+// The extensions are snapshots: a response-phase change to the live struct, such as
+// token counts set in OnResponse, must not reach a row that was already built.
+func TestRequest_SnapshotsTheExtensions(t *testing.T) {
+	pctx := withProtocolParses(richContext())
+	ev := Request(pctx, pipeline.Outbound)
+	pctx.Extensions.A2A.Method = "changed"
+	pctx.Extensions.MCP.Method = "changed"
+	pctx.Extensions.Inference.Model = "changed"
+	if ev.A2A.Method != "message/send" || ev.MCP.Method != "tools/call" || ev.Inference.Model != "m" {
+		t.Errorf("row followed the live extensions: A2A=%q MCP=%q Inference=%q",
+			ev.A2A.Method, ev.MCP.Method, ev.Inference.Model)
+	}
+}
+
+// Each phase carries its own half: the request row the body sent and the request's own
+// attribution, the response row the outcome. The other half stays zero.
+func TestRequestResponse_EachPhaseCarriesItsOwnHalf(t *testing.T) {
+	pctx := withProtocolParses(richContext())
+	pctx.SetAttribution("100.200", "101.201", "X-Session")
+	pctx.UpgradeStripped = "h2c"
+
+	req := Request(pctx, pipeline.Outbound)
+	if req.Phase != pipeline.SessionRequest || req.BytesUp != int64(len(pctx.Body)) {
+		t.Errorf("request: Phase=%v BytesUp=%d", req.Phase, req.BytesUp)
+	}
+	if req.Proc != "100.200" || req.ClientProc != "101.201" || req.SessionHeader != "X-Session" || req.UpgradeStripped != "h2c" {
+		t.Errorf("request: Proc=%q ClientProc=%q SessionHeader=%q UpgradeStripped=%q",
+			req.Proc, req.ClientProc, req.SessionHeader, req.UpgradeStripped)
+	}
+	if req.BytesDown != 0 || req.StatusCode != 0 || req.Error != nil || req.Duration != 0 || req.Ttfb != 0 {
+		t.Errorf("request carries response fields: %+v", req)
+	}
+
+	fail := &pipeline.EventError{Kind: "upstream_timeout"}
+	resp := Response(pctx, pipeline.Outbound, 502, fail)
+	if resp.Phase != pipeline.SessionResponse || resp.StatusCode != 502 || resp.Error != fail {
+		t.Errorf("response: Phase=%v StatusCode=%d Error=%+v", resp.Phase, resp.StatusCode, resp.Error)
+	}
+	if resp.BytesDown != 42 || resp.Duration <= 0 || resp.Ttfb <= 0 || resp.Proc != "100.200" {
+		t.Errorf("response: BytesDown=%d Duration=%v Ttfb=%v Proc=%q", resp.BytesDown, resp.Duration, resp.Ttfb, resp.Proc)
+	}
+	if resp.BytesUp != 0 || resp.ClientProc != "" || resp.SessionHeader != "" || resp.UpgradeStripped != "" {
+		t.Errorf("response carries request-only fields: BytesUp=%d ClientProc=%q SessionHeader=%q UpgradeStripped=%q",
+			resp.BytesUp, resp.ClientProc, resp.SessionHeader, resp.UpgradeStripped)
+	}
+}
+
+// With no explicit failure, Response falls back to what the response implies, as the
+// buffered recorders' DeriveError did before they shared this builder.
+func TestResponse_DerivesTheErrorWhenNoneIsGiven(t *testing.T) {
+	pctx := &pipeline.Context{StatusCode: 503}
+	ev := Response(pctx, pipeline.Inbound, 503, nil)
+	if ev.Error == nil || ev.Error.Kind != "backend_error" || ev.Error.Code != "503" {
+		t.Errorf("Error = %+v, want backend_error 503", ev.Error)
+	}
+	if ev := Response(&pipeline.Context{StatusCode: 200}, pipeline.Inbound, 200, nil); ev.Error != nil {
+		t.Errorf("Error = %+v, want nil for a 200", ev.Error)
+	}
+}
+
+// A listener that cannot know a field records nothing for it — the contract that lets
+// one builder serve all three.
+func TestRequestResponse_OmitWhatTheContextDoesNotCarry(t *testing.T) {
+	pctx := &pipeline.Context{}
+	for _, ev := range []pipeline.SessionEvent{Request(pctx, pipeline.Inbound), Response(pctx, pipeline.Inbound, 200, nil)} {
+		if ev.A2A != nil || ev.MCP != nil || ev.Inference != nil || ev.Identity != nil || ev.TLS != nil ||
+			ev.Plugins != nil || ev.Invocations != nil || ev.RequestedHost != "" || ev.Proc != "" {
+			t.Errorf("%v: populated fields pctx did not carry: %+v", ev.Phase, ev)
+		}
+	}
+}
+
+// TunnelOpen records every field of a tunnel's open row. The forward proxy built this
+// row by hand before the builder existed.
+func TestTunnelOpen_PopulatesEveryField(t *testing.T) {
+	pctx := richContext()
+	pctx.SetAttribution("100.200", "101.201", "X-Session")
+	pctx.DialedAddr = "203.0.113.7:443"
+
+	ev := TunnelOpen(pctx, pipeline.TunnelPassthroughHost)
+	if ev.At.IsZero() || ev.Direction != pipeline.Outbound || ev.Phase != pipeline.SessionRequest {
+		t.Errorf("At/Direction/Phase = %v/%v/%v", ev.At, ev.Direction, ev.Phase)
+	}
+	if ev.RequestID != pctx.RequestID() || ev.Host != pctx.Host || ev.HTTPMethod != "POST" || ev.HTTPPath != "/parity/deny" {
+		t.Errorf("RequestID/Host/Method/Path = %q/%q/%q/%q", ev.RequestID, ev.Host, ev.HTTPMethod, ev.HTTPPath)
+	}
+	if !ev.Tunnel || ev.TunnelReason != pipeline.TunnelPassthroughHost || ev.DialAddr != "203.0.113.7:443" {
+		t.Errorf("Tunnel/TunnelReason/DialAddr = %v/%q/%q", ev.Tunnel, ev.TunnelReason, ev.DialAddr)
+	}
+	if ev.Invocations == nil || ev.Plugins == nil || ev.Identity == nil || ev.Client == nil {
+		t.Errorf("Invocations/Plugins/Identity/Client not snapshotted: %+v", ev)
+	}
+	if ev.Subagent != "a1a2e36cb5946f31c" || ev.ParentSubagent != "a0974b0b8591dc76b" || ev.Proc != "100.200" {
+		t.Errorf("Subagent/ParentSubagent/Proc = %q/%q/%q", ev.Subagent, ev.ParentSubagent, ev.Proc)
+	}
+	// The open row has no outcome, and the request-only fields stay on Request.
+	if ev.StatusCode != 0 || ev.Error != nil || ev.Duration != 0 || ev.BytesUp != 0 || ev.BytesDown != 0 ||
+		ev.ClientProc != "" || ev.SessionHeader != "" || ev.TLS != nil || ev.RequestedHost != "" {
+		t.Errorf("open row carries fields it must not: %+v", ev)
+	}
+}
+
+// TunnelClose records every field of a tunnel's close row. The WebSocket close row once
+// dropped Proc, Subagent and ParentSubagent because it was built by hand.
+func TestTunnelClose_PopulatesEveryField(t *testing.T) {
+	pctx := richContext()
+	pctx.SetAttribution("100.200", "101.201", "X-Session")
+	pctx.DialedAddr = "203.0.113.7:443"
+	fail := &pipeline.EventError{Kind: "upstream_unreachable"}
+
+	ev := TunnelClose(pctx, pipeline.TunnelWebSocket, 502, fail, 10, 20)
+	if ev.At.IsZero() || ev.Direction != pipeline.Outbound || ev.Phase != pipeline.SessionResponse {
+		t.Errorf("At/Direction/Phase = %v/%v/%v", ev.At, ev.Direction, ev.Phase)
+	}
+	if ev.RequestID != pctx.RequestID() || ev.Host != pctx.Host || ev.HTTPMethod != "POST" || ev.HTTPPath != "/parity/deny" {
+		t.Errorf("RequestID/Host/Method/Path = %q/%q/%q/%q", ev.RequestID, ev.Host, ev.HTTPMethod, ev.HTTPPath)
+	}
+	if ev.StatusCode != 502 || ev.Error != fail || ev.Duration <= 0 || ev.BytesUp != 10 || ev.BytesDown != 20 {
+		t.Errorf("StatusCode/Error/Duration/BytesUp/BytesDown = %d/%+v/%v/%d/%d",
+			ev.StatusCode, ev.Error, ev.Duration, ev.BytesUp, ev.BytesDown)
+	}
+	if !ev.Tunnel || ev.TunnelReason != pipeline.TunnelWebSocket || ev.Identity == nil || ev.Client == nil {
+		t.Errorf("Tunnel/TunnelReason/Identity/Client = %v/%q/%+v/%+v", ev.Tunnel, ev.TunnelReason, ev.Identity, ev.Client)
+	}
+	if ev.Subagent != "a1a2e36cb5946f31c" || ev.ParentSubagent != "a0974b0b8591dc76b" || ev.Proc != "100.200" {
+		t.Errorf("Subagent/ParentSubagent/Proc = %q/%q/%q", ev.Subagent, ev.ParentSubagent, ev.Proc)
+	}
+	// Nothing runs on a tunnel's response, and the open row carries the dial address.
+	if ev.Invocations != nil || ev.Plugins != nil || ev.DialAddr != "" || ev.ClientProc != "" ||
+		ev.SessionHeader != "" || ev.TLS != nil || ev.RequestedHost != "" {
+		t.Errorf("close row carries fields it must not: %+v", ev)
+	}
+}

@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 
 	"github.com/rossoctl/cortex/core/cost/event"
-	"github.com/rossoctl/cortex/core/pipeline"
+	"github.com/rossoctl/cortex/core/model"
 )
 
 // BeginReplay starts a replay that runs alongside live traffic, and returns the private aggregator
@@ -93,7 +93,7 @@ func (a *Aggregator) logReplayLocked(op func(*Aggregator)) {
 // Feed events in ascending At order. Record pairs a request with the response after it, and
 // reclaims the least recently written session ring at the cap, so that order is what makes the
 // replayed ring the one the old process had.
-func (a *Aggregator) Replay(sessionID string, e *pipeline.SessionEvent) bool {
+func (a *Aggregator) Replay(sessionID string, e *model.SessionEvent) bool {
 	if e == nil || e.At.IsZero() {
 		return false
 	}
@@ -114,15 +114,16 @@ func (a *Aggregator) Replay(sessionID string, e *pipeline.SessionEvent) bool {
 // A COPY WITH THE HEAVY FIELDS CLEARED, NOT A COPY OF THE FIELDS RECORD READS, so a field Record
 // starts reading later is kept without anyone remembering to add it here. What is cleared is what
 // Record has no use for: the protocol payloads, the conversation, the tool manifest, the completion
-// and its tool calls, and every plugin entry but the cost record. TestReplayCopy_RecordsWhatTheEventDoes
+// and its tool calls, the tool calls and results the request re-sends, and every plugin entry but
+// the cost record. TestReplayCopy_RecordsWhatTheEventDoes
 // holds that.
-func ReplayCopy(e *pipeline.SessionEvent) pipeline.SessionEvent {
+func ReplayCopy(e *model.SessionEvent) model.SessionEvent {
 	c := *e
 	c.A2A, c.MCP = nil, nil
 	if e.Inference != nil {
 		inf := *e.Inference
 		inf.Messages, inf.Tools, inf.ToolChoice, inf.ToolCalls, inf.Completion = nil, nil, nil, nil, ""
-		inf.ToolResults = nil
+		inf.ToolResults, inf.HistoryToolCalls = nil, nil
 		c.Inference = &inf
 	}
 	c.Plugins = nil

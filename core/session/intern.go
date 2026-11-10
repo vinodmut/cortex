@@ -4,7 +4,7 @@ import (
 	"hash/fnv"
 	"slices"
 
-	"github.com/rossoctl/cortex/core/pipeline"
+	"github.com/rossoctl/cortex/core/model"
 )
 
 // Repeated message content is stored once per session, not once per event.
@@ -23,7 +23,8 @@ import (
 // the same bytes it always did.
 //
 // SCOPE: string fields only — inference messages and completions, tool results (content
-// by the threshold, ToolUseID below it via internID), A2A part content, and the tool
+// by the threshold, ToolUseID below it via internID), the history tool calls' arguments
+// (ids and names via internID), A2A part content, and the tool
 // manifest's descriptions AND schemas. Tool results repeat exactly as
 // the conversation does: a client re-sends every earlier one on every request. The manifest
 // earns its place: a client re-sends it on every request, so it duplicates harder than
@@ -36,7 +37,7 @@ import (
 // too. They used to be map[string]any, which is what put them out of reach: a walk that
 // rewrites map values cannot lean on string immutability the way this does, so it needs
 // its own reasoning about aliasing. Rather than write that walk, the FIELD changed — it is
-// a pipeline.RawJSON, a named string type, so it interns here like any other string and
+// a model.RawJSON, a named string type, so it interns here like any other string and
 // the aliasing question never arises. Two measurements motivated it: the schemas were
 // 34.7% of that 10.3MB, and as maps they cost 4.1x their JSON text to hold — 84KB per
 // event on a live session, ~172MB across one 2050-event session.
@@ -52,7 +53,7 @@ const (
 	// constantly and all cost less to duplicate than to hash. The savings live in
 	// message bodies, which are orders of magnitude past this.
 	//
-	// Exported for the session archive, which deduplicates the same six fields on disk
+	// Exported for the session archive, which deduplicates the same seven fields on disk
 	// and must agree with the store on what is worth sharing — one threshold, not two
 	// numbers kept equal by hand.
 	InternMinLen = 64
@@ -123,9 +124,10 @@ type Interner struct {
 // content event, and its growing message arrays. The zero value is ready.
 type convState struct {
 	strings map[string]string
-	msgs    []pipeline.InferenceMessage
-	tools   []pipeline.InferenceTool
-	results []pipeline.InferenceToolResult
+	msgs    []model.InferenceMessage
+	tools   []model.InferenceTool
+	results []model.InferenceToolResult
+	calls   []model.InferenceToolCall
 }
 
 // conversationKeys separates the conversations sharing one session bucket:
@@ -147,7 +149,7 @@ type convState struct {
 //
 // The keys are fresh 8-byte strings: hashing reads the contents, it does not
 // retain them.
-func conversationKeys(inf *pipeline.InferenceExtension) (full, base string) {
+func conversationKeys(inf *model.InferenceExtension) (full, base string) {
 	h := fnv.New64a()
 	_, _ = h.Write([]byte(inf.Model))
 	_, _ = h.Write([]byte{0})
@@ -166,7 +168,7 @@ func conversationKeys(inf *pipeline.InferenceExtension) (full, base string) {
 // extends what that state holds, and a fresh split state when it does not —
 // a sibling conversation sharing the model and system prompt but carrying a
 // different task, which must not thrash the original's arrays.
-func (in *Interner) stateForEvent(inf *pipeline.InferenceExtension) *convState {
+func (in *Interner) stateForEvent(inf *model.InferenceExtension) *convState {
 	full, base := conversationKeys(inf)
 	if st, ok := in.convs[full]; ok {
 		in.touchLRU(full)
@@ -255,10 +257,11 @@ func (st *convState) intern(s string, next map[string]string) string {
 
 // internID is intern without the length floor, for identifiers that repeat
 // exactly as message content does while being far shorter than InternMinLen.
-// ToolUseID and the message Role are the two today: a "toolu_…" id is ~20
-// bytes and a role ~5, but a client re-sends every earlier tool result and
-// message on every request, so both duplicate as hard as the conversation
-// does — the Role duplication alone was ~15 million strings on one measured
+// ToolUseID, the message Role, its ToolCallNames and ToolUseIDs, and a history tool call's
+// ID and Name are the ones today: a
+// "toolu_…" id is ~20 bytes and a role ~5, but a client re-sends every earlier
+// tool result and message on every request, so they duplicate as hard as the
+// conversation does — the Role duplication alone was ~15 million strings on one measured
 // 30-day archive (#1541). Only the empty string is beneath sharing, because
 // it is the one value every absent id shares for no reason.
 //
@@ -304,7 +307,7 @@ func (st *convState) internID(s string, next map[string]string) string {
 // Cloning costs one slice copy per event and nothing in steady state: the original array
 // becomes garbage when the request completes, and the store then owns everything it
 // mutates.
-func (in *Interner) InternEvent(e *pipeline.SessionEvent) {
+func (in *Interner) InternEvent(e *model.SessionEvent) {
 	// An event with nothing to intern must leave the tables ALONE rather than roll an
 	// empty one forward. Rolling is what makes turn N share with turn N-1, and a session's
 	// events are not all turns: a CONNECT tunnel-open, a denial, an MCP call all carry
@@ -341,6 +344,8 @@ func (in *Interner) InternEvent(e *pipeline.SessionEvent) {
 		// Tool results repeat like the conversation — every request re-sends all
 		// of them — and alias across both phases of a request the same way.
 		cp.ToolResults = shareToolResults(st, e.Inference.ToolResults, next)
+		// The calls those results answer are re-sent the same way.
+		cp.HistoryToolCalls = shareToolCalls(st, e.Inference.HistoryToolCalls, next)
 		e.Inference = &cp
 	}
 	if e.A2A != nil {
@@ -383,7 +388,7 @@ func (in *Interner) InternEvent(e *pipeline.SessionEvent) {
 //     canonicalized into a fresh tail and the state's array is rebased to it.
 //     The event's slice and the state's diverge from here on, exactly as they
 //     do for strings that disappear and come back.
-func shareMessages(st *convState, msgs []pipeline.InferenceMessage, next map[string]string) []pipeline.InferenceMessage {
+func shareMessages(st *convState, msgs []model.InferenceMessage, next map[string]string) []model.InferenceMessage {
 	k := 0
 	// Struct ==, not a field list: a field added to InferenceMessage joins the
 	// comparison by itself, and a non-comparable one breaks the build rather
@@ -395,6 +400,8 @@ func shareMessages(st *convState, msgs []pipeline.InferenceMessage, next map[str
 		// the arriving one, so a miss cannot pin a duplicate no event holds.
 		st.intern(st.msgs[k].Content, next)
 		st.internID(st.msgs[k].Role, next)
+		st.internID(st.msgs[k].ToolCallNames, next)
+		st.internID(st.msgs[k].ToolUseIDs, next)
 		k++
 	}
 	if k == len(msgs) {
@@ -404,10 +411,12 @@ func shareMessages(st *convState, msgs []pipeline.InferenceMessage, next map[str
 		return st.msgs[:k]
 	}
 	if k == len(st.msgs) {
-		tail := make([]pipeline.InferenceMessage, len(msgs)-k)
+		tail := make([]model.InferenceMessage, len(msgs)-k)
 		for i := range tail {
 			tail[i] = msgs[k+i]
 			tail[i].Role = st.internID(tail[i].Role, next)
+			tail[i].ToolCallNames = st.internID(tail[i].ToolCallNames, next)
+			tail[i].ToolUseIDs = st.internID(tail[i].ToolUseIDs, next)
 			tail[i].Content = st.intern(tail[i].Content, next)
 		}
 		st.msgs = append(st.msgs, tail...)
@@ -416,11 +425,13 @@ func shareMessages(st *convState, msgs []pipeline.InferenceMessage, next map[str
 	// Partial match: rebuild from the verified prefix, CANONICAL side first —
 	// copying the arriving elements instead would retain the event's own wire
 	// copy of every prefix string alongside the canonical one.
-	out := make([]pipeline.InferenceMessage, len(msgs))
+	out := make([]model.InferenceMessage, len(msgs))
 	copy(out, st.msgs[:k])
 	for i := k; i < len(msgs); i++ {
 		out[i] = msgs[i]
 		out[i].Role = st.internID(out[i].Role, next)
+		out[i].ToolCallNames = st.internID(out[i].ToolCallNames, next)
+		out[i].ToolUseIDs = st.internID(out[i].ToolUseIDs, next)
 		out[i].Content = st.intern(out[i].Content, next)
 	}
 	st.msgs = out
@@ -428,7 +439,7 @@ func shareMessages(st *convState, msgs []pipeline.InferenceMessage, next map[str
 }
 
 // shareTools is shareMessages for the tool manifest.
-func shareTools(st *convState, tools []pipeline.InferenceTool, next map[string]string) []pipeline.InferenceTool {
+func shareTools(st *convState, tools []model.InferenceTool, next map[string]string) []model.InferenceTool {
 	k := 0
 	for k < len(tools) && k < len(st.tools) && tools[k] == st.tools[k] {
 		st.intern(st.tools[k].Description, next)
@@ -439,30 +450,30 @@ func shareTools(st *convState, tools []pipeline.InferenceTool, next map[string]s
 		return st.tools[:k]
 	}
 	if k == len(st.tools) {
-		tail := make([]pipeline.InferenceTool, len(tools)-k)
+		tail := make([]model.InferenceTool, len(tools)-k)
 		for i := range tail {
 			tail[i] = tools[k+i]
 			tail[i].Name = st.internID(tail[i].Name, next)
 			tail[i].Description = st.intern(tail[i].Description, next)
-			tail[i].Parameters = pipeline.RawJSON(st.intern(string(tail[i].Parameters), next))
+			tail[i].Parameters = model.RawJSON(st.intern(string(tail[i].Parameters), next))
 		}
 		st.tools = append(st.tools, tail...)
 		return st.tools
 	}
-	out := make([]pipeline.InferenceTool, len(tools))
+	out := make([]model.InferenceTool, len(tools))
 	copy(out, st.tools[:k])
 	for i := k; i < len(tools); i++ {
 		out[i] = tools[i]
 		out[i].Name = st.internID(out[i].Name, next)
 		out[i].Description = st.intern(out[i].Description, next)
-		out[i].Parameters = pipeline.RawJSON(st.intern(string(out[i].Parameters), next))
+		out[i].Parameters = model.RawJSON(st.intern(string(out[i].Parameters), next))
 	}
 	st.tools = out
 	return out
 }
 
 // shareToolResults is shareMessages for tool results.
-func shareToolResults(st *convState, results []pipeline.InferenceToolResult, next map[string]string) []pipeline.InferenceToolResult {
+func shareToolResults(st *convState, results []model.InferenceToolResult, next map[string]string) []model.InferenceToolResult {
 	k := 0
 	for k < len(results) && k < len(st.results) && results[k] == st.results[k] {
 		st.intern(st.results[k].Content, next)
@@ -473,7 +484,7 @@ func shareToolResults(st *convState, results []pipeline.InferenceToolResult, nex
 		return st.results[:k]
 	}
 	if k == len(st.results) {
-		tail := make([]pipeline.InferenceToolResult, len(results)-k)
+		tail := make([]model.InferenceToolResult, len(results)-k)
 		for i := range tail {
 			tail[i] = results[k+i]
 			tail[i].ToolUseID = st.internID(tail[i].ToolUseID, next)
@@ -482,7 +493,7 @@ func shareToolResults(st *convState, results []pipeline.InferenceToolResult, nex
 		st.results = append(st.results, tail...)
 		return st.results
 	}
-	out := make([]pipeline.InferenceToolResult, len(results))
+	out := make([]model.InferenceToolResult, len(results))
 	copy(out, st.results[:k])
 	for i := k; i < len(results); i++ {
 		out[i] = results[i]
@@ -490,5 +501,40 @@ func shareToolResults(st *convState, results []pipeline.InferenceToolResult, nex
 		out[i].Content = st.intern(out[i].Content, next)
 	}
 	st.results = out
+	return out
+}
+
+// shareToolCalls is shareMessages for the history tool calls.
+func shareToolCalls(st *convState, calls []model.InferenceToolCall, next map[string]string) []model.InferenceToolCall {
+	k := 0
+	for k < len(calls) && k < len(st.calls) && calls[k] == st.calls[k] {
+		st.intern(st.calls[k].Arguments, next)
+		st.internID(st.calls[k].ID, next)
+		st.internID(st.calls[k].Name, next)
+		k++
+	}
+	if k == len(calls) {
+		return st.calls[:k]
+	}
+	canon := func(c model.InferenceToolCall) model.InferenceToolCall {
+		c.ID = st.internID(c.ID, next)
+		c.Name = st.internID(c.Name, next)
+		c.Arguments = st.intern(c.Arguments, next)
+		return c
+	}
+	if k == len(st.calls) {
+		tail := make([]model.InferenceToolCall, len(calls)-k)
+		for i := range tail {
+			tail[i] = canon(calls[k+i])
+		}
+		st.calls = append(st.calls, tail...)
+		return st.calls
+	}
+	out := make([]model.InferenceToolCall, len(calls))
+	copy(out, st.calls[:k])
+	for i := k; i < len(calls); i++ {
+		out[i] = canon(calls[i])
+	}
+	st.calls = out
 	return out
 }

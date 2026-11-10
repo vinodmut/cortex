@@ -139,6 +139,33 @@ func TestParity_OutboundDenyOnRequest(t *testing.T) {
 	assertParity(t, f, pipeline.SessionDenied, outboundListeners)
 }
 
+// TestParity_InboundResponseDenyRecordsNoRow: a plugin rejects the response
+// on the inbound path. Neither extproc nor the reverse proxy records a denied
+// row. The reverse proxy's errorHandler writes the rejection and returns, and
+// extproc's response handlers return rejectFromAction. The forward proxy is
+// the one listener that records this deny, and
+// TestDivergence_OutboundResponseDeny pins that difference. This fixture pins
+// the inbound half, so that a change to either inbound leg is a decision. The
+// reverse proxy's missing row is a known gap, a sibling of #1045
+// (reverseproxy errorHandler says so).
+func TestParity_InboundResponseDenyRecordsNoRow(t *testing.T) {
+	f := fixture{
+		name:      "inbound-response-deny",
+		direction: pipeline.Inbound,
+		entries: []config.PluginEntry{spyEntry(spyPluginA, spyConfig{
+			DenyOnResponse: true,
+			DenyStatus:     403,
+			DenyReason:     "spy.response-blocked",
+		})},
+		method:             "GET",
+		path:               "/parity/response-deny",
+		upstreamStatus:     200,
+		unrecordedBy:       map[string]bool{"extproc": true, "reverseproxy": true},
+		expectedWireStatus: 403,
+	}
+	assertParity(t, f, pipeline.SessionDenied, inboundListeners)
+}
+
 // TestParity_ReadsBodyBufferedJSON: with ReadsBody set, both listeners
 // present the plugin with the same request and response body bytes,
 // despite extproc's two-phase handshake vs. the proxies' in-process
@@ -1087,6 +1114,12 @@ func observationDiff(a, b *observation) string {
 	// without a failure anywhere.
 	if !reflect.DeepEqual(a.Inference, b.Inference) {
 		return "Inference: " + jsonPretty(a.Inference) + " vs " + jsonPretty(b.Inference)
+	}
+	if a.A2AMethod != b.A2AMethod {
+		return fmt.Sprintf("A2AMethod: %q vs %q", a.A2AMethod, b.A2AMethod)
+	}
+	if a.MCPMethod != b.MCPMethod {
+		return fmt.Sprintf("MCPMethod: %q vs %q", a.MCPMethod, b.MCPMethod)
 	}
 	// Compare per-plugin JSON payloads structurally to tolerate
 	// whitespace and map-order differences between listeners.

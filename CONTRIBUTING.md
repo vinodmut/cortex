@@ -17,6 +17,10 @@ Comment `/claim` on an issue to have it automatically assigned to you. Issues la
 ## Prerequisites
 
 - **Go 1.26.10+** (matches `go.work`)
+- **Xcode Command Line Tools on macOS** (`xcode-select --install`). `/usr/bin/make` is a
+  shim for them, so without them `make` fails before it reads the Makefile. In a sandbox
+  that blocks `/var/select/`, the same `xcode-select: error` shows even when the tools are
+  installed. There, run the Makefile's `go build` commands directly.
 - **Python 3.12+** (for `keycloak_sync.py` and the demo setup scripts)
 - **Docker or Podman** (for building container images)
 - **pre-commit** (for local hooks)
@@ -106,7 +110,7 @@ out to be one of these six.
 
 **4. Deploy a workload.** Use a demo rather than hand-written manifests; they
 are kept current, and the manual path is not. Start from
-[`demos/README.md`](demos/README.md).
+[`cortex-demos/README.md`](https://github.com/rossoctl/cortex-demos/blob/main/README.md).
 
 ## Installing an unreleased build
 
@@ -339,7 +343,8 @@ The prefix also decides where the PR appears in the release notes, which
 `scripts/release_notes.sh` builds from the PRs merged since the previous
 release: `Feat`/`Feature` under New features, `Fix`/`Bug fix`/`Perf` under Bug
 fixes, `Breaking change` (or a `!` before the colon) under Breaking changes,
-and everything else under a collapsed Other changes.
+`(deps)` titles and dependabot PRs under a folded Dependency updates, and
+everything else under a collapsed Other changes.
 
 ## Pull Requests
 
@@ -359,7 +364,7 @@ Smaller pull requests are typically easier to review and merge. If your pull req
   Always give `gofmt` a path — a bare `gofmt -l` reads stdin, so it scans nothing
   and exits 0. `gofmt -l .` also lists any pre-existing offenders, so check the
   names it prints are yours.
-- `go vet` is gated: all five `Go CI (…)` jobs run it, and a finding fails the job.
+- `go vet` is gated: every `Go CI (…)` job runs it, on all 7 modules, and a finding fails the job.
   `gofmt` is not — CI's lint step runs `go fmt`, which rewrites files and exits 0,
   so unformatted code still goes green. There are no Go hooks in pre-commit either.
 - Run per-module with `GOWORK=off` — how the root Makefile builds, and how every
@@ -367,6 +372,14 @@ Smaller pull requests are typically easier to review and merge. If your pull req
 - If your change deletes a package or its last import of a dependency, also run
   `go mod tidy -diff` in every module — CI gates on it, and `build`/`vet`/`test`
   all pass while it fails.
+- `cmd/agentop`'s tests run one at a time, and a full run takes about 6 minutes on a
+  Mac. `scripts/dev/go-test-shards.sh cmd/agentop` runs them as parallel processes
+  (about 2 minutes). Add `-short` while you change code (about 20 s): it skips the
+  setup, service, doctor and uninstall scenes. The script tests only the root package.
+  Before you push, and whenever you change the code those scenes test, run the full
+  suite with `-race`. Then, from `cmd/agentop`, run the subpackages with
+  `go test -race $(go list ./... | grep -v 'agentop$')`. CI always runs
+  `go test -race ./...`.
 - Apache 2.0 license header in all Go files
 
 ### Python Code (keycloak_sync.py, sparc-service, demo scripts)

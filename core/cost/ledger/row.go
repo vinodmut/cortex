@@ -47,12 +47,12 @@ package ledger
 import (
 	"strings"
 	"time"
-	"unicode/utf8"
 
+	"github.com/rossoctl/cortex/core/cost/event"
 	"github.com/rossoctl/cortex/core/cost/pricing"
 	"github.com/rossoctl/cortex/core/cost/usage"
 
-	"github.com/rossoctl/cortex/core/pipeline"
+	"github.com/rossoctl/cortex/core/model"
 )
 
 // Row is one minute's totals for one (endpoint, model, agent, provenance) key.
@@ -76,7 +76,7 @@ type Row struct {
 	Model    string `json:"model,omitempty"`
 	// Agent identifies the calling coding agent, as "name/version" —
 	// "claude-code/2.1.14" — or as its raw User-Agent when the parser did not
-	// recognise it. Populated from pipeline.EventClient.Label; see Writer.Record.
+	// recognise it. Populated from model.EventClient.Label; see Writer.Record.
 	//
 	// CLIENT-ASSERTED AND TRIVIALLY SPOOFABLE, because it is derived from a request
 	// header: a cost-attribution and display key, never an authorization subject.
@@ -165,11 +165,9 @@ func (r Row) key() key {
 	return key{r.Endpoint, r.Model, r.Agent, r.Provenance, strings.ToLower(r.currencyOrUSD())}
 }
 
-// maxLabelLen bounds one label ON DISK, and it is the same 96 bytes
-// usage.maxLabelLen applies to the same two request-controlled fields — the value
-// is matched deliberately rather than chosen again, so a model name is spelled
-// identically in the ring and in the ledger and group=model answers the same from
-// either source.
+// maxLabelLen bounds one label ON DISK. It is event.MaxLabelLen, so a model name is
+// spelled identically in the ring and in the ledger and group=model answers the same
+// from either source.
 //
 // Load-bearing here for a reason the ring does not have: these strings are WRITTEN
 // TO AN APPEND-ONLY FILE that is retained for retentionDays. Model comes straight
@@ -186,141 +184,26 @@ func (r Row) key() key {
 // which is what turns readDay's over-long-line guard from a live failure mode into
 // the last-resort guard for a file some other process corrupted.
 // TestRecord_LabelsAreCappedSoALineCanNeverExceedTheReadLimit pins the arithmetic.
-// Pinned to usage.MaxLabelLen by TestMaxLabelLen_MatchesTheRingItMirrors — which is a real
-// comparison now that the other side is exported, rather than a third copy of the literal.
-const maxLabelLen = 96
+const maxLabelLen = event.MaxLabelLen
 
-// truncateLabel caps one label at maxLabelLen BYTES, cut on a RUNE boundary.
+// rowLabel prepares one string for a durable row: sanitized, then capped at maxLabelLen
+// bytes on a rune boundary.
 //
-// THE CAP STAYS IN BYTES because bytes are what it bounds: the length of a line in an
-// append-only file, and through that the reachability of readDay's unskippable-line
-// path. Cutting on a rune boundary moves where that cap lands by at most three bytes
-// and does not weaken it.
-//
-// NOT A PLAIN BYTE CUT, which would halve whatever rune straddles byte 96 and leave an
-// invalid UTF-8 sequence in a DURABLE file that other tools parse — most readily on exactly
-// the labels this package rewrites, since sanitizeLabel emits 3-byte U+FFFD runes and
-// rowLabel cuts afterwards. "A model name is effectively always ASCII" is a caller's choice
-// rather than a fact, and pipeline.capUA cuts on a rune boundary too, so one rule still
-// covers both.
-//
-// usage.truncateLabel is the remaining byte cut, on the ring's in-memory copies of the same
-// labels. Named rather than silently diverged from: it is a different package's file, its
-// strings die with the process, and the fix belongs with its owner.
-func truncateLabel(s string) string {
-	if len(s) <= maxLabelLen {
-		return s
-	}
-	cut := maxLabelLen
-	// Walk back off a continuation byte; at most three steps, since no UTF-8 sequence
-	// is longer than four bytes.
-	for cut > 0 && !utf8.RuneStart(s[cut]) {
-		cut--
-	}
-	return s[:cut]
-}
-
-// sanitizeLabel replaces C0 controls, DEL and C1 controls with U+FFFD.
-//
-// These strings are request- or upstream-controlled — Endpoint is the host the
-// workload asked for and Model comes straight off the parsed request body — and they
-// are written to a DURABLE file that an operator cats and that other tools parse. An
-// escape sequence in a model name repositions the cursor, recolours the pane or erases
-// the line that reports it, for every future read of a file that is retained for
-// retentionDays and cannot be edited. CWE-150.
-//
-// REPLACED, NOT DROPPED, so tampering is visible instead of collapsing into a
-// plausible-looking label: "m\x1b[31mx" reads as "m�[31mx" rather than as "m[31mx",
-// which nobody would question.
-//
-// C1 IS INCLUDED — U+0080–U+009F — and so are the bidi and zero-width runes; isControlRune
-// names the set and pipeline.sanitizeUA carries the full argument for it. The short version:
-// U+009B is a single-character CSI, so a byte scan for anything below 0x20 steps straight past
-// a working escape sequence. An invalid byte is replaced too, so the label held in memory, the
-// label served, and the label encoding/json would have written are one string, not three.
-//
-// SHARED RULE, ONE DEFINITION, THREE SANITISERS AROUND IT:
-//
-//   - pipeline.sanitizeUA is the PRIMARY guard for the Agent label. It sits in
-//     ParseUserAgent, where a User-Agent header becomes a value, so it covers the live
-//     usage aggregator as well as this file — one choke point for both consumers of
-//     EventClient.Label rather than one fix per consumer.
-//   - THIS one is the primary guard for Endpoint, Model and Provenance, which never pass
-//     through that parser, and defence in depth for Agent. It stays for that reason
-//     rather than out of habit: it is the copy in front of a file that is retained for
-//     retentionDays and cannot be edited afterwards, so it is the one that has to hold
-//     even if a future edit weakens the other.
-//   - agentop's tui.sanitizeLabel is a third copy, at RENDER time, in a main module this
-//     library must not import. It still filters C0 and DEL only — named here because a
-//     divergence stated is a divergence someone can fix.
-//
-// WHICH RUNES COUNT is not copied any more: it is pipeline.IsControlRune, imported by this
-// package and by usage, so there is one definition repo-wide. This comment used to say the
-// rule had to be duplicated to avoid a dependency edge the wrong way round — it does not;
-// nothing in pipeline imports either of us. Three byte-identical copies lived on that
-// sentence, and only pipeline's was tested against the bidi marks.
-//
-// NOT a JSON-integrity guard — encoding/json escapes control bytes, so an unsanitised
-// label could never split a line or break readDay. Every consumer downstream of the
-// decode is what this protects.
-//
-// AND THE DIVERGENCE THIS USED TO WARN ABOUT IS CLOSED. It read "usage (the ring) does not
-// sanitise, so a label carrying control bytes is spelled differently in the two halves and
-// group=model would show it as two series" — the ring sanitises now, with the same predicate,
-// so one hostile label is one series in both halves. agentop's render-time copy is the only
-// remaining narrower filter, and it is named above rather than left to be discovered.
-func sanitizeLabel(s string) string {
-	if !hasControlRunes(s) {
-		// The overwhelmingly common case, and no allocation for it: this runs on the
-		// session-append path, under the store's write lock.
-		return s
-	}
-	var b strings.Builder
-	b.Grow(len(s))
-	for i := 0; i < len(s); {
-		r, size := utf8.DecodeRuneInString(s[i:])
-		if pipeline.IsControlRune(r) || (r == utf8.RuneError && size == 1) {
-			b.WriteRune('\uFFFD')
-			i += size
-			continue
-		}
-		b.WriteString(s[i : i+size])
-		i += size
-	}
-	return b.String()
-}
-
-// hasControlRunes reports whether s carries anything sanitizeLabel would replace.
-//
-// A RUNE scan, and it has to be one. A byte scan is exact for C0 and DEL — no continuation
-// byte of a multi-byte UTF-8 sequence is below 0x80, so a byte below 0x20 can only be that
-// character itself — and blind to C1, which lives entirely above 0x80, which is what lets
-// U+009B through. The tests read this as the "did anything hostile reach disk" predicate, so
-// it has to name the same set the rewrite replaces.
-//
-// An INVALID byte reports true (RuneError at size 1 is the decoder saying "this is not
-// UTF-8"); a legitimately encoded U+FFFD does not, because it decodes at size 3 — so an
-// already-sanitised label does not read as still hostile.
-func hasControlRunes(s string) bool {
-	for i := 0; i < len(s); {
-		r, size := utf8.DecodeRuneInString(s[i:])
-		if pipeline.IsControlRune(r) || (r == utf8.RuneError && size == 1) {
-			return true
-		}
-		i += size
-	}
-	return false
-}
-
-// rowLabel prepares one string for a durable row: sanitised, then capped.
+// These strings are request- or upstream-controlled — Endpoint is the host the workload
+// asked for and Model comes straight off the parsed request body — and they are written to
+// a DURABLE file that an operator cats and that other tools parse. An escape sequence in a
+// model name repositions the cursor, recolors the pane or erases the line that reports it,
+// for every future read of a file that is retained for retentionDays and cannot be edited.
+// CWE-150. This is the primary guard for Endpoint, Model and Provenance, and defence in
+// depth for Agent, which model.ParseUserAgent already sanitized.
 //
 // THE ORDER MATTERS. Sanitising can triple a string's length — every replaced byte becomes
 // three — so capping first would let a label of 96 control bytes reach 288 on disk and break
-// the line-length arithmetic maxLabelLen exists to guarantee. Capping last is only safe
-// because truncateLabel cuts on a rune boundary: a byte cut here would split one of
-// sanitizeLabel's own U+FFFD runes and put an invalid UTF-8 fragment in a durable row.
+// the line-length arithmetic maxLabelLen exists to guarantee. The cap cuts on a rune
+// boundary, so it cannot split one of the sanitizer's own U+FFFD runes and put an invalid
+// UTF-8 fragment in a durable row.
 func rowLabel(s string) string {
-	return truncateLabel(sanitizeLabel(s))
+	return model.TruncateLabel(model.SanitizeControlRunes(s), maxLabelLen)
 }
 
 // maxLabelsPerMinute caps how many DISTINCT rows one open minute accumulates, and

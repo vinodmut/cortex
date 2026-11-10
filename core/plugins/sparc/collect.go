@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"path"
-	"strings"
 
 	"github.com/rossoctl/cortex/core/pipeline"
 )
@@ -17,14 +16,11 @@ import (
 // (no inference-parser, or session tracking off) so the caller can skip rather
 // than reflect on partial data.
 func correlateInferenceContext(pctx *pipeline.Context) (messages, toolSpecs []map[string]any, ok bool) {
-	if pctx.Session == nil {
+	last := pctx.LastInference()
+	if last.Event == nil {
 		return nil, nil, false
 	}
-	infs := pctx.Session.InferenceRequests()
-	if len(infs) == 0 {
-		return nil, nil, false
-	}
-	inf := infs[len(infs)-1].Inference
+	inf := last.Event.Inference
 	if inf == nil || len(inf.Messages) == 0 {
 		return nil, nil, false
 	}
@@ -112,10 +108,7 @@ func mcpRPCID(mcp *pipeline.MCPExtension) any {
 }
 
 func sessionID(pctx *pipeline.Context) string {
-	if pctx.Session != nil {
-		return pctx.Session.ID
-	}
-	return ""
+	return pctx.SessionID
 }
 
 func firstExplanation(verdict ReflectVerdict) string {
@@ -142,17 +135,6 @@ func anyGlobMatch(patterns []string, name string) bool {
 		}
 	}
 	return false
-}
-
-// matchesAnyHost reports whether host matches any glob (path.Match), port stripped.
-func matchesAnyHost(patterns []string, host string) bool {
-	if host == "" {
-		return false
-	}
-	if i := strings.IndexByte(host, ':'); i >= 0 {
-		host = host[:i]
-	}
-	return anyGlobMatch(patterns, host)
 }
 
 // preview truncates s to n runes, appending an ellipsis when truncated.

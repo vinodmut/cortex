@@ -6,9 +6,9 @@
 // request addressed to a server's host is routed, and so is a routed agent's
 // inference request addressed anywhere else — its provider, Anthropic, OpenCode Zen,
 // Bob's gateway — which is captured: sent to the agent's server at the server's path
-// for its API format (see capturedPaths), by how the path the agent named ends.
-// Only a POST inference-parser read as inference is captured, since an agent's own
-// tools can POST to an API whose path happens to end the same way.
+// for its API format (see session.CapturePath), by how the path the agent named
+// ends. Only a POST inference-parser read as inference is captured, since an agent's
+// own tools can POST to an API whose path happens to end the same way.
 //
 // The choice is plugin config — servers by name, and agents by name to a server —
 // changed by editing it and letting the proxy hot-reload. Sessions are pinned in the
@@ -125,20 +125,20 @@
 package inferencerouter
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"net/url"
-	"slices"
-	"strings"
 	"sync"
 	"time"
 
 	"github.com/rossoctl/cortex/core/pipeline"
 	"github.com/rossoctl/cortex/core/plugins"
 	"github.com/rossoctl/cortex/core/plugins/inferencerouter/routerconfig"
+	"github.com/rossoctl/cortex/core/redact"
 	"github.com/rossoctl/cortex/core/session"
 	"github.com/rossoctl/cortex/core/storage"
 )
@@ -154,7 +154,7 @@ const (
 	// request renews it, so only a session idle this long forgets its server.
 	pinTTL = 30 * 24 * time.Hour
 
-	// historyLimit is how many of a session's archived events wentTo reads, newest
+	// historyLimit is how many of a session's archived events wentToView reads, newest
 	// first, before it stops looking: the archive is read from disk on the request
 	// path.
 	historyLimit = 2000
@@ -176,8 +176,8 @@ const (
 // The turn detail on a not-routed record, where the request's own turn decided an
 // unpinned Claude Code session.
 const (
-	turnContinuation = "continuation" // a conversation the router did not see begin
-	turnAside        = "aside"        // a one-shot or a subagent's request, which decides nothing
+	turnContinuation = session.TurnContinuation
+	turnAside        = session.TurnAside
 )
 
 // route is one configured server, ready to redirect to.
@@ -235,7 +235,8 @@ func New() *Router { return &Router{now: time.Now} }
 func (p *Router) SetStore(st storage.Store) { p.store = st }
 
 // SetHistory implements session.HistoryConsumer: the router reads a session's archived
-// events for where it went before this process (see wentTo).
+// events for where it went before this process, when the listener gives no table it can
+// vouch for (see wentTo).
 func (p *Router) SetHistory(h session.History) { p.history = h }
 
 func init() {
@@ -359,39 +360,42 @@ func (p *Router) OnRequest(_ context.Context, pctx *pipeline.Context) pipeline.A
 	// Redirected even when the Host header already names the server: the listener
 	// dials the redirect target, and without one it dials what the client chose,
 	// which on a bridged request is the CONNECT authority and not the Host header.
-	if err := pctx.Redirect(srv.target()); err != nil {
-		// The request went nowhere, so a first request pins nothing: pinning the server
-		// would hold the session to one it never reached, and the next request can
-		// decide again.
-		pin.forgo()
-		pctx.Record(pipeline.Invocation{Action: pipeline.ActionDeny, Reason: "redirect_failed", Details: details()})
-		return pipeline.Deny(codeUnavailable, fmt.Sprintf("inference-router could not send this request to %q: %v", name, err))
-	}
+	redirectErr := pctx.Redirect(srv.target())
 	// Redirect returns nil under on_error: observe without moving anything. The
 	// server's key must then stay off the request, which still goes where the client
 	// sent it. Redirected is the signal that it moved, and it is this router's
 	// redirect: a pipeline admits one WritesDestination plugin.
-	if !pctx.Redirected() {
-		// The request stayed put, so that is what a first request pins: a session that
-		// started under observe stays put once enforce is on. A session an override
-		// would have moved keeps its pin instead: nothing moved — this is observe —
-		// and the pin is the state the move, once enforce is on, will replace.
-		if pin.state == pinMoved {
-			pin.forgo()
-		} else {
+	redirected := redirectErr == nil && pctx.Redirected()
+	var pathErr error
+	if redirected && captured != "" {
+		// The table's paths are absolute with no query, so this is refused only by a
+		// drift between the table and SetRedirectPath's rule.
+		pathErr = pctx.SetRedirectPath(captured)
+	}
+	err := cmp.Or(redirectErr, pathErr)
+	outcome := redirectMoved
+	switch {
+	case err != nil:
+		outcome = redirectFailed
+	case !redirected:
+		outcome = redirectStayed
+	}
+	// decideSettle says what the outcome does to the pin. Forgo comes before each
+	// record, because forgo changes the pin state that details shows.
+	settle := decideSettle(pin.state, outcome)
+	if !settle {
+		pin.forgo()
+	}
+	if err != nil {
+		pctx.Record(pipeline.Invocation{Action: pipeline.ActionDeny, Reason: "redirect_failed", Details: details()})
+		return pipeline.Deny(codeUnavailable, fmt.Sprintf("inference-router could not send this request to %q: %v", name, err))
+	}
+	if !redirected {
+		if settle {
 			pin.settle("")
 		}
 		pctx.Record(pipeline.Invocation{Action: pipeline.ActionObserve, Reason: "would_route", Details: details()})
 		return cont
-	}
-	if captured != "" {
-		// The table's paths are absolute with no query, so this is refused only by a
-		// drift between the table and SetRedirectPath's rule.
-		if err := pctx.SetRedirectPath(captured); err != nil {
-			pin.forgo()
-			pctx.Record(pipeline.Invocation{Action: pipeline.ActionDeny, Reason: "redirect_failed", Details: details()})
-			return pipeline.Deny(codeUnavailable, fmt.Sprintf("inference-router could not send this request to %q: %v", name, err))
-		}
 	}
 	// The model is chosen only once the request has moved, so an observed router
 	// changes nothing.
@@ -399,7 +403,9 @@ func (p *Router) OnRequest(_ context.Context, pctx *pipeline.Context) pipeline.A
 	// Before applyLimits, so limits are fitted to the body as sent.
 	p.keepOwnReasoning(pctx, name, pin.moving(), pin.movedFrom(addressed))
 	p.applyLimits(pctx, name, true)
-	pin.settle(name)
+	if settle {
+		pin.settle(name)
+	}
 	if addressed != name {
 		dropProviderCredentials(pctx.Headers)
 	}
@@ -482,66 +488,35 @@ func (pn *pinning) forgo() {
 }
 
 // serverFor is the server the request's session uses, "" for not routed, and the
-// session's pin.
-//
-// A session its agent already pinned uses its pin, "not routed" included, so routing
-// an agent later does not move the sessions it already has running; every request
-// renews the pin. Otherwise the session is decided by unpinned, and the pin comes
-// back pinNew for OnRequest to settle by where the request went (see the package
-// doc) — except when the pin is another agent's, which this request must neither
-// follow nor overwrite, or when the request decides nothing, and then it comes back
-// pinNone. Without a session to pin, whether
-// none, a synthetic one or no store, the agent's choice applies and nothing is
-// pinned: a synthetic session's history is many conversations', not this one's.
-//
-// Two first requests of one session racing can both miss and both store; they store
-// the same outcome unless a reload lands between them, which is the case the pin
-// cannot rule out and does not need to.
+// session's pin. It reads the pin store and renews the pin. decideServer makes the
+// decision.
 func (p *Router) serverFor(pctx *pipeline.Context, captured bool) (string, pinning) {
 	agent := agentOf(pctx)
 	choice := p.agents[agent]
-	if pctx.Session == nil || pctx.Session.ID == "" || synthetic(pctx.Session.ID) {
-		return choice, pinning{state: pinNone}
+	unpinned := func() (string, string, bool) { return p.unpinned(pctx, agent, choice, captured) }
+	var store pins
+	if pctx.SessionID != "" && !synthetic(pctx.SessionID) {
+		if store = p.pinsFor(pctx); store == nil {
+			p.noStore.Do(func() {
+				slog.Warn("inference-router: this binary wires no process store, so sessions are not pinned: " +
+					"each request follows its agent's current server, and changing it moves running sessions")
+			})
+		}
 	}
-	store := p.pinsFor(pctx)
 	if store == nil {
-		p.noStore.Do(func() {
-			slog.Warn("inference-router: this binary wires no process store, so sessions are not pinned: " +
-				"each request follows its agent's current server, and changing it moves running sessions")
-		})
-		return choice, pinning{state: pinNone}
+		server, pn, _ := decideServer(serverFacts{agent: agent, choice: choice}, unpinned)
+		return server, pn
 	}
-	key := pinPrefix + pctx.Session.ID
-	// A sessions: override is the user's explicit move: it beats the pin and every
-	// unpinned rule, and the pin follows it, so removing the entry later does not
-	// move the session back. pinMoved tells the record this request moved a session
-	// that already held a pin; pinNew is a session that held none.
-	if over, ok := p.overrideFor(pctx); ok {
-		state, from := pinNew, ""
-		if pn, had := store.load(key); had && pn.belongsTo(agent) {
-			switch {
-			case pn.server == over:
-				state = pinExisting
-				p.keepPin(pctx, store, key, pn)
-			case pn.server != over:
-				state, from = pinMoved, pn.server
-			}
-		}
-		return over, pinning{state: state, store: store, key: key, agent: agent, override: true, from: from}
+	key := pinPrefix + pctx.SessionID
+	over, overridden := p.overrideFor(pctx)
+	had, pinned := store.load(key)
+	server, pn, keep := decideServer(serverFacts{agent: agent, choice: choice, session: true,
+		over: over, overridden: overridden, had: had, pinned: pinned}, unpinned)
+	if keep {
+		p.keepPin(pctx, store, key, had)
 	}
-	if pn, ok := store.load(key); ok {
-		if !pn.belongsTo(agent) {
-			server, _, _ := p.unpinned(pctx, agent, choice, captured)
-			return server, pinning{state: pinNone}
-		}
-		p.keepPin(pctx, store, key, pn)
-		return pn.server, pinning{state: pinExisting}
-	}
-	server, turn, decides := p.unpinned(pctx, agent, choice, captured)
-	if !decides {
-		return server, pinning{state: pinNone, turn: turn}
-	}
-	return server, pinning{state: pinNew, store: store, key: key, agent: agent, turn: turn}
+	pn.store, pn.key, pn.agent = store, key, agent
+	return server, pn
 }
 
 // keepPin renews the session's pin and, with it, its reasoning record, which must
@@ -556,10 +531,10 @@ func (p *Router) keepPin(pctx *pipeline.Context, store pins, key string, pn pin)
 // synthetic session is never overridden, whatever a hand-fed config says: its id
 // holds many conversations, not one to move.
 func (p *Router) overrideFor(pctx *pipeline.Context) (string, bool) {
-	if pctx.Session == nil || pctx.Session.ID == "" || synthetic(pctx.Session.ID) {
+	if pctx.SessionID == "" || synthetic(pctx.SessionID) {
 		return "", false
 	}
-	over, ok := p.sessions[pctx.Session.ID]
+	over, ok := p.sessions[pctx.SessionID]
 	return over, ok
 }
 
@@ -573,87 +548,45 @@ func (p *Router) overrideRoutes(pctx *pipeline.Context) bool {
 
 // pinnedToServer reports whether pctx's session holds its agent's pin to a server.
 func (p *Router) pinnedToServer(pctx *pipeline.Context) bool {
-	if pctx.Session == nil || pctx.Session.ID == "" || synthetic(pctx.Session.ID) {
+	if pctx.SessionID == "" || synthetic(pctx.SessionID) {
 		return false
 	}
 	store := p.pinsFor(pctx)
 	if store == nil {
 		return false
 	}
-	pn, ok := store.load(pinPrefix + pctx.Session.ID)
+	pn, ok := store.load(pinPrefix + pctx.SessionID)
 	return ok && pn.belongsTo(agentOf(pctx)) && pn.server != ""
 }
 
-// unpinned is the server for a request in a session its agent holds no pin on, and
-// whether the request decides the session's pin. In order:
-//
-//  1. An agent that is not routed is left alone, whatever its history.
-//  2. The server the session's history shows the agent already uses.
-//  3. A request no parser read as inference goes to the agent's current choice and
-//     decides nothing.
-//  4. A Claude Code request's own turn (see turnOf): a conversation's opening turn
-//     goes to the agent's current choice; a continuation, a conversation the router
-//     did not see begin, is not routed; a side request decides nothing, and goes to
-//     the agent's current choice when it is a one-shot or was captured, and is not
-//     routed when it is a subagent's to a server's host. turn names the last two,
-//     for the record.
-//  5. The agent's current choice.
+// unpinned is decideUnpinned for pctx: the server for a request in a session its
+// agent holds no pin on, and whether the request decides the session's pin.
 func (p *Router) unpinned(pctx *pipeline.Context, agent, choice string, captured bool) (server, turn string, decides bool) {
-	if choice == "" {
-		return "", "", true
-	}
-	if server, ok := p.wentTo(pctx.Session, agent); ok {
-		return server, "", true
-	}
-	if pctx.Extensions.Inference == nil {
-		return choice, "", false
-	}
-	switch turnOf(pctx.Extensions.Inference) {
-	case turnContinuation:
-		return "", turnContinuation, true
-	case turnAside:
-		// A one-shot is sent beside the main conversation and is no part of it, so the
-		// agent's server answering it moves nothing. A subagent's request is a
-		// conversation of its own, which may be running already, so it is left where
-		// Claude Code sent it unless captured: then leaving it would send the user's
-		// credential to the provider the agent was routed away from.
-		if captured || pctx.Extensions.Inference.AgentRole == pipeline.AgentRoleMain {
-			return choice, turnAside, false
-		}
-		return "", turnAside, false
-	}
-	return choice, "", true
+	return decideUnpinned(choice, pctx.Extensions.Inference, captured, func() (string, bool) {
+		return p.wentTo(pctx, agent)
+	})
 }
 
-// turnOf is a Claude Code request's place in its session's conversation, read from
-// inference-parser's parse: turnContinuation for the main conversation with earlier
-// assistant turns, turnAside for any other request, and "" for the main
-// conversation's opening turn or a request that states no role.
-//
-// The role is stated only by Claude Code's system prompt (see
-// pipeline.InferenceExtension.AgentRole), and only Claude Code is read this way:
-// another agent's earlier turns may have gone to another provider — OpenCode starts
-// on Zen and addresses a server later — so its turns say nothing about whether its
-// use of the servers began before this request. The main conversation carries its
-// tool manifest; the one-shots Claude Code interleaves with it, its title request,
-// auto mode's classifier and the permission monitor, carry none, and neither they
-// nor a subagent's requests say whether the session began now.
-func turnOf(ext *pipeline.InferenceExtension) string {
-	if ext == nil || ext.AgentRole == "" {
-		return ""
+// wentTo is the server the latest earlier inference request agent sent in the session
+// went to, by wentToView's rule. ok is false when there is no such request. When the
+// listener passed the store's InferenceHosts table and the store can vouch for it, the
+// table answers: it holds the evidence of every event the store and the archive kept,
+// trimmed and older ones too, and costs no archive read. Else wentToView scans the view
+// and the archive.
+func (p *Router) wentTo(pctx *pipeline.Context, agent string) (server string, ok bool) {
+	if hosts, known := pctx.InferenceHosts(); known {
+		return hosts.LastServer(agent, p.serverAt)
 	}
-	if ext.AgentRole != pipeline.AgentRoleMain || len(ext.Tools) == 0 {
-		return turnAside
-	}
-	for _, m := range ext.Messages {
-		if m.Role == "assistant" {
-			return turnContinuation
-		}
-	}
-	return ""
+	return p.wentToView(pctx.Session, agent)
 }
 
-// wentTo is the server the latest earlier inference request agent sent in the
+// serverAt is the server on host by the current config, as serverOf maps a row's Host.
+func (p *Router) serverAt(host string) (string, bool) {
+	server, ok := p.byHost[routerconfig.Key(host)]
+	return server, ok
+}
+
+// wentToView is the server the latest earlier inference request agent sent in the
 // session to a server's host went to; ok is false when there is no such request,
 // which is what makes a session new. The session's events in memory are read first,
 // then, where the process has a session archive, its archived events below the
@@ -662,7 +595,7 @@ func turnOf(ext *pipeline.InferenceExtension) string {
 //
 // Only an outbound request row a parser read as inference counts, and only one that
 // reached a server. A tunnel row, a count_tokens or a /v1/models request no parser
-// claimed, a side request (see turnOf), which decides nothing, and a denied request,
+// claimed, a side request (see session.TurnOf), which decides nothing, and a denied request,
 // which went nowhere, say nothing about where the conversation is; nor does a
 // request to any other host, which the router never routes (see the package doc).
 // Another agent's row says nothing about this agent's conversation, and following it
@@ -670,7 +603,11 @@ func turnOf(ext *pipeline.InferenceExtension) string {
 // bytes went, the server's host for a routed request, because the listener records
 // it after the redirect; RequestedHost, where the client asked to go, is not where
 // the session is.
-func (p *Router) wentTo(view *pipeline.SessionView, agent string) (server string, ok bool) {
+func (p *Router) wentToView(view *pipeline.SessionView, agent string) (server string, ok bool) {
+	// The guard on SessionID does not prove a view: a hand-built Context can set the id alone.
+	if view == nil {
+		return "", false
+	}
 	events := view.Events
 	for i := len(events) - 1; i >= 0; i-- {
 		if server, ok := p.serverOf(&events[i], agent); ok {
@@ -700,11 +637,11 @@ func (p *Router) wentTo(view *pipeline.SessionView, agent string) (server string
 	return "", false
 }
 
-// serverOf is the server e shows agent's session on, by the rule wentTo gives; ok is
+// serverOf is the server e shows agent's session on, by the rule wentToView gives; ok is
 // false when e is no evidence.
 func (p *Router) serverOf(e *pipeline.SessionEvent, agent string) (server string, ok bool) {
 	if e.Direction != pipeline.Outbound || e.Phase != pipeline.SessionRequest || e.Inference == nil ||
-		turnOf(e.Inference) == turnAside || pipeline.AgentName(e.Client.Label()) != agent {
+		session.TurnOf(e.Inference) == turnAside || pipeline.AgentName(e.Client.Label()) != agent {
 		return "", false
 	}
 	if server, ok = p.byHost[routerconfig.Key(e.Host)]; ok {
@@ -714,7 +651,7 @@ func (p *Router) serverOf(e *pipeline.SessionEvent, agent string) (server string
 	// server's host. One recorded where the agent sent it was made while the router
 	// was not routing the agent — before it was routed, or under observe — so the
 	// session ran unrouted, and moving it now would switch a running conversation.
-	if _, captured := capturePath(e.HTTPMethod, e.HTTPPath); captured && e.RequestedHost == "" {
+	if _, captured := session.CapturePath(e.HTTPMethod, e.HTTPPath); captured && e.RequestedHost == "" {
 		return "", true
 	}
 	return "", false
@@ -737,25 +674,18 @@ func agentOf(pctx *pipeline.Context) string {
 	return agent
 }
 
-// credentialWords are the words of a header name that make the header a credential.
-var credentialWords = []string{"key", "apikey", "token", "auth", "authorization", "cookie",
-	"secret", "signature", "password", "credential", "credentials"}
-
-// dropProviderCredentials removes from h each header whose name, split at "-" and
-// "_" with case ignored, has one of credentialWords. Authorization and X-Api-Key stay
-// for setKey, which puts the server's key in whichever of them the agent used. The
-// router calls it on a request it sends to a server the request did not name.
+// dropProviderCredentials removes from h each header whose name has a credential word
+// (redact.CredentialName). Authorization and X-Api-Key stay for setKey, which puts the
+// server's key in whichever of them the agent used. The router calls it on a request it
+// sends to a server the request did not name.
 func dropProviderCredentials(h http.Header) {
 	for name := range h {
 		switch http.CanonicalHeaderKey(name) {
 		case "Authorization", "X-Api-Key":
 			continue
 		}
-		for _, w := range strings.FieldsFunc(strings.ToLower(name), func(r rune) bool { return r == '-' || r == '_' }) {
-			if slices.Contains(credentialWords, w) {
-				h.Del(name)
-				break
-			}
+		if redact.CredentialName(name) {
+			h.Del(name)
 		}
 	}
 }

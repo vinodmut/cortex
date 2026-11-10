@@ -375,46 +375,6 @@ func TestAffinityName_CodexUsesTheRecognisedName(t *testing.T) {
 	}
 }
 
-// IsKnownAgent answers for canonical names only: what AgentName folds a recognised Label to.
-func TestIsKnownAgent(t *testing.T) {
-	for _, tc := range []struct {
-		name string
-		want bool
-	}{
-		{"claude-code", true},
-		{"bob", true},
-		{"opencode", true},
-		{"codex", true},
-		{"pi", true},
-		// A product token is not a canonical name: claude-cli is how Claude Code is RECOGNISED.
-		{"claude-cli", false},
-		// Retired spellings are not canonical names either — but AgentName folds them to
-		// one before any consumer asks, so IsKnownAgent(AgentName(label)) stays true for
-		// a label recorded under the old name. Pinned by TestAgentName below.
-		{"bob-shell", false},
-		{"ibm-bob", false},
-		{"codex_exec", false},
-		{"codex-mcp-client", false},
-		// Versioned labels have to be folded first; the godoc says so.
-		{"claude-code/2.1.285", false},
-		{"curl", false},
-		{UnknownClientLabel, false},
-		{"(other)", false},
-		{"", false},
-	} {
-		if got := IsKnownAgent(tc.name); got != tc.want {
-			t.Errorf("IsKnownAgent(%q) = %v, want %v", tc.name, got, tc.want)
-		}
-	}
-	// Every value ParseUserAgent can put in Name is one this accepts, so a new knownClients
-	// entry cannot be recognised by the parser and rejected here.
-	for product, name := range knownClients {
-		if !IsKnownAgent(name) {
-			t.Errorf("knownClients[%q] = %q, which IsKnownAgent rejects", product, name)
-		}
-	}
-}
-
 // OpenCode sends one User-Agent from its TUI, its background service and its inference
 // client alike, with a release channel before the version. Captured from OpenCode 2.0.21.
 func TestParseUserAgent_OpenCodeVersionIsTheFieldAfterItsChannel(t *testing.T) {
@@ -493,7 +453,7 @@ func TestParseUserAgent_CapsTheRetainedValue(t *testing.T) {
 	// The header is caller-controlled and the value is retained in bucket label
 	// maps for a full ring lap. Without a cap a caller parks arbitrary bytes in
 	// memory from off-host, on the synchronous session-append path — the same
-	// reasoning as usage.maxLabelLen.
+	// reasoning as event.MaxLabelLen.
 	long := strings.Repeat("A", 10_000)
 	got := ParseUserAgent(long)
 	if got == nil {
@@ -579,7 +539,7 @@ func TestParseUserAgent_SanitisesControlCharactersBeforeLabel(t *testing.T) {
 			// And every field, since Raw is persisted and Version is joined into the label
 			// for a recognised agent.
 			for name, got := range map[string]string{"Raw": c.Raw, "Version": c.Version, "Label": c.Label()} {
-				if hasControlRunes(got) {
+				if HasControlRunes(got) {
 					t.Errorf("%s = %q still carries a control character", name, got)
 				}
 			}
@@ -619,7 +579,7 @@ func TestParseUserAgent_SanitisesBeforeCappingAndStillHonoursTheByteCap(t *testi
 		t.Errorf("Raw is %d bytes, want <= %d; the cap bounds retained memory and the "+
 			"length of a persisted line, so it has to be a BYTE cap", len(c.Raw), maxClientLen)
 	}
-	if hasControlRunes(c.Raw) {
+	if HasControlRunes(c.Raw) {
 		t.Errorf("Raw = %q: capping must not be able to reintroduce a control character", c.Raw)
 	}
 	// A cut mid-U+FFFD is invalid UTF-8 in a string that goes to a durable file and to a
@@ -682,10 +642,33 @@ func TestParseUserAgent_CapCutsOnARuneBoundary(t *testing.T) {
 	}
 }
 
+// The one-byte prefix puts a rune across the cap for every width, so each case names
+// the boundary the walk-back must stop on.
+func TestTruncateLabel_CutsOnTheLastRuneBoundaryAtOrBelowTheCap(t *testing.T) {
+	for _, tc := range []struct {
+		rune    string
+		wantLen int
+	}{
+		{"é", 95},
+		{"€", 94},
+		{"𝄞", 93},
+		{"�", 94},
+	} {
+		got := TruncateLabel("a"+strings.Repeat(tc.rune, 96), 96)
+		if len(got) != tc.wantLen || !utf8.ValidString(got) {
+			t.Errorf("%q runes: got %d bytes (valid UTF-8: %v), want %d",
+				tc.rune, len(got), utf8.ValidString(got), tc.wantLen)
+		}
+	}
+	if got := TruncateLabel("short", 96); got != "short" {
+		t.Errorf("a label under the cap changed: %q", got)
+	}
+}
+
 // EVERY MEMBER OF isControlRune's SWITCH, with a literal expectation for each.
 //
-// The predicate cannot be its own oracle: hasControlRunes calls isControlRune, so a loop
-// asserting !hasControlRunes(got) stays green when a rune is deleted from the switch —
+// The predicate cannot be its own oracle: HasControlRunes calls isControlRune, so a loop
+// asserting !HasControlRunes(got) stays green when a rune is deleted from the switch —
 // verified by deleting U+200C, which no test in this package noticed. A member missing from
 // the switch is a rune that reaches a durable row and a chart intact, so each one is pinned
 // against the exact string it must become.

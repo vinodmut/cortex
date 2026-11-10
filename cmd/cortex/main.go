@@ -1,7 +1,7 @@
 // Package main is the proxy-sidecar authbridge binary: HTTP forward
 // proxy + reverse proxy, no Envoy / gRPC dependencies. It links only the
 // plugins its build tags name — nothing is compiled in by default. Every
-// plugin has its own plugins_<name>.go file gated by
+// plugin has its own core/plugins/all/plugins_<name>.go file gated by
 // `//go:build include_plugin_<name>`, so a binary contains exactly the
 // set it was built with. main.go imports no plugin package directly.
 //
@@ -61,10 +61,12 @@ import (
 	"github.com/rossoctl/cortex/core/listener/reverseproxy"
 	"github.com/rossoctl/cortex/core/listener/skiphost"
 	"github.com/rossoctl/cortex/core/listener/transparentproxy"
-	// Plugins are wired via per-plugin plugins_<name>.go files, each gated
-	// by `//go:build include_plugin_<name>`. main.go imports no plugin
-	// package directly, so a binary links exactly the set its profile names
-	// (see scripts/profile-tags).
+
+	// Plugins are wired via core/plugins/all: one plugins_<name>.go file per
+	// plugin, each gated by `//go:build include_plugin_<name>`. main.go imports
+	// no plugin package directly, so a binary links exactly the set its profile
+	// names (see scripts/profile-tags).
+	_ "github.com/rossoctl/cortex/core/plugins/all"
 )
 
 // version is the cortex build version, overridden at release time
@@ -127,7 +129,7 @@ func spiffeProviderNeeded(c *config.Config) bool {
 // SPIFFE identity scheme. It is a shared config convention (token-exchange is
 // the only consumer today); kept as a local constant so main.go stays
 // decoupled from any specific plugin package — every plugin is build-tag
-// excludable via plugins_<name>.go.
+// excludable via core/plugins/all/plugins_<name>.go.
 const spiffeIdentityType = "spiffe"
 
 // pluginUsesSPIFFEIdentity reports whether a plugin's config consumes the
@@ -577,7 +579,7 @@ func main() {
 		if err != nil {
 			return nil, nil, nil, fmt.Errorf("inbound: %w", err)
 		}
-		out, err := plugins.BuildWithDeps(c.Pipeline.Outbound.Plugins, outDeps)
+		out, err := plugins.BuildWithDeps(outboundEntries(c, slog.Default()), outDeps)
 		if err != nil {
 			return nil, nil, nil, fmt.Errorf("outbound: %w", err)
 		}
@@ -836,8 +838,8 @@ func main() {
 		// back on handshake failure", and Istio's PeerAuthentication
 		// permissive is inbound-only). A permissive caller can no
 		// longer reach a strict peer regardless of mode; mixed-mode
-		// deployments need both ends compatible. See CLAUDE.md
-		// "Top-level mtls: configuration".
+		// deployments need both ends compatible. See
+		// docs/framework-architecture.md §8a.
 		if strict {
 			fpMTLS = &forwardproxy.MTLSOptions{Source: src, Metrics: mtlsMetrics}
 		}
@@ -872,6 +874,14 @@ func main() {
 	// TLS so the outbound pipeline sees decrypted HTTPS. Constructed
 	// here and set on fpSrv below (mirroring fpSrv.SkipHosts / fpSrv.Shared).
 	// A nil *Engine leaves today's blind-tunnel behavior intact.
+	// The bridge's re-origination client, and the praxis egress listener's, dial
+	// through the egress guard when one is armed, so a bridged request is checked
+	// exactly like a plaintext one. No option when the guard is off: nil
+	// DialContext is the transport's default dialer.
+	var upOpts []tlsbridge.UpstreamOption
+	if egress != nil {
+		upOpts = append(upOpts, tlsbridge.WithDialContext(egress.DialContext))
+	}
 	var bridge *tlsbridge.Engine
 	if cfg.TLSBridge != nil && cfg.TLSBridge.Mode == "enabled" {
 		// CA is normally the operator-mounted cert-manager Secret (tls.crt/tls.key
@@ -954,14 +964,6 @@ func main() {
 			if extra, err = os.ReadFile(cfg.TLSBridge.UpstreamCABundle); err != nil {
 				fatalf("tls-bridge upstream_ca_bundle read failed: %v", err)
 			}
-		}
-		// The bridge's re-origination client dials through the egress guard
-		// when one is armed, so a bridged request is checked exactly like a
-		// plaintext one. No option when the guard is off: nil DialContext is
-		// the transport's default dialer.
-		var upOpts []tlsbridge.UpstreamOption
-		if egress != nil {
-			upOpts = append(upOpts, tlsbridge.WithDialContext(egress.DialContext))
 		}
 		up, uerr := tlsbridge.NewUpstreamClient(extra, cfg.TLSBridge.UpstreamInsecure, upOpts...)
 		if uerr != nil {
@@ -1049,6 +1051,17 @@ func main() {
 	if ctrlErr != nil {
 		fatalf("vm control: %v", ctrlErr)
 	}
+	// Praxis mode: one read of the gateway token, for the hop, the egress listener and
+	// POST /v1/ingest. hopJoins stays nil when no forward proxy runs.
+	var gatewayToken string
+	var hopJoins sessionapi.HopJoins
+	if cfg.PraxisEnabled() {
+		t, terr := readGatewayToken(os.Getenv, os.ReadFile)
+		if terr != nil {
+			fatalf("praxis: %v", terr)
+		}
+		gatewayToken = t
+	}
 	if roles[config.RoleForward] {
 		fpSrv, ferr := forwardproxy.NewServer(outboundH, sessions, fpMTLS, forwardproxy.WithEgressGuard(egress))
 		if ferr != nil {
@@ -1084,10 +1097,10 @@ func main() {
 		}
 		fpSrv.TLSBridge = bridge
 		fpSrv.Shared = sharedStore
-		// A Responses API WebSocket is answered 426 so Codex falls back to HTTPS at once,
-		// rather than after ~6s of retrying the origin's 405. On unless
-		// listener.decline_responses_websockets: false.
-		fpSrv.DeclineResponsesWebSockets = cfg.Listener.DeclinesResponsesWebSockets()
+		// A Responses API WebSocket — Codex's transport — is carried and parsed turn by
+		// turn by default; listener.responses_websockets: decline answers it 426 so Codex
+		// uses HTTPS at once, and forward restores the stripped GET.
+		fpSrv.ResponsesWebSockets = cfg.Listener.ResponsesWebSocketsMode()
 		// Per-session bucketing. Without it every coding-agent session on the
 		// machine records into one shared bucket: two Claude Code windows
 		// interleave and per-session cost cannot be computed at all. Defaults to
@@ -1145,9 +1158,33 @@ func main() {
 		if ctrlCfg.Socket != "" {
 			vmCtrl = startVMControl(ctrlCfg, fpSrv)
 		}
+		// Praxis mode, also before the forward proxy serves: startPraxis sets fpSrv.Hop
+		// and fpSrv.ResponsesWebSockets. The egress listener uses the bridge's upstream
+		// options (Decision 11).
+		var egressSrv *http.Server
+		if cfg.PraxisEnabled() {
+			var upstream http.RoundTripper
+			if bridge != nil {
+				upstream = bridge.Upstream.Transport
+			} else {
+				up, uerr := tlsbridge.NewUpstreamClient(nil, false, upOpts...)
+				if uerr != nil {
+					fatalf("praxis egress upstream client failed: %v", uerr)
+				}
+				upstream = up.Transport
+			}
+			var hop *forwardproxy.Hop
+			hop, egressSrv = startPraxis(ctx, cfg, fpSrv, gatewayToken, upstream, listeners.take("praxis-egress"))
+			hopJoins = hop
+		}
 
 		httpServers = append(httpServers, bootstrap.ServeHTTPServer("forward-proxy", fpSrv.Handler(),
 			listeners.take("forward-proxy"), bootstrap.WithConnContext(fpSrv.ConnContext)))
+		// After the forward proxy: the drain shuts servers down in slice order, and a
+		// request still on the forward proxy reaches the gateway, which dials this listener.
+		if egressSrv != nil {
+			httpServers = append(httpServers, egressSrv)
+		}
 
 		// Outbound transparent listener (enforce-redirect mode). It shares the
 		// forward proxy's outbound pipeline via HandleTransparentConn, so explicit
@@ -1177,7 +1214,8 @@ func main() {
 	// pprof exposes the process's internals (allocation stack traces, argv,
 	// caller-started CPU/trace profiling), so it rides the same loopback-only
 	// gate as the session API's clear.
-	statOpts = append(statOpts, observe.WithPprof(cfg.Listener.BindLoopbackOnly))
+	statOpts = append(statOpts, observe.WithPprof(cfg.Listener.BindLoopbackOnly),
+		observe.WithLoopbackOnly(cfg.Listener.BindLoopbackOnly))
 	statSrv := bootstrap.ServeStatServer(rld.ConfigProvider(), statsProvider, rld.Handler(), pricingRegistry.Handler(),
 		listeners.take("stats"), statOpts...)
 
@@ -1188,21 +1226,27 @@ func main() {
 
 	var sessionAPISrv *sessionapi.Server
 	if cfg.Listener.SessionAPIAddr != "" && sessions != nil {
+		// POST /v1/ingest, in praxis mode only: nil options in direct mode.
+		ingestOpts := ingestOptions(cfg, pricingRegistry, gatewayToken, hopJoins)
 		sessionAPISrv = sessionapi.New(
 			cfg.Listener.SessionAPIAddr,
 			sessions,
-			sessionapi.WithPipelines(inboundH, outboundH),
-			sessionapi.WithCatalog(sessionapi.PluginsCatalog),
-			sessionapi.WithUsage(usageAgg),
-			// nil when the ledger is off, which handleUsage reads as "serve the ring's
-			// maximum window and say which window that was".
-			sessionapi.WithCostLedger(costLedger),
-			// nil unless the archive runs; pages and ?archived=true then read history from disk.
-			sessionapi.WithArchive(sessArchive),
-			// DELETE /v1/sessions and DELETE /v1/sessions/{id} only where the API is this
-			// machine's alone: a laptop install binds loopback-only, and its one user owns the
-			// history. See sessionapi.clearRefusal.
-			sessionapi.WithClearAllowed(cfg.Listener.BindLoopbackOnly),
+			append([]sessionapi.Option{
+				sessionapi.WithPipelines(inboundH, outboundH),
+				sessionapi.WithCatalog(sessionapi.PluginsCatalog),
+				sessionapi.WithUsage(usageAgg),
+				// nil when the ledger is off, which handleUsage reads as "serve the ring's
+				// maximum window and say which window that was".
+				sessionapi.WithCostLedger(costLedger),
+				// nil unless the archive runs; pages and ?archived=true then read history from disk.
+				sessionapi.WithArchive(sessArchive),
+				// DELETE /v1/sessions and DELETE /v1/sessions/{id} only where the API is this
+				// machine's alone: a laptop install binds loopback-only, and its one user owns the
+				// history. See sessionapi.clearRefusal.
+				sessionapi.WithClearAllowed(cfg.Listener.BindLoopbackOnly),
+				// Reads hold raw prompts: the same browser defenses as the erase, on every route.
+				sessionapi.WithLoopbackOnly(cfg.Listener.BindLoopbackOnly),
+			}, ingestOpts...)...,
 		)
 		sessionLn := listeners.take("session-api")
 		go func() {
@@ -1280,11 +1324,11 @@ func main() {
 			_ = sessionAPISrv.Server().Close()
 		}
 	}
-	outboundPipeline.Stop(shutdownCtx)
-	inboundPipeline.Stop(shutdownCtx)
+	rld.Close(shutdownCtx)
 
-	// Flushed AFTER both pipelines have stopped and before the store closes, so the
-	// final minute includes every event a draining request still produced. Any earlier
+	// Flushed AFTER rld.Close (every pipeline stopped, or the shutdown budget spent)
+	// and before the store closes, so the final minute includes every event a
+	// draining request still produced. Any earlier
 	// and a request finishing during the pipeline drain would land in a minute already
 	// written; any later and the store is gone.
 	//

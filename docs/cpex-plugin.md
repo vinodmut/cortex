@@ -87,7 +87,8 @@ The binary is still `cortex`, run by the same service with the same
 `cortex --version` prints `cortex (cpex) <version>`, and `/v1/plugins` on the
 session API lists `cpex`. The install binds to loopback, so Cortex has process
 attribution there and `session_source: resolved` keeps a child process in its
-parent's session. Re-running the installer without `--cpex` switches back.
+parent's session. Re-running the installer without `--cpex` switches back, and
+`agentop update` keeps the cpex build.
 [The cpex build](laptop-service.md#the-cpex-build) covers verification and
 switching. To build it from a checkout instead, `make cortex-cpex` writes
 `bin/cortex-cpex/cortex`.
@@ -180,7 +181,7 @@ plugins:
 | `config` | string | unset | The CPEX runtime YAML inline, as a single string. Mutually exclusive with `config_file`. |
 | `fail_open` | bool | `false` | On a CPEX-internal error: reject (`false`) or log and continue (`true`). A policy deny is always honored. See [fail_open](#fail_open-when-to-use-it). |
 | `worker_threads` | int | `0` | Size of CPEX's tokio worker pool; `0` lets CPEX choose. |
-| `bypass_hosts` | `[]string` | Keycloak, SPIRE, observability | Host globs that skip CPEX, on outbound traffic only. Setting the list replaces the default rather than extending it. With `synthetic_egress` the default is dropped; an explicit list is kept. See [Bypass list curation](#bypass-list-curation). |
+| `bypass_hosts` | `[]string` | Keycloak, SPIRE, observability | Host globs that skip CPEX, on outbound traffic only, matched case-insensitively against the host with its port and IPv6 brackets stripped. Setting the list replaces the default rather than extending it. With `synthetic_egress` the default is dropped; an explicit list is kept. See [Bypass list curation](#bypass-list-curation). |
 | `strict_hosts` | `[]string` | empty | Tool servers that may read JSON more leniently than the parsers, such as a Python server, each listed as a host glob (`.`-delimited, as in `delegated_credential_hosts`, matched without the port), an IP address, or a CIDR (`10.96.0.0/12`, `fd00:10:96::/112`). A host that reads as an address — any IP literal spelling, IPv4-mapped IPv6, a zone, a trailing dot, or a numeric `inet_aton` form such as `0x0a.0x60.0.10` — is matched by its canonical address against the addresses and CIDRs only; a name only against the globs, so a DNS name resolving to a listed address is not caught. A host that is neither a name nor an address (`10.96.0.256`, misused brackets) is treated as strict. An outbound request to one of them whose body no parser claimed is refused as `cpex.unparseable_request` when it is a JSON object the parsers cannot read. It protects only the destinations it lists: a server reached by its cluster IP or pod IP is covered only when that address is listed. It is checked before `bypass_hosts` and `bypass_paths`, so a destination on both is still checked. Every entry must be a CIDR without host bits, a canonical IP, or a name glob with a label that is not a number or a wildcard; anything else (`10.1`, `10.96.0.1/12`, `10.96.*.*`, `*.*`), CIDRs covering every address (`0.0.0.0/0`, `::/0`), and entries with a port or a zone are refused. The tool server should also parse strictly, as the HR demo's `hr-mcp` does. Empty, the default, checks no host. |
 | `bypass_paths` | `[]string` | `/healthz`, `/readyz`, `/livez`, `/metrics`, `/.well-known/*` | URL path globs that skip CPEX in both directions, or inbound only with `synthetic_egress`. Setting the list replaces the default. |
 | `fallback_identification` | string | `global` | How a request naming no tool, prompt, resource or model (A2A, MCP `tools/list` and `initialize`, unparsed traffic) is identified: `global` sends CPEX's global entity (`http`/`*`), so `http:` routes and the global policy govern it; `none` sends no identification, which CPEX denies as `unidentified_request` when the config declares any policy. Inference requests are identified as `llm`/<model>. |
@@ -206,7 +207,7 @@ policy can call), `global:` (cross-cutting PDPs such as Cedar and CEL, and
 the session store) and `routes:` (the APL policy, one entry per tool,
 prompt, resource or model). `engine_settings:` holds engine-wide settings;
 its default, `dispatch: policy`, runs a plugin only where a route reaches
-it. [`demos/hr-cpex/`](../demos/hr-cpex/) has a complete working policy.
+it. [`cortex-demos/hr-cpex/`](https://github.com/rossoctl/cortex-demos/tree/main/hr-cpex/) has a complete working policy.
 
 ```yaml
 plugins:
@@ -537,4 +538,4 @@ need to route background results separately from foreground logs.
   the runtime YAML, APL, and the built-in sub-plugins.
 - [CPEX repository](https://github.com/contextforge-org/cpex) — source
   and the FFI ABI.
-- [`demos/hr-cpex/`](../demos/hr-cpex/) — runnable demo configurations.
+- [`cortex-demos/hr-cpex/`](https://github.com/rossoctl/cortex-demos/tree/main/hr-cpex/) — runnable demo configurations.

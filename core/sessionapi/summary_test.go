@@ -45,6 +45,7 @@ func fullEvent() pipeline.SessionEvent {
 			// rather than the ~163x it measures against a live proxy.
 			Messages:         bigConversation(24, 8192),
 			ToolResults:      []pipeline.InferenceToolResult{{ToolUseID: "toolu_1", Content: strings.Repeat("r", 4096)}},
+			HistoryToolCalls: []pipeline.InferenceToolCall{{ID: "toolu_1", Name: "Bash", Arguments: strings.Repeat("a", 1024)}},
 			Tools:            []pipeline.InferenceTool{{Name: "search"}},
 			AgentRole:        pipeline.AgentRoleMain,
 			Completion:       strings.Repeat("y", 2048),
@@ -58,7 +59,14 @@ func fullEvent() pipeline.SessionEvent {
 			PresentKinds:     9,
 			FinishReason:     "stop",
 			// Set only when a plugin changed the model; differs from Model on purpose.
-			RequestedModel: "claude-opus-5-5",
+			RequestedModel:   "claude-opus-5-5",
+			ServedModel:      "bedrock/us.anthropic.claude-opus-5-5",
+			ThinkingType:     "adaptive",
+			ThinkingDisplay:  "summarized",
+			Effort:           "high",
+			AnthropicBeta:    "interleaved-thinking-2025-05-14",
+			HistoryThinking:  &pipeline.InferenceThinking{Blocks: 3, SignatureBytes: 2944},
+			ResponseThinking: &pipeline.InferenceThinking{Blocks: 1, TextBytes: 7, SignatureBytes: 1300},
 		},
 		A2A: &pipeline.A2AExtension{
 			Method:       "message/send",
@@ -112,6 +120,10 @@ func TestSummarizeEvent_DropsPayloadsKeepsTimelineFields(t *testing.T) {
 	if got.Inference.ToolResults != nil {
 		t.Error("Inference.ToolResults survived")
 	}
+	// The calls those results answer, re-sent the same way.
+	if got.Inference.HistoryToolCalls != nil {
+		t.Error("Inference.HistoryToolCalls survived")
+	}
 	// …but their LENGTHS are stated in their place. A third category beside dropped and kept:
 	// derived from a payload that goes, and the only thing left that says what it was.
 	if got.Inference.MessageCount != len(full.Inference.Messages) {
@@ -132,6 +144,24 @@ func TestSummarizeEvent_DropsPayloadsKeepsTimelineFields(t *testing.T) {
 	if got.Inference.RequestedModel != full.Inference.RequestedModel {
 		t.Errorf("requestedModel = %q, want %q — the detail pane's model: line reads it",
 			got.Inference.RequestedModel, full.Inference.RequestedModel)
+	}
+	if got.Inference.ServedModel != full.Inference.ServedModel {
+		t.Errorf("servedModel = %q, want %q — the detail pane's model: line reads it",
+			got.Inference.ServedModel, full.Inference.ServedModel)
+	}
+	// The thinking and effort fields are kept: a few short scalars, and the counts do not grow
+	// with the conversation the way the blocks would.
+	gi, fi := got.Inference, full.Inference
+	if gi.ThinkingType != fi.ThinkingType || gi.ThinkingDisplay != fi.ThinkingDisplay ||
+		gi.Effort != fi.Effort || gi.AnthropicBeta != fi.AnthropicBeta {
+		t.Errorf("thinking/effort/beta = %q/%q/%q/%q, want %q/%q/%q/%q",
+			gi.ThinkingType, gi.ThinkingDisplay, gi.Effort, gi.AnthropicBeta,
+			fi.ThinkingType, fi.ThinkingDisplay, fi.Effort, fi.AnthropicBeta)
+	}
+	if gi.HistoryThinking == nil || *gi.HistoryThinking != *fi.HistoryThinking ||
+		gi.ResponseThinking == nil || *gi.ResponseThinking != *fi.ResponseThinking {
+		t.Errorf("history/response thinking = %+v/%+v, want %+v/%+v",
+			gi.HistoryThinking, gi.ResponseThinking, fi.HistoryThinking, fi.ResponseThinking)
 	}
 	if got.A2A.Artifact != "" {
 		t.Error("A2A.Artifact survived")
@@ -311,15 +341,16 @@ func TestSummarizeEvent_IsOrdersOfMagnitudeSmaller(t *testing.T) {
 // The half that was missed the first time, and silently: the events table has a
 // FILTER, and it searches fields the projection had been dropping. `plugin:foo`
 // matched nothing because it is a lookup into Plugins, and `/some completion text`
-// stopped matching because eventHaystack reads Inference.Completion and
-// A2A.Parts[].Content.
+// stopped matching because the filter read Inference.Completion and
+// A2A.Parts[].Content. agentop's details search reads them now, with detailHas on the
+// summary rows it holds.
 //
 // Worse than losing a feature, it was INCONSISTENT: SSE-streamed events are not
 // projected, so the same query matched newly arrived rows and missed everything a
 // snapshot had replaced.
 //
-// Each field below is named by agentop's eventHaystack / matchEventRow
-// (cmd/agentop/tui/events_pane.go). Keeping them costs 299x → 163x, which is 1.12 MiB
+// Each field below is read by agentop's detailHas on a summary row
+// (cmd/agentop/tui/search_details.go). Keeping them costs 299x → 163x, which is 1.12 MiB
 // against 0.61 for a 1000-event session — both instant.
 func TestSummarizeEvent_KeepsEverythingTheFilterSearches(t *testing.T) {
 	full := fullEvent()
@@ -329,7 +360,7 @@ func TestSummarizeEvent_KeepsEverythingTheFilterSearches(t *testing.T) {
 	if _, ok := got.Plugins["cost"]; !ok {
 		t.Error("Plugins was dropped — the plugin:<name> filter is a lookup into it")
 	}
-	// Free-text: eventHaystack appends both of these.
+	// Free-text: agentop's detailHas reads both of these on the summary row.
 	if got.Inference.Completion != full.Inference.Completion {
 		t.Error("Inference.Completion was dropped — the / filter searches it")
 	}
@@ -393,7 +424,12 @@ func TestSummarizeEvent_ShapeIsGuarded(t *testing.T) {
 		// 26 since RequestedModel, which is kept as RequestedHost is: agentop's detail pane
 		// draws its model: line from the projected event. A scalar; asserted above.
 		// 27 since ToolResults, which is DETAIL data: dropped, asserted above.
-		{"InferenceExtension", reflect.TypeOf(pipeline.InferenceExtension{}), 27},
+		// 28 since ServedModel, kept as RequestedModel is: agentop's detail pane draws its
+		// model: line from the projected event. A capped scalar; asserted above.
+		// 29 since HistoryToolCalls, DETAIL data like ToolResults: dropped, asserted above.
+		// 35 since ThinkingType, ThinkingDisplay, Effort, AnthropicBeta, HistoryThinking and
+		// ResponseThinking: small scalars and counts, kept, asserted above.
+		{"InferenceExtension", reflect.TypeOf(pipeline.InferenceExtension{}), 35},
 		{"A2AExtension", reflect.TypeOf(pipeline.A2AExtension{}), 11},
 		{"MCPExtension", reflect.TypeOf(pipeline.MCPExtension{}), 6},
 	} {
@@ -401,10 +437,11 @@ func TestSummarizeEvent_ShapeIsGuarded(t *testing.T) {
 			if got := g.typ.NumField(); got != g.want {
 				t.Errorf("%s has %d fields, this guard was written against %d.\n"+
 					"A field was added or removed. Decide which it is:\n"+
-					"  TIMELINE data — rendered in the events table, or searched by agentop's\n"+
-					"    eventHaystack/matchEventRow — then it MUST survive summarizeEvent, and\n"+
-					"    belongs in one of the assertions above.\n"+
-					"  DETAIL data — read only by the detail pane — then drop it in summarizeEvent.\n"+
+					"  TIMELINE data — rendered in the events table — then it MUST survive\n"+
+					"    summarizeEvent, and belongs in one of the assertions above.\n"+
+					"  DETAIL data — read only by the detail pane — then drop it in summarizeEvent,\n"+
+					"    and add it to the search route's matcher (search.go), or the details\n"+
+					"    search stops seeing it.\n"+
 					"Then update this count.", g.name, got, g.want)
 			}
 		})

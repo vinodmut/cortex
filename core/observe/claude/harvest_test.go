@@ -1262,8 +1262,8 @@ func TestTitleFromTranscript_UnwrapsSlashCommands(t *testing.T) {
 		},
 		{
 			"name only",
-			`<command-message>clear</command-message>\n<command-name>/clear</command-name>\n<command-args></command-args>`,
-			"/clear",
+			`<command-message>review</command-message>\n<command-name>/review</command-name>\n<command-args></command-args>`,
+			"/review",
 		},
 		{
 			"ordinary prose is untouched",
@@ -1282,6 +1282,46 @@ func TestTitleFromTranscript_UnwrapsSlashCommands(t *testing.T) {
 			got, gerr := titleFromTranscript(filepath.Join(dir, "s.jsonl"))
 			if gerr != nil {
 				t.Fatal(gerr)
+			}
+			if got != tc.want {
+				t.Errorf("title = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// /clear never names a session. Claude Code writes it as the first user turn of the transcript it
+// starts, so a session left idle after /clear was titled "/clear".
+func TestTitleFromTranscript_ClearNamesNothing(t *testing.T) {
+	const clear = `<command-name>/clear</command-name>\n            <command-message>clear</command-message>\n            <command-args></command-args>`
+	user := func(content string) string {
+		body, err := json.Marshal(strings.ReplaceAll(content, `\n`, "\n"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return `{"type":"user","cwd":"/w/repo","message":{"role":"user","content":` + string(body) + `}}`
+	}
+	human := func(line string) string {
+		return strings.Replace(line, `"type":"user",`, `"type":"user","origin":{"kind":"human"},`, 1)
+	}
+	for _, tc := range []struct {
+		name  string
+		lines []string
+		want  string
+	}{
+		{"alone falls through to the cwd", []string{user(clear)}, "/w/repo"},
+		{"attributed human turn", []string{human(user(clear))}, "/w/repo"},
+		{"last-prompt record", []string{user(clear), `{"type":"last-prompt","lastPrompt":"/clear"}`}, "/w/repo"},
+		{"the prompt after it wins", []string{user(clear), user("fix the title bug")}, "fix the title bug"},
+		{"a prompt before it is kept", []string{user("fix the title bug"), user(clear)}, "fix the title bug"},
+		{"a longer command name is not /clear", []string{user(`<command-name>/clearcache</command-name><command-args></command-args>`)}, "/clearcache"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			writeSessionTranscript(t, dir, "s.jsonl", tc.lines...)
+			got, err := titleFromTranscript(filepath.Join(dir, "s.jsonl"))
+			if err != nil {
+				t.Fatal(err)
 			}
 			if got != tc.want {
 				t.Errorf("title = %q, want %q", got, tc.want)
@@ -2995,6 +3035,45 @@ func TestHarvest_ReadsSubagentMetaFiles(t *testing.T) {
 	}
 }
 
+// The Workflow tool's agents keep their meta files in subagents/workflows/<run>/. They
+// start without a write to the main transcript, so an incremental harvest that skips the
+// unchanged transcript must still find an agent that started after the last harvest.
+func TestHarvest_ReadsWorkflowSubagentsWhenTranscriptIsUnchanged(t *testing.T) {
+	metadataHome(t)
+	cfg := filepath.Join(t.TempDir(), "claude")
+	proj := filepath.Join(cfg, "projects", "-p")
+	writeSessionTranscript(t, proj, "s1.jsonl", `{"type":"ai-title","aiTitle":"t"}`)
+	subs := filepath.Join(proj, "s1", "subagents")
+	writeSessionTranscript(t, subs, "agent-a1.meta.json", `{"description":"Agent tool child"}`)
+	run := filepath.Join(subs, "workflows", "wf_1")
+	writeSessionTranscript(t, run, "agent-b1.meta.json", `{"agentType":"workflow-subagent","description":"implement T1: x"}`)
+
+	if _, err := Harvest(Options{ConfigDir: cfg, Merge: true, Incremental: true}); err != nil {
+		t.Fatal(err)
+	}
+	writeSessionTranscript(t, run, "agent-b2.meta.json", `{"description":"merge T1: x"}`)
+	res, err := Harvest(Options{ConfigDir: cfg, Merge: true, Incremental: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Skipped != 1 {
+		t.Fatalf("Skipped = %d, want 1: the transcript did not change", res.Skipped)
+	}
+	got := readMetadataFile(t, res.Path)["s1"]
+	want := map[string]string{"a1": "Agent tool child", "b1": "implement T1: x", "b2": "merge T1: x"}
+	if len(got.Subagents) != len(want) {
+		t.Fatalf("Subagents = %v, want %v", got.Subagents, want)
+	}
+	for id, d := range want {
+		if got.Subagents[id].Description != d {
+			t.Errorf("Subagents[%s] = %+v, want description %q", id, got.Subagents[id], d)
+		}
+	}
+	if got.Title != "t" {
+		t.Errorf("Title = %q, want the kept title", got.Title)
+	}
+}
+
 // A session with no subagents carries no Subagents map at all, so the JSON spells nothing
 // out for the sessions that have none — which is most of them.
 func TestHarvest_SessionWithoutSubagentsHasNoMap(t *testing.T) {
@@ -3009,5 +3088,48 @@ func TestHarvest_SessionWithoutSubagentsHasNoMap(t *testing.T) {
 	}
 	if got := readMetadataFile(t, res.Path)["s1"].Subagents; got != nil {
 		t.Errorf("Subagents = %v, want nil", got)
+	}
+}
+
+// An entry an older build titled "/clear" is re-parsed even when its transcript has not moved:
+// a session left idle after /clear never writes again, so the mtime skip would keep the title.
+func TestHarvest_IncrementalReparsesAClearTitle(t *testing.T) {
+	for _, title := range []string{"/clear", "/clear my-feature"} {
+		t.Run(title, func(t *testing.T) {
+			metadataHome(t)
+			cfg := filepath.Join(t.TempDir(), "claude")
+			proj := filepath.Join(cfg, "projects", "-p")
+			log := filepath.Join(proj, "s1.jsonl")
+			writeSessionTranscript(t, proj, "s1.jsonl", `{"type":"ai-title","aiTitle":"current"}`)
+			touch(t, log, time.Now().Add(-time.Hour))
+
+			path, err := SessionMetadataPath()
+			if err != nil {
+				t.Fatal(err)
+			}
+			old, err := json.Marshal(map[string]SessionMetadata{"s1": {
+				Title: title, AgentType: "Claude Code", LogFile: log, LogModTime: time.Now(),
+			}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path, old, 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			res, err := Harvest(Options{ConfigDir: cfg, Merge: true, Incremental: true})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if res.Harvested != 1 || res.Skipped != 0 {
+				t.Errorf("harvested/skipped = %d/%d, want 1/0", res.Harvested, res.Skipped)
+			}
+			if got := readMetadataFile(t, res.Path)["s1"].Title; got != "current" {
+				t.Errorf("title = %q, want %q", got, "current")
+			}
+		})
 	}
 }
