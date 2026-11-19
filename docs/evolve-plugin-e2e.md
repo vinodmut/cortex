@@ -12,7 +12,7 @@ claude -p ──► dev Cortex (47700) ──► LLM gateway
                  │   ▲
    process_      │   │ get_guidelines_with_attribution
    trajectory    ▼   │ list_entities
-              evolve-mcp (8201) ── cortex-candidates  (learned, never injected)
+              evolve-mcp (8201) ── cortex-candidates  (learned, not injected)
                                 └─ cortex             (reviewed, injected)
 ```
 

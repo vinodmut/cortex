@@ -139,13 +139,24 @@ func TestConfigure_Validation(t *testing.T) {
 		`{"endpoint":"evolve:8202"}`,
 		`{"endpoint":"http://x","bogus":1}`,
 		`{"endpoint":"http://x","top_k":99}`,
-		`{"endpoint":"http://x","serve_namespace":"a","learn_namespace":"a"}`,
 		`{"endpoint":"http://x","min_turns":-1}`,
 		`{"endpoint":"http://x","placement":"tools"}`,
 	} {
 		if err := New().Configure(json.RawMessage(raw)); err == nil {
 			t.Errorf("Configure(%s) succeeded, want error", raw)
 		}
+	}
+}
+
+func TestConfigure_OneNamespaceServesWhatIsLearned(t *testing.T) {
+	// The same namespace for both skips the review: evolve's learned guidelines
+	// are served to the next session.
+	p := New()
+	if err := p.Configure(json.RawMessage(`{"endpoint":"http://x","serve_namespace":"cortex","learn_namespace":"cortex"}`)); err != nil {
+		t.Fatalf("Configure: %v", err)
+	}
+	if p.cfg.ServeNamespace != "cortex" || p.cfg.LearnNamespace != "cortex" {
+		t.Fatalf("namespaces = %q, %q", p.cfg.ServeNamespace, p.cfg.LearnNamespace)
 	}
 }
 

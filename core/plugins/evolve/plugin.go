@@ -15,10 +15,12 @@
 //     turns to evolve (process_trajectory) as one identified batch. Evolve
 //     generates guidelines from them into the learn namespace.
 //
-// The two namespaces are the review gate. Session content includes tool output
-// the agent read, so a guideline distilled from it can carry text an attacker
-// wrote. Learned guidelines therefore land in learn_namespace, which is never
-// injected from; a person copies the ones worth keeping into serve_namespace.
+// By default the two namespaces are a review gate. Session content includes
+// tool output the agent read, so a guideline distilled from it can carry text an
+// attacker wrote. Learned guidelines therefore land in learn_namespace, which is
+// not injected from; a person copies the ones worth keeping into
+// serve_namespace. Setting the two to the same namespace skips the review:
+// whatever evolve learns is served to the next session.
 //
 // Every failure fails open. Evolve unreachable, slow, or returning nonsense
 // means the request goes upstream untouched; the guidelines are an
@@ -45,8 +47,8 @@ const name = "evolve"
 
 type config struct {
 	Endpoint       string   `json:"endpoint" required:"true" description:"SSE URL of the evolve MCP server (evolve-mcp --transport sse), e.g. http://127.0.0.1:8201/sse."`
-	ServeNamespace string   `json:"serve_namespace" description:"Evolve namespace guidelines are injected from: the reviewed set." default:"cortex"`
-	LearnNamespace string   `json:"learn_namespace" description:"Evolve namespace learned guidelines are written to, for review. Never injected from." default:"cortex-candidates"`
+	ServeNamespace string   `json:"serve_namespace" description:"Evolve namespace guidelines are injected from: the reviewed set, unless it is also learn_namespace." default:"cortex"`
+	LearnNamespace string   `json:"learn_namespace" description:"Evolve namespace learned guidelines are written to, for review. Set it to serve_namespace to serve learned guidelines without review." default:"cortex-candidates"`
 	Profile        string   `json:"processing_profile" description:"Evolve processing profile the plugin creates and learns with." default:"cortex"`
 	Inject         *bool    `json:"inject" description:"Append guidelines to main-agent requests." default:"true"`
 	Placement      string   `json:"placement" description:"Where guidelines go: system (after the system instructions) or user (a system-reminder on the first user message)." default:"system" enum:"system,user"`
@@ -99,9 +101,6 @@ func (c *config) applyDefaults() {
 func (c *config) validate() error {
 	if !strings.HasPrefix(c.Endpoint, "http://") && !strings.HasPrefix(c.Endpoint, "https://") {
 		return fmt.Errorf("endpoint must be an http(s) URL, got %q", c.Endpoint)
-	}
-	if c.ServeNamespace == c.LearnNamespace {
-		return fmt.Errorf("serve_namespace and learn_namespace must differ: learned guidelines are reviewed before they are served")
 	}
 	if c.Placement != placementSystem && c.Placement != placementUser {
 		return fmt.Errorf("placement must be %q or %q, got %q", placementSystem, placementUser, c.Placement)

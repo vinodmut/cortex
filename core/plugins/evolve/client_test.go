@@ -21,6 +21,11 @@ type fakeEvolveServer struct {
 	headers   []http.Header
 	failLearn bool
 	listErr   bool
+	// old is an evolve that predates include_details: it rejects the argument
+	// the way pydantic does.
+	old bool
+	// noDetailsField accepts include_details but answers without guidelines.
+	noDetailsField bool
 }
 
 func (f *fakeEvolveServer) record(req mcp.CallToolRequest) {
@@ -39,7 +44,20 @@ func (f *fakeEvolveServer) start(t *testing.T) string {
 	}
 	s.AddTool(mcp.NewTool("get_guidelines_with_attribution"), func(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		f.record(req)
-		return text(map[string]any{"text": "prose", "entity_ids": []string{"7", "9"}, "entity_revisions": map[string]any{"7": 2, "9": nil}, "namespace_id": "cortex"}), nil
+		_, details := req.GetArguments()["include_details"]
+		if details && f.old {
+			return mcp.NewToolResultError("1 validation error for call[get_guidelines_with_attribution]\ninclude_details\n" +
+				"  Unexpected keyword argument [type=unexpected_keyword_argument, input_value=True, input_type=bool]"), nil
+		}
+		out := map[string]any{"text": "prose", "entity_ids": []string{"7", "9"}, "entity_revisions": map[string]any{"7": 2, "9": nil}, "namespace_id": "cortex"}
+		if details && !f.noDetailsField {
+			// 9 was consolidated from two sessions, and its content is structured.
+			out["guidelines"] = []any{
+				map[string]any{"id": "7", "content": "guideline 7", "trigger": "when testing", "source_task_ids": []string{"cortex:s:7"}},
+				map[string]any{"id": "9", "content": map[string]any{"rule": "guideline 9"}, "trigger": nil, "source_task_ids": []string{"cortex:a:1", "cortex:b:2"}},
+			}
+		}
+		return text(out), nil
 	})
 	s.AddTool(mcp.NewTool("ensure_processing_profile"), func(_ context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		f.record(req)
@@ -79,7 +97,7 @@ func (f *fakeEvolveServer) tools() []string {
 	return names
 }
 
-func TestMCPEvolve_GuidelinesReadsEachAttributedEntity(t *testing.T) {
+func TestMCPEvolve_GuidelinesComeWithTheirAttribution(t *testing.T) {
 	f := &fakeEvolveServer{}
 	e := newMCPEvolve(f.start(t), "cortex", time.Second)
 	defer e.Close()
@@ -89,15 +107,70 @@ func TestMCPEvolve_GuidelinesReadsEachAttributedEntity(t *testing.T) {
 		t.Fatal(err)
 	}
 	if len(gs) != 2 || gs[0].ID != "7" || gs[0].Content != "guideline 7" || *gs[0].Revision != 2 || gs[0].Source != "cortex:s:7" ||
-		gs[1].ID != "9" || gs[1].Content != "guideline 9" || gs[1].Revision != nil {
+		gs[1].ID != "9" || gs[1].Content != `{"rule":"guideline 9"}` || gs[1].Revision != nil || gs[1].Source != "cortex:a:1,cortex:b:2" {
 		t.Fatalf("guidelines = %+v", gs)
 	}
 	args := f.calls[0].GetArguments()
-	if args["task"] != "fix the test" || args["namespace_id"] != "cortex" || args["session_id"] != "s1" {
+	if args["task"] != "fix the test" || args["namespace_id"] != "cortex" || args["session_id"] != "s1" || args["include_details"] != true {
 		t.Fatalf("args = %v", args)
 	}
-	if a := f.calls[1].GetArguments(); f.calls[1].Params.Name != "list_entities" || a["namespace_id"] != "cortex" || a["include_content"] != true {
-		t.Fatalf("second call = %s %v, want list_entities of the serve namespace with content", f.calls[1].Params.Name, a)
+	// One call: the guidelines come with their attribution, with no namespace read
+	// and so no cap on how large the served namespace can be.
+	if got := f.tools(); len(got) != 1 {
+		t.Fatalf("tools called = %v, want only get_guidelines_with_attribution", got)
+	}
+}
+
+func TestMCPEvolve_OlderEvolveFallsBackToReadingTheNamespace(t *testing.T) {
+	f := &fakeEvolveServer{old: true}
+	e := newMCPEvolve(f.start(t), "cortex", time.Second)
+	defer e.Close()
+
+	for range 2 {
+		gs, err := e.Guidelines(context.Background(), "cortex", "fix the test", "s1")
+		if err != nil {
+			t.Fatal(err)
+		}
+		// 8 is in the namespace but not attributed, so it is left out.
+		if len(gs) != 2 || gs[0].ID != "7" || gs[0].Content != "guideline 7" || *gs[0].Revision != 2 || gs[0].Source != "cortex:s:7" ||
+			gs[1].ID != "9" || gs[1].Content != "guideline 9" || gs[1].Revision != nil {
+			t.Fatalf("guidelines = %+v", gs)
+		}
+	}
+	// The first fetch learns that this evolve rejects include_details; the second
+	// doesn't send it again.
+	got := f.tools()
+	want := []string{"get_guidelines_with_attribution", "get_guidelines_with_attribution", "list_entities", "get_guidelines_with_attribution", "list_entities"}
+	if len(got) != len(want) {
+		t.Fatalf("tools called = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("tools called = %v, want %v", got, want)
+		}
+	}
+	if _, sent := f.calls[1].GetArguments()["include_details"]; sent {
+		t.Fatal("retry still sent include_details")
+	}
+	if _, sent := f.calls[3].GetArguments()["include_details"]; sent {
+		t.Fatal("include_details sent again to an evolve that rejected it")
+	}
+	if a := f.calls[2].GetArguments(); a["namespace_id"] != "cortex" || a["include_content"] != true {
+		t.Fatalf("list_entities args = %v, want the serve namespace with content", a)
+	}
+}
+
+func TestMCPEvolve_AttributionWithoutDetailsReadsTheNamespace(t *testing.T) {
+	f := &fakeEvolveServer{noDetailsField: true}
+	e := newMCPEvolve(f.start(t), "cortex", time.Second)
+	defer e.Close()
+
+	gs, err := e.Guidelines(context.Background(), "cortex", "t", "s")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := f.tools(); len(got) != 2 || got[1] != "list_entities" || len(gs) != 2 || gs[0].Source != "cortex:s:7" {
+		t.Fatalf("tools called = %v, guidelines = %+v", got, gs)
 	}
 }
 
@@ -139,7 +212,7 @@ func TestMCPEvolve_ToolErrorsAreUnavailable(t *testing.T) {
 	if !errors.Is(err, ErrUnavailable) {
 		t.Fatalf("err = %v", err)
 	}
-	f.listErr = true
+	f.listErr, f.noDetailsField = true, true
 	if _, err := e.Guidelines(context.Background(), "cortex", "t", "s"); !errors.Is(err, ErrUnavailable) {
 		t.Fatalf("list error = %v", err)
 	}

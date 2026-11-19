@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -30,7 +31,9 @@ type Guideline struct {
 	ID       string
 	Content  string
 	Revision *int
-	// Source is the trajectory the guideline was learned from (source_task_id).
+	// Source is the trajectory the guideline was learned from (its source task
+	// id), or several, comma-separated, for a guideline consolidated from more
+	// than one.
 	Source string
 }
 
@@ -59,7 +62,8 @@ type Batch struct {
 var ErrUnavailable = errors.New("evolve unavailable")
 
 // maxServedGuidelines is the most guidelines read from the served namespace
-// (list_entities caps a page at 200).
+// when evolve can't return them with their attribution (list_entities caps a
+// page at 200).
 const maxServedGuidelines = 200
 
 // sentinelHeader marks the plugin's own calls so that, should one ever loop
@@ -91,6 +95,11 @@ type mcpEvolve struct {
 	mu      sync.Mutex
 	client  *mcpclient.Client
 	ensured bool
+	// noDetails records that this evolve predates include_details on
+	// get_guidelines_with_attribution, so Guidelines reads the guidelines with
+	// list_entities instead. Cleared with the session, in case evolve was
+	// upgraded in the meantime.
+	noDetails bool
 }
 
 func newMCPEvolve(url, profile string, timeout time.Duration) *mcpEvolve {
@@ -137,6 +146,7 @@ func (e *mcpEvolve) drop(c *mcpclient.Client) {
 		_ = c.Close()
 		e.client = nil
 		e.ensured = false
+		e.noDetails = false
 	}
 }
 
@@ -178,13 +188,39 @@ func resultText(res *mcp.CallToolResult) string {
 type attribution struct {
 	EntityIDs       []string        `json:"entity_ids"`
 	EntityRevisions map[string]*int `json:"entity_revisions"`
-	Error           string          `json:"error"`
+	// Guidelines is present when evolve honoured include_details: each selected
+	// guideline's content and sources, in the order of EntityIDs.
+	Guidelines *[]attributed `json:"guidelines"`
+	Error      string        `json:"error"`
 }
 
+type attributed struct {
+	ID            string   `json:"id"`
+	Content       any      `json:"content"`
+	SourceTaskIDs []string `json:"source_task_ids"`
+}
+
+// detailsArg is get_guidelines_with_attribution's option to return each
+// guideline's content and sources (altk-evolve #485). An evolve that predates it
+// rejects it as an unexpected argument.
+const detailsArg = "include_details"
+
 func (e *mcpEvolve) Guidelines(ctx context.Context, namespace, task, sessionID string) ([]Guideline, error) {
-	text, err := e.call(ctx, "get_guidelines_with_attribution", map[string]any{
-		"task": task, "namespace_id": namespace, "session_id": sessionID,
-	})
+	args := map[string]any{"task": task, "namespace_id": namespace, "session_id": sessionID}
+	e.mu.Lock()
+	details := !e.noDetails
+	e.mu.Unlock()
+	if details {
+		args[detailsArg] = true
+	}
+	text, err := e.call(ctx, "get_guidelines_with_attribution", args)
+	if err != nil && details && strings.Contains(err.Error(), detailsArg) {
+		e.mu.Lock()
+		e.noDetails = true
+		e.mu.Unlock()
+		delete(args, detailsArg)
+		text, err = e.call(ctx, "get_guidelines_with_attribution", args)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -199,10 +235,22 @@ func (e *mcpEvolve) Guidelines(ctx context.Context, namespace, task, sessionID s
 		return nil, nil
 	}
 	// The attribution's prose is evolve's own prompt wording; the plugin owns the
-	// block's format, so it takes the ids and reads the guidelines themselves.
-	// list_entities rather than get_entity: get_entity refuses a guideline whose
-	// agent_id differs from the caller's, and a caller cannot name one agent that
-	// owns both unowned and agent-owned guidelines.
+	// block's format, so it takes each guideline's content and renders the block
+	// itself.
+	if a.Guidelines != nil {
+		out := make([]Guideline, 0, len(*a.Guidelines))
+		for _, g := range *a.Guidelines {
+			out = append(out, Guideline{
+				ID: g.ID, Content: contentText(g.Content), Revision: a.EntityRevisions[g.ID],
+				Source: strings.Join(g.SourceTaskIDs, ","),
+			})
+		}
+		return out, nil
+	}
+	// An evolve without include_details returns only the ids, so the guidelines
+	// are read separately. list_entities rather than get_entity: get_entity
+	// refuses a guideline whose agent_id differs from the caller's, and a caller
+	// cannot name one agent that owns both unowned and agent-owned guidelines.
 	byID, err := e.guidelineIndex(ctx, namespace)
 	if err != nil {
 		return nil, err
@@ -211,7 +259,7 @@ func (e *mcpEvolve) Guidelines(ctx context.Context, namespace, task, sessionID s
 	for _, id := range a.EntityIDs {
 		g, ok := byID[id]
 		if !ok {
-			continue // removed between the two calls
+			continue // removed between the two calls, or beyond maxServedGuidelines
 		}
 		g.Revision = a.EntityRevisions[id]
 		out = append(out, g)
@@ -219,9 +267,18 @@ func (e *mcpEvolve) Guidelines(ctx context.Context, namespace, task, sessionID s
 	return out, nil
 }
 
-// guidelineIndex reads every guideline in namespace, keyed by id. The served
-// namespace is a reviewed set, small by construction; maxServedGuidelines
-// bounds the read regardless.
+func contentText(content any) string {
+	if s, ok := content.(string); ok {
+		return s
+	}
+	b, _ := json.Marshal(content)
+	return string(b)
+}
+
+// guidelineIndex reads the guidelines in namespace, keyed by id, for an evolve
+// that can't return them with their attribution. It reads at most
+// maxServedGuidelines, so in a larger namespace (one learned into directly, say)
+// some attributed guidelines are missed.
 func (e *mcpEvolve) guidelineIndex(ctx context.Context, namespace string) (map[string]Guideline, error) {
 	text, err := e.call(ctx, "list_entities", map[string]any{
 		"namespace_id": namespace, "entity_types": []string{"guideline"},
@@ -246,13 +303,7 @@ func (e *mcpEvolve) guidelineIndex(ctx context.Context, namespace string) (map[s
 	}
 	out := make(map[string]Guideline, len(page.Items))
 	for _, item := range page.Items {
-		g := Guideline{ID: item.ID}
-		if s, ok := item.Content.(string); ok {
-			g.Content = s
-		} else {
-			b, _ := json.Marshal(item.Content)
-			g.Content = string(b)
-		}
+		g := Guideline{ID: item.ID, Content: contentText(item.Content)}
 		g.Source, _ = item.Metadata["source_task_id"].(string)
 		out[item.ID] = g
 	}

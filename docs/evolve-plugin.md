@@ -8,19 +8,26 @@ better — from agent trajectories. It closes the loop rossoctl#2653 describes:
 2. **Learn** — when a session goes quiet, it sends the new turns to evolve, which distils
    guidelines from them into a **candidates** namespace.
 3. **Inject** — on each main-agent request, it appends the guidelines relevant to the
-   session's task, from a separate **reviewed** namespace, to the system instructions.
+   session's task, from a **reviewed** namespace (separate by default), to the system
+   instructions.
 
 Evolve is Python, so it runs beside Cortex and the plugin is a client of its stock MCP server
-(`evolve-mcp --transport sse`) — no evolve-side changes. The tools it calls:
+(`evolve-mcp --transport sse`). The tools it calls:
 
 | Purpose | Tool |
 |---|---|
-| Fetch the task-relevant guideline ids | `get_guidelines_with_attribution` |
-| Read their text and provenance | `list_entities` |
+| Fetch the task-relevant guidelines, with their text and provenance | `get_guidelines_with_attribution`, with `include_details` |
+| Read their text and provenance, on an evolve without `include_details` | `list_entities` |
 | Create the plugin's processing profile, once | `ensure_processing_profile` |
 | Learn from a batch of turns | `process_trajectory` |
 
-## Nothing learned is injected until a person accepts it
+`include_details` (altk-evolve #485) returns each selected guideline's content and sources with
+its id, in one call. An evolve that predates it rejects the argument; the plugin then asks
+again without it and reads the guidelines with `list_entities`, which reads at most 200 from
+the served namespace. It asks with `include_details` again after reconnecting, in case evolve
+was upgraded.
+
+## By default, nothing learned is injected until a person accepts it
 
 Session content includes tool output: fetched web pages, file contents, command output. A
 guideline distilled from it can carry text an attacker wrote, and injecting it makes that text
@@ -43,6 +50,18 @@ written to, so a trajectory can never rewrite or delete a reviewed guideline.
 
 A withdrawn guideline stops being injected once each session's cache expires
 (`cache_ttl_seconds`, default 30 minutes).
+
+### Serving what is learned, without review
+
+Setting `learn_namespace` to the same namespace as `serve_namespace` turns the review off:
+whatever evolve learns from a session is served to the next one. Use it only where every
+session's input is trusted, such as a local demo. In that setup:
+
+- An attacker's text in a tool result can become a guideline that later sessions are given.
+- A guideline can reinforce itself: sessions given it tend to follow it, evolve can learn it
+  again from that, and conflict resolution merges the copies, raising its support. At enough
+  support it joins evolve's always-on core and is injected whatever the task.
+- Withdrawing a guideline means deleting it from that namespace.
 
 ## What a request looks like
 
@@ -93,7 +112,7 @@ reason otherwise) and publishes `plugins.evolve` on its session event:
 ```
 
 `ids` name exactly which guidelines shaped the request; `sources` is the session batch each
-was learned from. agentop's detail pane shows the event; the plugin pane shows counters
+was learned from (comma-separated for a guideline consolidated from several). agentop's detail pane shows the event; the plugin pane shows counters
 (`requests injected`, `fetch errors`, `sessions sent to learn`, …).
 
 ## Failure policy: open
@@ -122,8 +141,8 @@ pipeline:
 | Field | Default | Meaning |
 |---|---|---|
 | `endpoint` | required | SSE URL of `evolve-mcp --transport sse`. |
-| `serve_namespace` | `cortex` | Reviewed guidelines, injected from. |
-| `learn_namespace` | `cortex-candidates` | Learned guidelines, for review. Must differ. |
+| `serve_namespace` | `cortex` | Guidelines injected from: the reviewed set, unless it is also `learn_namespace`. |
+| `learn_namespace` | `cortex-candidates` | Learned guidelines, for review. Set it to `serve_namespace` to serve them [without review](#serving-what-is-learned-without-review). |
 | `processing_profile` | `cortex` | Evolve profile created and used for learning. |
 | `inject` | `true` | Append guidelines to main-agent requests. |
 | `placement` | `system` | `system`: after the system instructions. `user`: a `<system-reminder>` leading the first user message. |
