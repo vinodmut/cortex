@@ -2,7 +2,7 @@
 
 The `evolve` plugin connects Cortex to [altk-evolve](https://github.com/AgentToolkit/altk-evolve),
 a service that learns *guidelines* — short instructions that would have steered an agent
-better — from agent trajectories. It closes the loop rossoctl#2653 describes:
+better — from agent trajectories. It closes the loop [rossoctl#2653](https://github.com/rossoctl/rossoctl/issues/2653) describes:
 
 1. **Capture** — the plugin records each completed main-agent turn as OpenAI chat messages.
 2. **Learn** — when a session goes quiet, it sends the new turns to evolve, which distils
@@ -21,10 +21,10 @@ Evolve is Python, so it runs beside Cortex and the plugin is a client of its sto
 | Create the plugin's processing profile, once | `ensure_processing_profile` |
 | Learn from a batch of turns | `process_trajectory` |
 
-`include_details` (altk-evolve #485) returns each selected guideline's content and sources with
+`include_details` ([altk-evolve #485](https://github.com/AgentToolkit/altk-evolve/pull/485)) returns each selected guideline's content and sources with
 its id, in one call. An evolve that predates it rejects the argument; the plugin then asks
-again without it and reads the guidelines with `list_entities`, which reads at most 200 from
-the served namespace. It asks with `include_details` again after reconnecting, in case evolve
+again without it and reads the guidelines with `list_entities`, a page at a time until it has
+found the ones selected. It asks with `include_details` again after reconnecting, in case evolve
 was upgraded.
 
 ## By default, nothing learned is injected until a person accepts it
@@ -49,7 +49,10 @@ evolve's conflict resolution reconciles new guidelines only against the namespac
 written to, so a trajectory can never rewrite or delete a reviewed guideline.
 
 A withdrawn guideline stops being injected once each session's cache expires
-(`cache_ttl_seconds`, default 30 minutes).
+(`cache_ttl_seconds`, default 30 minutes) and its guidelines are fetched again. If evolve
+can't be reached then, the session keeps the guidelines it had, withdrawn ones included, and
+its event says `refresh_failed`, until a refresh succeeds. To stop every guideline at once,
+remove the `evolve` entry from the pipeline.
 
 ### Serving what is learned, without review
 
@@ -81,8 +84,8 @@ Guidelines learned from earlier sessions on this machine. Apply them when they a
 </evolve-guidelines>
 ```
 
-Guidelines are fetched **once per session** (from the session's first user message, with
-`<system-reminder>` context removed) and the rendered block is cached, so every turn appends
+Guidelines are fetched **once per session** (from the session's first user message, with the
+agent's harness context removed) and the rendered block is cached, so every turn appends
 identical bytes and the provider's prompt cache keeps hitting. Requests the plugin leaves
 alone: subagents, tool-less side calls (titles, summaries), sessions without an id, agents
 outside `agents`, and its own calls (`X-Evolve-Cortex`).
@@ -92,14 +95,32 @@ outside `agents`, and its own calls (`X-Evolve-Cortex`).
 Only the main conversation of sessions the plugin saw: each successful (2xx) main-agent
 exchange contributes the new user messages, the assistant's reply and tool calls, and the tool
 results the next request carried (truncated to 4 KB each, errors marked `[error]`).
-`<system-reminder>` and `<evolve-guidelines>` blocks are stripped, so evolve does not learn
-from harness context or from its own injected guidelines. A session is sent once it has been
+Harness context and `<evolve-guidelines>` blocks are stripped, so evolve does not learn from
+the agent's own context or from its injected guidelines. Harness context is Claude Code's
+`<system-reminder>` blocks, and the blocks Codex sends as user text ahead of the prompt: the
+repo's AGENTS.md instructions, `<environment_context>` (cwd, shell, date) and the like. A session is sent once it has been
 idle for `idle_after_seconds` with at least `min_turns` new turns; a resumed session sends only
 its new turns, with the original task as context.
 
 Each send is an identified batch (`source: cortex`, the session id, a per-process sequence
 number): a send that is retried after a timeout is skipped by evolve if it was already
 processed. Unsent turns live in memory, so a Cortex restart drops them.
+
+### Which prompt evolve learns with
+
+The plugin's processing profile names evolve's `environment-grounded` guideline prompt
+(altk-evolve [#479](https://github.com/AgentToolkit/altk-evolve/pull/479)). Coding agents work
+where the project states its own rules: a pre-commit hook, a CI check or an error message says
+what to do. That prompt turns each such requirement into a step to take first ("before
+committing, add an entry under `## Unreleased` in `CHANGES.md`"), where evolve's general
+prompt tends to learn it as advice about recovering from the error. Set `guidelines_prompt` to
+name another prompt, or to `""` to use whatever the evolve server is configured with
+(`EVOLVE_GUIDELINES_PROMPT`).
+
+An evolve that can't take the prompt still learns. If it predates [altk-evolve #479](https://github.com/AgentToolkit/altk-evolve/pull/479) it rejects the key, and
+if it doesn't have the prompt it rejects the name. In both cases the plugin logs
+`evolve can't take the configured guideline prompt` once, and creates the profile with the
+server's default prompt. It asks with the prompt again after reconnecting.
 
 ## Seeing what it did
 
@@ -120,7 +141,9 @@ was learned from (comma-separated for a guideline consolidated from several). ag
 Evolve unreachable, slow (`timeout_ms`, default 3 s, paid once per session), or returning an
 error means the request is forwarded **unchanged**, a fetch error is counted, and the plugin
 tries again after `retry_after_seconds`. A session that already has guidelines keeps them
-through a failed refresh. A failed learning send is retried on the next 30-second tick.
+through a failed refresh. A failed learning send is sent again as it was, under its own batch
+id, after a wait that doubles from 30 seconds; new turns wait for it and go in a later batch.
+After 6 failed sends the batch is dropped, with a warning and a `batches dropped` count.
 
 ## Configuration
 
@@ -144,6 +167,7 @@ pipeline:
 | `serve_namespace` | `cortex` | Guidelines injected from: the reviewed set, unless it is also `learn_namespace`. |
 | `learn_namespace` | `cortex-candidates` | Learned guidelines, for review. Set it to `serve_namespace` to serve them [without review](#serving-what-is-learned-without-review). |
 | `processing_profile` | `cortex` | Evolve profile created and used for learning. |
+| `guidelines_prompt` | `environment-grounded` | Evolve guideline prompt the profile learns with. `""`: the evolve server's own default. See [Which prompt evolve learns with](#which-prompt-evolve-learns-with). |
 | `inject` | `true` | Append guidelines to main-agent requests. |
 | `placement` | `system` | `system`: after the system instructions. `user`: a `<system-reminder>` leading the first user message. |
 | `learn` | `true` | Send idle sessions' new turns to evolve. |
@@ -190,7 +214,7 @@ stay in evolve.
 
 - **Shadow evaluation.** Adoption is a manual copy today. Injecting a candidate on a fraction
   of sessions and promoting it only when cost and an outcome signal strictly beat the baseline
-  (rossoctl#2653, SkillOpt's gate) is the next step.
+  ([rossoctl#2653](https://github.com/rossoctl/rossoctl/issues/2653), SkillOpt's gate) is the next step.
 - Redaction of session content before it reaches evolve's LLM (evolve's hooks can do this but
   are opt-in), and subagent trajectories.
 - Ordering with `context-guru`, which may compact the block away; place `evolve` after it.

@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -61,27 +63,43 @@ type Batch struct {
 // on all of them.
 var ErrUnavailable = errors.New("evolve unavailable")
 
-// maxServedGuidelines is the most guidelines read from the served namespace
-// when evolve can't return them with their attribution (list_entities caps a
-// page at 200).
-const maxServedGuidelines = 200
+// listPageSize is list_entities' largest page, and maxListPages the most pages
+// read to find the selected guidelines when evolve can't return them with their
+// attribution. The pages are read within the fetch's own timeout.
+const (
+	listPageSize = 200
+	maxListPages = 100
+)
+
+// connectTimeout bounds establishing the SSE session: the dial, the stream's
+// response headers, the endpoint event and initialize. A caller waits for a
+// connect only as long as its own context allows; the connect carries on, for
+// the calls after it, until this bound.
+const connectTimeout = 10 * time.Second
 
 // sentinelHeader marks the plugin's own calls so that, should one ever loop
 // back through the listener, OnRequest skips it instead of recursing.
 const sentinelHeader = "X-Evolve-Cortex"
 
 // profileDefinition is the processing profile the plugin owns on the evolve
-// server: standard guideline generation. ensure_processing_profile creates it
-// once and keeps operator edits made to it afterwards.
-var profileDefinition = map[string]any{
-	"processors": []any{map[string]any{
-		"id": "guidelines", "plugin": "evolve.guidelines",
-		"config": map[string]any{"guidelines_mode": "standard"},
-	}},
+// server: standard guideline generation, with the named guideline prompt, or
+// with the server's own default prompt when prompt is empty.
+// ensure_processing_profile creates it once and keeps operator edits made to it
+// afterwards.
+func profileDefinition(prompt string) map[string]any {
+	config := map[string]any{"guidelines_mode": "standard"}
+	if prompt != "" {
+		config["guidelines_prompt"] = prompt
+	}
+	return map[string]any{
+		"processors": []any{map[string]any{"id": "guidelines", "plugin": "evolve.guidelines", "config": config}},
+	}
 }
 
 // mcpEvolve talks to `evolve-mcp --transport sse`. One SSE session is kept
-// open and re-established after a failure.
+// open and re-established after a failure. Connecting happens off the lock, one
+// attempt at a time, so a slow or hung evolve costs each call at most its own
+// timeout and never blocks calls on other sessions.
 //
 // Its http.Client never uses a proxy: Cortex is usually also the machine's
 // HTTPS_PROXY, and routing evolve's calls through it would record them as
@@ -89,79 +107,195 @@ var profileDefinition = map[string]any{
 type mcpEvolve struct {
 	url     string
 	profile string
+	prompt  string // guidelines_prompt for the processing profile; "" = the server's default
 	timeout time.Duration
 	http    *http.Client
 
-	mu      sync.Mutex
-	client  *mcpclient.Client
+	mu     sync.Mutex
+	client *conn
+	// connecting is closed when the connect in progress ends; nil when none is.
+	connecting chan struct{}
+	connErr    error // why the last connect failed
+	// gen counts Close calls, so a connect that finishes after one is discarded.
+	gen     int
 	ensured bool
 	// noDetails records that this evolve predates include_details on
 	// get_guidelines_with_attribution, so Guidelines reads the guidelines with
 	// list_entities instead. Cleared with the session, in case evolve was
 	// upgraded in the meantime.
 	noDetails bool
+	// noPrompt records that this evolve rejected guidelines_prompt (it predates
+	// altk-evolve #479, or doesn't have the prompt), so the profile is created
+	// with the server's default prompt. Cleared with the session, like noDetails.
+	noPrompt bool
 }
 
-func newMCPEvolve(url, profile string, timeout time.Duration) *mcpEvolve {
+func newMCPEvolve(url, profile, prompt string, timeout time.Duration) *mcpEvolve {
+	dialer := &net.Dialer{Timeout: connectTimeout, KeepAlive: 30 * time.Second}
 	return &mcpEvolve{
 		url:     url,
 		profile: profile,
+		prompt:  prompt,
 		timeout: timeout,
 		// No client timeout: the SSE stream is long-lived. Calls are bounded by ctx.
-		http: &http.Client{Transport: &http.Transport{Proxy: nil, MaxIdleConnsPerHost: 4, IdleConnTimeout: 90 * time.Second}},
+		// The dial and response-header timeouts bound only getting an answer started,
+		// so a server that accepts the connection and never answers can't hold one.
+		http: &http.Client{Transport: &http.Transport{
+			Proxy: nil, DialContext: dialer.DialContext, ResponseHeaderTimeout: connectTimeout,
+			MaxIdleConnsPerHost: 4, IdleConnTimeout: 90 * time.Second,
+		}},
 	}
 }
 
-func (e *mcpEvolve) session(ctx context.Context) (*mcpclient.Client, error) {
+// conn is one SSE session and the number of calls using it. A session that
+// failed is retired: later calls get a new one, and it is closed once its last
+// call returns. Closing it while a call still waits for its reply would cancel
+// that call, and could panic: mcp-go's reader sends a reply on the call's
+// channel after releasing its lock, and Close closes the channels still waiting.
+type conn struct {
+	c       *mcpclient.Client
+	calls   int
+	retired bool
+	closed  bool
+}
+
+// session returns the open SSE session, counted as in use until release,
+// starting a connect when there is none and none is in progress. The caller
+// waits for the connect only until its ctx ends; the connect itself is bounded
+// by connectTimeout.
+func (e *mcpEvolve) session(ctx context.Context) (*conn, error) {
+	e.mu.Lock()
+	if e.client != nil {
+		cn := e.client
+		cn.calls++
+		e.mu.Unlock()
+		return cn, nil
+	}
+	wait := e.connecting
+	if wait == nil {
+		wait = make(chan struct{})
+		e.connecting = wait
+		go e.connect(wait, e.gen)
+	}
+	e.mu.Unlock()
+	select {
+	case <-wait:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if e.client != nil {
+	switch {
+	case e.client != nil:
+		e.client.calls++
 		return e.client, nil
+	case e.connErr != nil:
+		return nil, e.connErr
 	}
+	return nil, errors.New("connection closed")
+}
+
+// connect establishes a session and publishes it, unless Close ran meanwhile.
+func (e *mcpEvolve) connect(done chan struct{}, gen int) {
+	c, err := e.dial()
+	e.mu.Lock()
+	e.connecting = nil
+	e.connErr = err
+	if err == nil {
+		if e.gen == gen {
+			e.client = &conn{c: c}
+		} else {
+			_ = c.Close()
+		}
+	}
+	e.mu.Unlock()
+	close(done)
+}
+
+func (e *mcpEvolve) dial() (*mcpclient.Client, error) {
 	c, err := mcpclient.NewSSEMCPClient(e.url,
 		transport.WithHTTPClient(e.http),
 		transport.WithHeaders(map[string]string{sentinelHeader: "1"}))
 	if err != nil {
 		return nil, err
 	}
-	// The stream outlives this call, so it must not inherit the caller's deadline.
-	if err := c.Start(context.Background()); err != nil {
+	// The stream outlives the connect, so its context has no deadline. The timer
+	// cancels it only if the session isn't up in time: mcp-go's own 30 s wait for
+	// the endpoint event starts only once the stream's headers have arrived.
+	stream, cancel := context.WithCancel(context.Background())
+	timer := time.AfterFunc(connectTimeout, cancel)
+	fail := func(err error) (*mcpclient.Client, error) {
+		timer.Stop()
+		cancel()
+		_ = c.Close()
 		return nil, err
 	}
+	if err := c.Start(stream); err != nil {
+		return fail(err)
+	}
+	initCtx, cancelInit := context.WithTimeout(context.Background(), connectTimeout)
+	defer cancelInit()
 	init := mcp.InitializeRequest{}
 	init.Params.ProtocolVersion = mcp.LATEST_PROTOCOL_VERSION
 	init.Params.ClientInfo = mcp.Implementation{Name: "cortex-evolve-plugin", Version: "1"}
-	if _, err := c.Initialize(ctx, init); err != nil {
-		_ = c.Close()
-		return nil, err
+	if _, err := c.Initialize(initCtx, init); err != nil {
+		return fail(err)
 	}
-	e.client = c
+	if !timer.Stop() {
+		return fail(fmt.Errorf("not connected within %s", connectTimeout))
+	}
 	return c, nil
 }
 
-func (e *mcpEvolve) drop(c *mcpclient.Client) {
+// release ends a call on cn. A call whose session failed retires it, and what
+// the plugin learned about this evolve (ensured, noDetails, noPrompt) is
+// forgotten with it, in case evolve was upgraded or replaced. A retired session
+// is closed once no call is using it.
+func (e *mcpEvolve) release(cn *conn, failed bool) {
 	e.mu.Lock()
-	defer e.mu.Unlock()
-	if e.client == c {
-		_ = c.Close()
-		e.client = nil
-		e.ensured = false
-		e.noDetails = false
+	cn.calls--
+	if failed && e.client == cn {
+		e.retire()
 	}
+	closeNow := cn.retired && cn.calls == 0 && !cn.closed
+	cn.closed = cn.closed || closeNow
+	e.mu.Unlock()
+	if closeNow {
+		_ = cn.c.Close()
+	}
+}
+
+// retire stops handing out the current session. Called with e.mu held.
+func (e *mcpEvolve) retire() {
+	e.client.retired = true
+	e.client = nil
+	e.ensured = false
+	e.noDetails = false
+	e.noPrompt = false
+}
+
+// broken reports whether a call's error means its session failed: a transport
+// error (the stream is gone, or evolve refused the request) other than the
+// caller's own deadline or cancellation. A tool error or a JSON-RPC error comes
+// back over a working session, and a call that timed out says nothing about the
+// calls still waiting on the same session.
+func broken(err error) bool {
+	var te *transport.Error
+	return errors.As(err, &te) && !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled)
 }
 
 // call invokes a tool and returns its text result.
 func (e *mcpEvolve) call(ctx context.Context, tool string, args map[string]any) (string, error) {
-	c, err := e.session(ctx)
+	cn, err := e.session(ctx)
 	if err != nil {
 		return "", fmt.Errorf("%w: connect: %v", ErrUnavailable, err)
 	}
 	req := mcp.CallToolRequest{}
 	req.Params.Name = tool
 	req.Params.Arguments = args
-	res, err := c.CallTool(ctx, req)
+	res, err := cn.c.CallTool(ctx, req)
+	e.release(cn, err != nil && broken(err))
 	if err != nil {
-		e.drop(c)
 		return "", fmt.Errorf("%w: %s: %v", ErrUnavailable, tool, err)
 	}
 	text := resultText(res)
@@ -251,7 +385,7 @@ func (e *mcpEvolve) Guidelines(ctx context.Context, namespace, task, sessionID s
 	// are read separately. list_entities rather than get_entity: get_entity
 	// refuses a guideline whose agent_id differs from the caller's, and a caller
 	// cannot name one agent that owns both unowned and agent-owned guidelines.
-	byID, err := e.guidelineIndex(ctx, namespace)
+	byID, err := e.guidelineIndex(ctx, namespace, a.EntityIDs)
 	if err != nil {
 		return nil, err
 	}
@@ -259,7 +393,7 @@ func (e *mcpEvolve) Guidelines(ctx context.Context, namespace, task, sessionID s
 	for _, id := range a.EntityIDs {
 		g, ok := byID[id]
 		if !ok {
-			continue // removed between the two calls, or beyond maxServedGuidelines
+			continue // removed between the two calls
 		}
 		g.Revision = a.EntityRevisions[id]
 		out = append(out, g)
@@ -275,37 +409,52 @@ func contentText(content any) string {
 	return string(b)
 }
 
-// guidelineIndex reads the guidelines in namespace, keyed by id, for an evolve
-// that can't return them with their attribution. It reads at most
-// maxServedGuidelines, so in a larger namespace (one learned into directly, say)
-// some attributed guidelines are missed.
-func (e *mcpEvolve) guidelineIndex(ctx context.Context, namespace string) (map[string]Guideline, error) {
-	text, err := e.call(ctx, "list_entities", map[string]any{
+// guidelineIndex reads the guidelines in namespace with the given ids, keyed by
+// id, for an evolve that can't return them with their attribution. It reads
+// list_entities pages until it has found them all or the namespace ends, so a
+// guideline selected from beyond the first page is found too.
+func (e *mcpEvolve) guidelineIndex(ctx context.Context, namespace string, ids []string) (map[string]Guideline, error) {
+	want := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		want[id] = true
+	}
+	out := make(map[string]Guideline, len(ids))
+	args := map[string]any{
 		"namespace_id": namespace, "entity_types": []string{"guideline"},
-		"include_content": true, "limit": maxServedGuidelines,
-	})
-	if err != nil {
-		return nil, err
+		"include_content": true, "limit": listPageSize,
 	}
-	var page struct {
-		Items []struct {
-			ID       string         `json:"id"`
-			Content  any            `json:"content"`
-			Metadata map[string]any `json:"metadata"`
-		} `json:"items"`
-		Error string `json:"error"`
-	}
-	if err := json.Unmarshal([]byte(text), &page); err != nil {
-		return nil, fmt.Errorf("%w: decode list_entities: %v", ErrUnavailable, err)
-	}
-	if page.Error != "" {
-		return nil, fmt.Errorf("%w: list_entities: %s", ErrUnavailable, page.Error)
-	}
-	out := make(map[string]Guideline, len(page.Items))
-	for _, item := range page.Items {
-		g := Guideline{ID: item.ID, Content: contentText(item.Content)}
-		g.Source, _ = item.Metadata["source_task_id"].(string)
-		out[item.ID] = g
+	for range maxListPages {
+		text, err := e.call(ctx, "list_entities", args)
+		if err != nil {
+			return nil, err
+		}
+		var page struct {
+			Items []struct {
+				ID       string         `json:"id"`
+				Content  any            `json:"content"`
+				Metadata map[string]any `json:"metadata"`
+			} `json:"items"`
+			NextCursor string `json:"next_cursor"`
+			Error      string `json:"error"`
+		}
+		if err := json.Unmarshal([]byte(text), &page); err != nil {
+			return nil, fmt.Errorf("%w: decode list_entities: %v", ErrUnavailable, err)
+		}
+		if page.Error != "" {
+			return nil, fmt.Errorf("%w: list_entities: %s", ErrUnavailable, page.Error)
+		}
+		for _, item := range page.Items {
+			if !want[item.ID] {
+				continue
+			}
+			g := Guideline{ID: item.ID, Content: contentText(item.Content)}
+			g.Source, _ = item.Metadata["source_task_id"].(string)
+			out[item.ID] = g
+		}
+		if len(out) == len(want) || page.NextCursor == "" {
+			break
+		}
+		args["cursor"] = page.NextCursor
 	}
 	return out, nil
 }
@@ -337,9 +486,7 @@ func (e *mcpEvolve) ensure(ctx context.Context, namespace string) error {
 	if done {
 		return nil
 	}
-	if _, err := e.call(ctx, "ensure_processing_profile", map[string]any{
-		"profile_id": e.profile, "definition": profileDefinition,
-	}); err != nil {
+	if err := e.ensureProfile(ctx); err != nil {
 		return err
 	}
 	if _, err := e.call(ctx, "list_entities", map[string]any{"namespace_id": namespace, "limit": 1}); err != nil {
@@ -351,12 +498,53 @@ func (e *mcpEvolve) ensure(ctx context.Context, namespace string) error {
 	return nil
 }
 
+// ensureProfile creates or refreshes the plugin's processing profile. An evolve
+// that can't take the configured guideline prompt (one that predates altk-evolve
+// #479 rejects the key, and one without the prompt rejects the name) still
+// learns, with its own default prompt: the plugin warns once and asks again
+// without the prompt, as it fails open everywhere else.
+func (e *mcpEvolve) ensureProfile(ctx context.Context) error {
+	e.mu.Lock()
+	prompt := e.prompt
+	if e.noPrompt {
+		prompt = ""
+	}
+	e.mu.Unlock()
+	_, err := e.call(ctx, "ensure_processing_profile", map[string]any{
+		"profile_id": e.profile, "definition": profileDefinition(prompt),
+	})
+	if err != nil && prompt != "" && strings.Contains(err.Error(), "guidelines_prompt") {
+		slog.Warn("evolve: evolve can't take the configured guideline prompt; learning with its default prompt",
+			"guidelines_prompt", prompt, "err", err)
+		e.mu.Lock()
+		e.noPrompt = true
+		e.mu.Unlock()
+		_, err = e.call(ctx, "ensure_processing_profile", map[string]any{
+			"profile_id": e.profile, "definition": profileDefinition(""),
+		})
+	}
+	return err
+}
+
+// Close retires the session, which closes once the calls still using it
+// return; those are bounded by their own contexts. It doesn't wait for a connect
+// in progress, which closes its own session when it finishes.
 func (e *mcpEvolve) Close() {
 	e.mu.Lock()
-	defer e.mu.Unlock()
+	e.gen++
+	var cn *conn
 	if e.client != nil {
-		_ = e.client.Close()
-		e.client = nil
+		cn = e.client
+		e.retire()
+		if cn.calls > 0 || cn.closed {
+			cn = nil
+		} else {
+			cn.closed = true
+		}
+	}
+	e.mu.Unlock()
+	if cn != nil {
+		_ = cn.c.Close()
 	}
 }
 

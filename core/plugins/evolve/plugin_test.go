@@ -4,11 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/tidwall/gjson"
 
@@ -25,24 +27,63 @@ type learned struct {
 }
 
 type fakeEvolve struct {
-	mu       sync.Mutex
-	gs       []Guideline
-	err      error
-	calls    []fetch
-	learned  []learned
-	learnErr error
+	mu         sync.Mutex
+	gs         []Guideline
+	err        error
+	calls      []fetch
+	learned    []learned
+	learnErr   error
+	learnCalls int
+	// learnHold, when set, keeps the next Learn from answering until it is
+	// closed; learning names the conversation that Learn is sending.
+	learnHold chan struct{}
+	learning  string
+	// hold, when set, keeps fetches for holdSession from answering until it is
+	// closed or the fetch's context ends.
+	hold        chan struct{}
+	holdSession string
 }
 
-func (f *fakeEvolve) Guidelines(_ context.Context, namespace, task, sessionID string) ([]Guideline, error) {
+func (f *fakeEvolve) Guidelines(ctx context.Context, namespace, task, sessionID string) ([]Guideline, error) {
+	f.mu.Lock()
+	f.calls = append(f.calls, fetch{namespace, task, sessionID})
+	hold := f.hold
+	if sessionID != f.holdSession {
+		hold = nil
+	}
+	f.mu.Unlock()
+	if hold != nil {
+		select {
+		case <-hold:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.calls = append(f.calls, fetch{namespace, task, sessionID})
 	return f.gs, f.err
+}
+
+func (f *fakeEvolve) fetches() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.calls)
 }
 
 func (f *fakeEvolve) Learn(_ context.Context, namespace string, t Trajectory) error {
 	f.mu.Lock()
+	hold := f.learnHold
+	f.learnHold = nil
+	if t.Batch != nil {
+		f.learning = t.Batch.ConversationID
+	}
+	f.mu.Unlock()
+	if hold != nil {
+		<-hold
+	}
+	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.learnCalls++
 	if f.learnErr != nil {
 		return f.learnErr
 	}
@@ -137,10 +178,15 @@ func TestConfigure_Validation(t *testing.T) {
 	for _, raw := range []string{
 		`{}`,
 		`{"endpoint":"evolve:8202"}`,
+		`{"endpoint":"https://"}`,
+		`{"endpoint":"http:///sse"}`,
+		`{"endpoint":"HTTP//127.0.0.1:8201/sse"}`,
 		`{"endpoint":"http://x","bogus":1}`,
 		`{"endpoint":"http://x","top_k":99}`,
 		`{"endpoint":"http://x","min_turns":-1}`,
 		`{"endpoint":"http://x","placement":"tools"}`,
+		`{"endpoint":"http://x","guidelines_prompt":"../default"}`,
+		`{"endpoint":"http://x","guidelines_prompt":" environment-grounded"}`,
 	} {
 		if err := New().Configure(json.RawMessage(raw)); err == nil {
 			t.Errorf("Configure(%s) succeeded, want error", raw)
@@ -165,6 +211,27 @@ func TestConfigure_Defaults(t *testing.T) {
 	if !*p.cfg.Inject || !*p.cfg.Learn || p.cfg.TopK != 8 || p.cfg.TimeoutMs != 3000 || p.cfg.CacheTTL != 1800 || p.cfg.IdleAfter != 900 ||
 		p.cfg.ServeNamespace != "cortex" || p.cfg.LearnNamespace != "cortex-candidates" || p.cfg.Profile != "cortex" || p.cfg.Placement != "system" {
 		t.Fatalf("defaults not applied: %+v", p.cfg)
+	}
+}
+
+func TestConfigure_GuidelinesPrompt(t *testing.T) {
+	// Unset: environment-grounded, the prompt for coding agents. Empty: evolve's own default.
+	p, _ := configured(t, "", &fakeEvolve{})
+	if *p.cfg.Prompt != "environment-grounded" {
+		t.Fatalf("default guidelines_prompt = %q", *p.cfg.Prompt)
+	}
+	for raw, want := range map[string]string{
+		`{"endpoint":"http://x","guidelines_prompt":""}`:           "",
+		`{"endpoint":"http://x","guidelines_prompt":"default"}`:    "default",
+		`{"endpoint":"http://x","guidelines_prompt":"My_rules-2"}`: "My_rules-2",
+	} {
+		q := New()
+		if err := q.Configure(json.RawMessage(raw)); err != nil {
+			t.Fatalf("Configure(%s): %v", raw, err)
+		}
+		if *q.cfg.Prompt != want {
+			t.Errorf("Configure(%s): guidelines_prompt = %q, want %q", raw, *q.cfg.Prompt, want)
+		}
 	}
 }
 
@@ -245,6 +312,8 @@ func TestInject_UserPlacementLeadsFirstUserMessage(t *testing.T) {
 		{"anthropic block content", "/v1/messages", `{"messages":[{"role":"user","content":[{"type":"text","text":"fix the test","cache_control":{"type":"ephemeral"}}]}]}`, "messages.0.content.0.text"},
 		{"chat after system message", "/v1/chat/completions", `{"messages":[{"role":"system","content":"base"},{"role":"user","content":"fix the test"}]}`, "messages.1.content"},
 		{"responses input", "/v1/responses", `{"instructions":"base","input":[{"role":"user","content":[{"type":"input_text","text":"fix the test"}]}]}`, "input.0.content.0.text"},
+		// Before, a bare string input was an unsupported shape, and went without.
+		{"responses string input", "/v1/responses", `{"instructions":"base","input":"fix the test"}`, "input"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -344,6 +413,12 @@ func TestInject_KeepsGuidelinesThroughTransientFailure(t *testing.T) {
 	if string(first.Body) != string(second.Body) {
 		t.Fatal("a refetch failure dropped the session's guidelines")
 	}
+	// Still injected, but the event says the refresh failed, and when evolve last
+	// answered. Before, it reported the failed attempt as a successful fetch.
+	before, after := published(t, first), published(t, second)
+	if !after.Injected || after.Error != "refresh_failed" || !after.FetchedAt.Equal(before.FetchedAt) {
+		t.Fatalf("event after a failed refresh = %+v; first fetch at %v", after, before.FetchedAt)
+	}
 }
 
 func TestInject_Skips(t *testing.T) {
@@ -420,6 +495,10 @@ func turn(history []pipeline.InferenceMessage, completion string, calls []pipeli
 	inf.Completion = completion
 	inf.ToolCalls = calls
 	inf.ToolResults = results
+	inf.FinishReason = "end_turn" // as Anthropic reports it
+	if len(calls) > 0 {
+		inf.FinishReason = "tool_use"
+	}
 	return pctx
 }
 
@@ -542,16 +621,83 @@ func TestLearn_RetriesWithSameBatchID(t *testing.T) {
 	c.t = c.t.Add(61 * time.Second)
 	p.learnIdle(context.Background())
 	fe.learnErr = nil
+	p.learnIdle(context.Background()) // not yet: the retry waits one tick
+	if len(fe.learned) != 0 {
+		t.Fatalf("retried before its backoff: %+v", fe.learned)
+	}
+	c.t = c.t.Add(p.tick)
 	p.learnIdle(context.Background())
 	if len(fe.learned) != 1 || !strings.HasSuffix(fe.learned[0].t.Batch.BatchID, "-1") || len(fe.learned[0].t.Messages) != 7 {
 		t.Fatalf("learned = %+v", fe.learned)
 	}
 }
 
-func TestLearn_SkipsTooFewTurnsAndIneligibleTraffic(t *testing.T) {
+func TestLearn_ARetryIsTheBatchAsSentAndNewTurnsGetANewID(t *testing.T) {
+	fe := &fakeEvolve{learnErr: ErrUnavailable}
+	p, c := configured(t, `{"endpoint":"http://x","idle_after_seconds":60,"min_turns":1}`, fe)
+	finish(t, p, turn(h1, "Running.", bash1))
+	c.t = c.t.Add(61 * time.Second)
+	p.learnIdle(context.Background()) // fails; perhaps evolve did process it
+	// The session goes on before the retry.
+	finish(t, p, turn(h2, "Done.", nil, pipeline.InferenceToolResult{ToolUseID: "t1", Content: "ok"}))
+	fe.learnErr = nil
+	c.t = c.t.Add(61 * time.Second)
+	p.learnIdle(context.Background()) // the retry
+	p.learnIdle(context.Background()) // then the new turns
+	if len(fe.learned) != 2 {
+		t.Fatalf("learned = %+v, want the retry, then the new turns", fe.learned)
+	}
+	first, second := fe.learned[0].t, fe.learned[1].t
+	// Before, the retry merged the new turns into the first batch, under its id:
+	// had evolve processed that batch, it skipped the new turns with it.
+	if !strings.HasSuffix(first.Batch.BatchID, "-1") || len(first.Messages) != 2 {
+		t.Fatalf("retry = %s with %d messages, want batch 1 as sent", first.Batch.BatchID, len(first.Messages))
+	}
+	if !strings.HasSuffix(second.Batch.BatchID, "-2") || second.Messages[0]["role"] != "tool" {
+		t.Fatalf("new turns = %s %v, want batch 2 starting with the tool result", second.Batch.BatchID, second.Messages)
+	}
+}
+
+func TestLearn_GivesUpOnABatchAfterRepeatedFailures(t *testing.T) {
+	fe := &fakeEvolve{learnErr: errors.New("NotImplementedError: Incremental processing requires atomic namespace writes")}
+	p, c := configured(t, `{"endpoint":"http://x","idle_after_seconds":60}`, fe)
+	session3(t, p)
+	for range 20 {
+		c.t = c.t.Add(time.Hour)
+		p.learnIdle(context.Background())
+	}
+	if fe.learnCalls != maxLearnAttempts {
+		t.Fatalf("sends = %d, want %d, then none", fe.learnCalls, maxLearnAttempts)
+	}
+	if got := metricValue(p, "batches dropped"); got != 1 {
+		t.Fatalf("batches dropped = %v, want 1", got)
+	}
+}
+
+func metricValue(p *Plugin, name string) float64 {
+	for _, m := range p.Metrics() {
+		if m.Name == name {
+			return m.Value
+		}
+	}
+	return 0
+}
+
+func TestLearn_SkipsTooFewTurns(t *testing.T) {
 	fe := &fakeEvolve{}
 	p, c := configured(t, `{"endpoint":"http://x","idle_after_seconds":60}`, fe)
 	finish(t, p, turn(h1, "Running.", bash1)) // one turn < min_turns
+	c.t = c.t.Add(61 * time.Second)
+	p.learnIdle(context.Background())
+	if len(fe.learned) != 0 {
+		t.Fatalf("learned = %+v", fe.learned)
+	}
+}
+
+func TestLearn_SkipsIneligibleTraffic(t *testing.T) {
+	// min_turns 1, so a single wrongly recorded turn would be sent.
+	fe := &fakeEvolve{}
+	p, c := configured(t, `{"endpoint":"http://x","idle_after_seconds":60,"min_turns":1}`, fe)
 	sub := turn(h1, "x", nil)
 	sub.Extensions.Inference.AgentRole = pipeline.AgentRoleSubagent
 	sub.Session.ID = "s2"
@@ -595,8 +741,19 @@ func TestLearn_KeepsTurnsTheClientHungUpOnAfterTheEnd(t *testing.T) {
 
 func TestLearn_SkipsTurnsCutOffOrDenied(t *testing.T) {
 	cases := map[string]func(*pipeline.Context) pipeline.Outcome{
-		"no finish reason": func(*pipeline.Context) pipeline.Outcome {
+		"no finish reason": func(pctx *pipeline.Context) pipeline.Outcome {
+			pctx.Extensions.Inference.FinishReason = ""
 			return pipeline.Outcome{FinalAction: pipeline.OutcomeError}
+		},
+		// A 200 whose stream ended before the response did, or in which the
+		// provider reported failure.
+		"2xx without a finish reason": func(pctx *pipeline.Context) pipeline.Outcome {
+			pctx.Extensions.Inference.FinishReason = ""
+			return pipeline.Outcome{FinalAction: pipeline.OutcomeAllow, StatusCode: 200}
+		},
+		"2xx failed": func(pctx *pipeline.Context) pipeline.Outcome {
+			pctx.Extensions.Inference.FinishReason = "failed"
+			return pipeline.Outcome{FinalAction: pipeline.OutcomeAllow, StatusCode: 200}
 		},
 		"failed": func(pctx *pipeline.Context) pipeline.Outcome {
 			pctx.Extensions.Inference.FinishReason = "failed"
@@ -651,4 +808,373 @@ func TestInitShutdown(t *testing.T) {
 	default:
 		t.Fatal("notifier still running after Shutdown")
 	}
+}
+
+// --- A session's fetch in progress ---
+
+func userTask(text string) []pipeline.InferenceMessage {
+	return []pipeline.InferenceMessage{{Role: "user", Content: text}}
+}
+
+func waitFor(t *testing.T, cond func() bool) {
+	t.Helper()
+	for deadline := time.Now().Add(5 * time.Second); !cond(); time.Sleep(5 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("timed out waiting")
+		}
+	}
+}
+
+func TestFetch_OutlivesTheRequestThatStartedIt(t *testing.T) {
+	fe := &fakeEvolve{gs: twoGuidelines, hold: make(chan struct{}), holdSession: "s1"}
+	p, _ := configured(t, `{"endpoint":"http://evolve.invalid/sse","timeout_ms":5000}`, fe)
+	first, cancel := context.WithCancel(context.Background())
+	started := make(chan *cached, 1)
+	go func() {
+		entry, _ := p.guidelinesFor(first, "s1", userTask("fix the test"))
+		started <- entry
+	}()
+	waitFor(t, func() bool { return fe.fetches() == 1 })
+	// The client that started the fetch hangs up. Before, that cancelled the fetch,
+	// and the failure was cached for the whole session for retry_after_seconds.
+	cancel()
+	waiting := make(chan *cached, 1)
+	go func() {
+		entry, _ := p.guidelinesFor(context.Background(), "s1", userTask("fix the test"))
+		waiting <- entry
+	}()
+	close(fe.hold)
+	for _, entry := range []*cached{<-started, <-waiting} {
+		if len(entry.guidelines) != 2 || entry.failed {
+			t.Fatalf("entry = %+v, want the two guidelines", entry)
+		}
+	}
+	if n := fe.fetches(); n != 1 {
+		t.Fatalf("evolve called %d times, want one fetch shared by both requests", n)
+	}
+}
+
+func TestFetch_AWaitingRequestStopsAtItsOwnCancellation(t *testing.T) {
+	fe := &fakeEvolve{gs: twoGuidelines, hold: make(chan struct{}), holdSession: "s1"}
+	p, _ := configured(t, `{"endpoint":"http://evolve.invalid/sse","timeout_ms":5000}`, fe)
+	defer close(fe.hold)
+	go p.guidelinesFor(context.Background(), "s1", userTask("fix the test"))
+	waitFor(t, func() bool { return fe.fetches() == 1 })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	start := time.Now()
+	entry, _ := p.guidelinesFor(ctx, "s1", userTask("fix the test"))
+	if took := time.Since(start); took > time.Second {
+		t.Fatalf("a cancelled request waited %v for the fetch in progress", took)
+	}
+	if len(entry.guidelines) != 0 {
+		t.Fatalf("entry = %+v, want none: the fetch hasn't answered", entry)
+	}
+}
+
+func TestFetch_EvictingASessionLeavesItsFetchShared(t *testing.T) {
+	fe := &fakeEvolve{gs: twoGuidelines}
+	p, clk := configured(t, `{"endpoint":"http://evolve.invalid/sse","timeout_ms":5000,"max_sessions":1,"cache_ttl_seconds":60}`, fe)
+	p.guidelinesFor(context.Background(), "a", userTask("task a"))
+	clk.t = clk.t.Add(2 * time.Minute) // a's guidelines expire: the next request refreshes them
+	fe.mu.Lock()
+	fe.hold, fe.holdSession = make(chan struct{}), "a"
+	fe.mu.Unlock()
+
+	done := make(chan struct{}, 2)
+	go func() { p.guidelinesFor(context.Background(), "a", userTask("task a")); done <- struct{}{} }()
+	waitFor(t, func() bool { return fe.fetches() == 2 })
+	// b's answer evicts a from the cache while a's refresh is still in progress.
+	p.guidelinesFor(context.Background(), "b", userTask("task b"))
+	go func() { p.guidelinesFor(context.Background(), "a", userTask("task a")); done <- struct{}{} }()
+	time.Sleep(50 * time.Millisecond)
+	close(fe.hold)
+	<-done
+	<-done
+	// a's fetch, a's refresh and b's fetch. Before, eviction also dropped a's
+	// in-progress marker, so the second request for a started another refresh.
+	if n := fe.fetches(); n != 3 {
+		t.Fatalf("evolve called %d times, want 3", n)
+	}
+}
+
+// --- Codex's harness context ---
+
+// codexContext is the first user item Codex 0.169 sends in a repo with an
+// AGENTS.md, as the parser joins its two parts.
+const codexContext = "# AGENTS.md instructions for /repo\n\n<INSTRUCTIONS>\n# Project rules\n\nRun `make test` before committing.\n\n</INSTRUCTIONS>\n" +
+	"<environment_context>\n  <cwd>/repo</cwd>\n  <shell>zsh</shell>\n  <current_date>2026-11-20</current_date>\n</environment_context>"
+
+func codexMessages(prompt string) []messageText {
+	return []messageText{
+		{"developer", "You are Codex."},
+		{"user", codexContext},
+		{"user", prompt},
+	}
+}
+
+func TestTaskText_IsCodexsPromptNotItsContext(t *testing.T) {
+	if got := taskText(codexMessages("Bump the version and commit the fix for the login bug")); got != "Bump the version and commit the fix for the login bug" {
+		t.Fatalf("task = %q", got)
+	}
+	// Without an AGENTS.md, Codex sends the environment context alone.
+	env := []messageText{{"user", "<environment_context>\n  <cwd>/repo</cwd>\n</environment_context>"}, {"user", "Fix the login bug"}}
+	if got := taskText(env); got != "Fix the login bug" {
+		t.Fatalf("task = %q", got)
+	}
+	// Text that merely mentions a tag mid-line is the user's.
+	if got := clean("Explain what <skill> tags do in Codex"); got != "Explain what <skill> tags do in Codex" {
+		t.Fatalf("clean = %q", got)
+	}
+}
+
+func TestLearn_CodexsContextIsNotLearned(t *testing.T) {
+	r := newRecorder("codex", "1.1")
+	var msgs []pipeline.InferenceMessage
+	for _, m := range codexMessages("Fix the login bug") {
+		msgs = append(msgs, pipeline.InferenceMessage{Role: m.role, Content: m.content})
+	}
+	r.observe(&pipeline.InferenceExtension{Messages: msgs, Completion: "Done."})
+	if r.task != "Fix the login bug" {
+		t.Fatalf("task = %q", r.task)
+	}
+	for _, m := range r.pending {
+		if c, _ := m["content"].(string); strings.Contains(c, "AGENTS.md") || strings.Contains(c, "environment_context") {
+			t.Fatalf("learned Codex's context: %v", r.pending)
+		}
+	}
+}
+
+func TestLearn_AResumedSessionDoesNotReuseItsBatchIDs(t *testing.T) {
+	fe := &fakeEvolve{}
+	p, c := configured(t, `{"endpoint":"http://x","idle_after_seconds":60,"min_turns":1,"max_sessions":1}`, fe)
+	finish(t, p, turn(h1, "Running.", bash1))
+	c.t = c.t.Add(61 * time.Second)
+	p.learnIdle(context.Background())
+	// Another session evicts s1, which then resumes with a new turn.
+	other := turn(h1, "x", nil)
+	other.Session.ID = "s2"
+	finish(t, p, other)
+	finish(t, p, turn(h2, "Done.", nil, pipeline.InferenceToolResult{ToolUseID: "t1", Content: "ok"}))
+	c.t = c.t.Add(61 * time.Second)
+	p.learnIdle(context.Background())
+
+	var ids []string
+	for _, l := range fe.learned {
+		if l.t.Batch.ConversationID == "s1" {
+			ids = append(ids, l.t.Batch.BatchID)
+		}
+	}
+	// Before, the new recorder started again at batch 1, and evolve skipped its
+	// turns as a batch it had already processed.
+	if len(ids) != 2 || ids[0] == ids[1] {
+		t.Fatalf("s1 batch ids = %v, want two different ids", ids)
+	}
+}
+
+func (f *fakeEvolve) sendingSession() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.learning
+}
+
+func TestLearn_ASessionThatResumesDuringATickWaits(t *testing.T) {
+	fe := &fakeEvolve{learnHold: make(chan struct{})}
+	p, c := configured(t, `{"endpoint":"http://x","idle_after_seconds":60,"min_turns":1}`, fe)
+	for _, id := range []string{"s1", "s2"} {
+		pctx := turn(h1, "Running.", bash1)
+		pctx.Session.ID = id
+		finish(t, p, pctx)
+	}
+	c.t = c.t.Add(61 * time.Second)
+	hold := fe.learnHold
+	done := make(chan struct{})
+	go func() { p.learnIdle(context.Background()); close(done) }()
+	waitFor(t, func() bool { return fe.sendingSession() != "" })
+	// Both sessions were idle when the tick began. The one not being sent resumes.
+	other := "s1"
+	if fe.sendingSession() == "s1" {
+		other = "s2"
+	}
+	resumed := turn(h2, "Done.", nil, pipeline.InferenceToolResult{ToolUseID: "t1", Content: "ok"})
+	resumed.Session.ID = other
+	finish(t, p, resumed)
+	close(hold)
+	<-done
+	// Before, the tick had taken both batches before sending either, so the
+	// resumed session was sent though it was active again.
+	if len(fe.learned) != 1 {
+		t.Fatalf("learned %d batches, want only the session that stayed idle", len(fe.learned))
+	}
+}
+
+func TestLearn_MaxSessionsHoldsWhileEverySessionIsSending(t *testing.T) {
+	fe := &fakeEvolve{learnHold: make(chan struct{})}
+	p, c := configured(t, `{"endpoint":"http://x","idle_after_seconds":60,"min_turns":1,"max_sessions":1}`, fe)
+	finish(t, p, turn(h1, "Running.", bash1))
+	c.t = c.t.Add(61 * time.Second)
+	hold := fe.learnHold
+	done := make(chan struct{})
+	go func() { p.learnIdle(context.Background()); close(done) }()
+	waitFor(t, func() bool { return fe.sendingSession() == "s1" })
+
+	// s1 is being sent, so it can't be evicted to make room for s2.
+	other := turn(h1, "x", nil)
+	other.Session.ID = "s2"
+	finish(t, p, other)
+	p.mu.Lock()
+	tracked := len(p.sessions)
+	p.mu.Unlock()
+	close(hold)
+	<-done
+	if tracked != 1 {
+		t.Fatalf("tracking %d sessions with max_sessions 1", tracked)
+	}
+	if got := metricValue(p, "turns not tracked"); got != 1 {
+		t.Fatalf("turns not tracked = %v, want 1", got)
+	}
+}
+
+func TestInject_ARequestWithoutATaskDoesNotHoldBackTheNextOne(t *testing.T) {
+	fe := &fakeEvolve{gs: twoGuidelines}
+	p, _ := configured(t, "", fe)
+	first := reqCtx("/v1/messages", anthropicBody)
+	first.Extensions.Inference.Messages = []pipeline.InferenceMessage{{Role: "user", Content: "<system-reminder>\nrules\n</system-reminder>"}}
+	run(t, p, first)
+	fetchedFirst := fe.fetches()
+	// The session's next request carries the task. Before, the first request's
+	// empty answer was cached for retry_after_seconds, so this got nothing.
+	second := reqCtx("/v1/messages", anthropicBody)
+	run(t, p, second)
+	if fe.fetches() != 1 || !published(t, second).Injected {
+		t.Fatalf("fetches = %d, event = %+v; want the task looked up and injected", fe.fetches(), published(t, second))
+	}
+	if reason := skipReason(first); reason != "no_task" || fetchedFirst != 0 {
+		t.Fatalf("first request: skip = %q after %d fetches, want no_task and no fetch", reason, fetchedFirst)
+	}
+}
+
+func TestTruncation_StaysWithinTheCapAndValidUTF8(t *testing.T) {
+	r := newRecorder("claude-code", "1.1")
+	r.calls["t1"] = 0
+	r.observe(&pipeline.InferenceExtension{ToolResults: []pipeline.InferenceToolResult{
+		{ToolUseID: "t1", Content: strings.Repeat("x", maxToolResultChars), IsError: true},
+	}})
+	content := r.pending[0]["content"].(string)
+	if len(content) > maxToolResultChars || !strings.HasPrefix(content, "[error] ") {
+		t.Fatalf("error result is %d bytes, want the marker within %d", len(content), maxToolResultChars)
+	}
+	// "é" is two bytes, so a cut at an odd byte count falls inside one.
+	if got := truncate(strings.Repeat("é", 10), 7); got != "ééé" || !utf8.ValidString(got) {
+		t.Fatalf("truncate = %q, want three whole runes", got)
+	}
+	task := taskText([]messageText{{"user", "a" + strings.Repeat("é", maxTaskChars)}})
+	if !utf8.ValidString(task) || len(task) > maxTaskChars {
+		t.Fatalf("task is %d bytes, valid UTF-8 %v", len(task), utf8.ValidString(task))
+	}
+}
+
+func TestLearn_InjectedGuidelinesAreNotLearnedFromAssistantOrToolText(t *testing.T) {
+	block := formatBlock(twoGuidelines)
+	r := newRecorder("claude-code", "1.1")
+	r.observe(&pipeline.InferenceExtension{
+		Messages:   h1,
+		Completion: "My instructions say:\n" + block + "\nSo I'll run the tests.",
+		ToolCalls:  bash1,
+	})
+	r.observe(&pipeline.InferenceExtension{
+		Messages:    h2,
+		ToolResults: []pipeline.InferenceToolResult{{ToolUseID: "t1", Content: "$ cat prompt.txt\n" + block}},
+		Completion:  "Done.",
+	})
+	for _, m := range r.pending {
+		if c, _ := m["content"].(string); strings.Contains(c, blockTag) || strings.Contains(c, "Run the test suite") {
+			t.Fatalf("learned the injected guidelines from %s text: %q", m["role"], c)
+		}
+	}
+	if r.pending[1]["content"] != "My instructions say:\n\nSo I'll run the tests." {
+		t.Fatalf("assistant text = %q, want the rest kept", r.pending[1]["content"])
+	}
+}
+
+func TestLearn_UnansweredToolCallsAreForgotten(t *testing.T) {
+	r := newRecorder("claude-code", "1.1")
+	for i := range 200 {
+		r.observe(&pipeline.InferenceExtension{
+			Messages:  h1,
+			ToolCalls: []pipeline.InferenceToolCall{{ID: fmt.Sprintf("abandoned-%d", i), Name: "Bash"}},
+		})
+	}
+	if len(r.calls) > openCallTurns+1 {
+		t.Fatalf("%d tool calls still open, want at most the last %d turns", len(r.calls), openCallTurns+1)
+	}
+	// The last turn's call is still answered by the next request.
+	r.observe(&pipeline.InferenceExtension{Messages: h1, ToolResults: []pipeline.InferenceToolResult{{ToolUseID: "abandoned-199", Content: "ok"}}})
+	if last := r.pending[len(r.pending)-1]; last["role"] != "tool" || last["tool_call_id"] != "abandoned-199" {
+		t.Fatalf("last message = %v, want the result of the latest call", last)
+	}
+}
+
+func TestLearn_ARewrittenHistoryOfTheSameLengthIsReadAgain(t *testing.T) {
+	r := newRecorder("claude-code", "1.1")
+	history := []pipeline.InferenceMessage{sys, {Role: "user", Content: "fix the test"}, {Role: "assistant", Content: "Running."}, {Role: "user", Content: "ok"}}
+	r.observe(&pipeline.InferenceExtension{Messages: history, Completion: "Done."})
+	// The agent compacts: four messages again, ending in the user's correction.
+	compacted := []pipeline.InferenceMessage{sys, {Role: "user", Content: "Summary: fixed the test."}, {Role: "assistant", Content: "Done."}, {Role: "user", Content: "no, use uv"}}
+	r.observe(&pipeline.InferenceExtension{Messages: compacted, Completion: "Using uv."})
+	var users []string
+	for _, m := range r.pending {
+		if m["role"] == "user" {
+			users = append(users, m["content"].(string))
+		}
+	}
+	// Before, the recorder took the four messages as already seen and recorded
+	// the reply without the correction it answered.
+	if users[len(users)-1] != "no, use uv" {
+		t.Fatalf("user turns = %q, want the correction recorded", users)
+	}
+}
+
+func TestInject_ChatGuidelinesFollowTheLastInstruction(t *testing.T) {
+	blockAt := func(t *testing.T, body []byte, field string) string {
+		t.Helper()
+		got := gjson.GetBytes(body, field).String()
+		if !strings.HasSuffix(got, "</evolve-guidelines>") {
+			t.Fatalf("%s = %q, want the block; body %s", field, got, body)
+		}
+		return got
+	}
+	run1 := func(t *testing.T, body string) []byte {
+		t.Helper()
+		p, _ := configured(t, "", &fakeEvolve{gs: twoGuidelines})
+		pctx := reqCtx("/v1/chat/completions", body)
+		run(t, p, pctx)
+		return pctx.Body
+	}
+	t.Run("two instruction messages", func(t *testing.T) {
+		out := run1(t, `{"messages":[{"role":"system","content":"first"},{"role":"developer","content":"base"},{"role":"user","content":"hi"}]}`)
+		if got := blockAt(t, out, "messages.1.content"); !strings.HasPrefix(got, "base\n\n") {
+			t.Fatalf("block not after the last instruction: %q", got)
+		}
+		// Before, it went on the first, ahead of the second instruction.
+		if gjson.GetBytes(out, "messages.0.content").String() != "first" {
+			t.Fatalf("first instruction changed: %s", out)
+		}
+	})
+	t.Run("array content", func(t *testing.T) {
+		out := run1(t, `{"messages":[{"role":"system","content":[{"type":"text","text":"base","cache_control":{"type":"ephemeral"}}]},{"role":"user","content":"hi"}]}`)
+		blockAt(t, out, "messages.0.content.1.text")
+		// Before, a new system message was put ahead of all the instructions.
+		if n := len(gjson.GetBytes(out, "messages").Array()); n != 2 || gjson.GetBytes(out, "messages.0.content.0.cache_control.type").String() != "ephemeral" {
+			t.Fatalf("instructions not kept as they were: %s", out)
+		}
+	})
+	t.Run("other content", func(t *testing.T) {
+		out := run1(t, `{"messages":[{"role":"system","content":null},{"role":"user","content":"hi"}]}`)
+		blockAt(t, out, "messages.1.content")
+		if gjson.GetBytes(out, "messages.1.role").String() != "system" || gjson.GetBytes(out, "messages.2.content").String() != "hi" {
+			t.Fatalf("block not a system message after the instructions: %s", out)
+		}
+	})
 }

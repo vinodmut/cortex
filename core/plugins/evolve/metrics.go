@@ -20,6 +20,8 @@ type metrics struct {
 	injectErrors uint64 // request shapes the block could not be added to
 	learned      uint64 // session batches sent to evolve
 	learnErrors  uint64
+	learnDropped uint64 // batches given up on after maxLearnAttempts sends
+	untracked    uint64 // turns not recorded: max_sessions reached, every session sending
 	recovered    uint64
 }
 
@@ -41,10 +43,12 @@ func (m *metrics) snapshot() []pipeline.Metric {
 		{"requests projected", m.projected, "observe mode: block computed, not sent"},
 		{"cache hits", m.cacheHits, ""},
 		{"guideline fetches", m.fetches, ""},
-		{"fetch errors", m.fetchErrors, "requests were forwarded without guidelines"},
+		{"fetch errors", m.fetchErrors, "evolve didn't answer; the session kept its earlier guidelines, or had none"},
 		{"inject errors", m.injectErrors, "unsupported request shape; forwarded unchanged"},
 		{"sessions sent to learn", m.learned, ""},
-		{"learn errors", m.learnErrors, "retried on the next tick"},
+		{"learn errors", m.learnErrors, "the batch is sent again, with backoff"},
+		{"batches dropped", m.learnDropped, "given up on after 6 failed sends"},
+		{"turns not tracked", m.untracked, "max_sessions reached while every tracked session was being sent"},
 		{"panics recovered", m.recovered, "the original body was forwarded"},
 	}
 	var out []pipeline.Metric

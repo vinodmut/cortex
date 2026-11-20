@@ -33,6 +33,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"net/url"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -45,11 +47,20 @@ import (
 
 const name = "evolve"
 
+// defaultPrompt is the evolve guideline prompt the plugin learns with unless
+// configured otherwise: coding agents work where hooks, checks and error
+// messages state the project's rules, which is what environment-grounded learns.
+const defaultPrompt = "environment-grounded"
+
+// promptName is evolve's rule for a guideline prompt name.
+var promptName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]*$`)
+
 type config struct {
 	Endpoint       string   `json:"endpoint" required:"true" description:"SSE URL of the evolve MCP server (evolve-mcp --transport sse), e.g. http://127.0.0.1:8201/sse."`
 	ServeNamespace string   `json:"serve_namespace" description:"Evolve namespace guidelines are injected from: the reviewed set, unless it is also learn_namespace." default:"cortex"`
 	LearnNamespace string   `json:"learn_namespace" description:"Evolve namespace learned guidelines are written to, for review. Set it to serve_namespace to serve learned guidelines without review." default:"cortex-candidates"`
 	Profile        string   `json:"processing_profile" description:"Evolve processing profile the plugin creates and learns with." default:"cortex"`
+	Prompt         *string  `json:"guidelines_prompt" description:"Evolve guideline prompt the processing profile learns with. environment-grounded turns a requirement a hook, check or error message states into a step to take first. Empty: the evolve server's own default. An evolve that can't take it learns with its default, with a warning." default:"environment-grounded"`
 	Inject         *bool    `json:"inject" description:"Append guidelines to main-agent requests." default:"true"`
 	Placement      string   `json:"placement" description:"Where guidelines go: system (after the system instructions) or user (a system-reminder on the first user message)." default:"system" enum:"system,user"`
 	Learn          *bool    `json:"learn" description:"Send idle sessions' new turns to evolve to learn from." default:"true"`
@@ -93,14 +104,23 @@ func (c *config) applyDefaults() {
 	if c.Profile == "" {
 		c.Profile = "cortex"
 	}
+	if c.Prompt == nil {
+		prompt := defaultPrompt
+		c.Prompt = &prompt
+	}
 	if c.Placement == "" {
 		c.Placement = placementSystem
 	}
 }
 
 func (c *config) validate() error {
-	if !strings.HasPrefix(c.Endpoint, "http://") && !strings.HasPrefix(c.Endpoint, "https://") {
-		return fmt.Errorf("endpoint must be an http(s) URL, got %q", c.Endpoint)
+	// Checked here, so a URL the client can't connect to fails the config, not
+	// every fetch once it is running.
+	if u, err := url.Parse(c.Endpoint); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" {
+		return fmt.Errorf("endpoint must be an http(s) URL with a host, got %q", c.Endpoint)
+	}
+	if *c.Prompt != "" && !promptName.MatchString(*c.Prompt) {
+		return fmt.Errorf("guidelines_prompt must be an evolve prompt name (letters, digits, '-' and '_'), or empty for evolve's default, got %q", *c.Prompt)
 	}
 	if c.Placement != placementSystem && c.Placement != placementUser {
 		return fmt.Errorf("placement must be %q or %q, got %q", placementSystem, placementUser, c.Placement)
@@ -124,9 +144,21 @@ func (c *config) validate() error {
 type cached struct {
 	guidelines []Guideline
 	block      string
-	fetchedAt  time.Time
+	fetchedAt  time.Time // when evolve last answered for this session
 	expires    time.Time
 	failed     bool
+	// stale marks guidelines kept from an earlier fetch because the refresh
+	// failed: still injected, but not what evolve serves now.
+	stale bool
+	// noTask marks a request with nothing to ask evolve with. It is never cached.
+	noTask bool
+}
+
+// flight is a session's guideline fetch in progress. Requests of the session
+// that arrive meanwhile wait for its entry instead of calling evolve again.
+type flight struct {
+	done  chan struct{}
+	entry *cached // set before done is closed; nil if the fetch panicked
 }
 
 // session is one session's learning state: its unsent turns and when it was
@@ -145,11 +177,15 @@ type Plugin struct {
 	agents map[string]struct{}
 	now    func() time.Time
 	epoch  int64
+	// recorders counts the recorders created, for their batch ids: a session
+	// evicted and resumed gets a new recorder, whose batches must not reuse the
+	// ids evolve already accepted from the old one.
+	recorders int
 
 	mu       sync.Mutex
 	cache    map[string]*cached
 	order    []string // cache insertion order, for eviction
-	inflight map[string]*sync.Mutex
+	inflight map[string]*flight
 	sessions map[string]*session
 
 	tick   time.Duration
@@ -202,11 +238,11 @@ func (p *Plugin) Configure(raw json.RawMessage) error {
 		p.agents[a] = struct{}{}
 	}
 	p.cache = map[string]*cached{}
-	p.inflight = map[string]*sync.Mutex{}
+	p.inflight = map[string]*flight{}
 	p.sessions = map[string]*session{}
 	p.epoch = p.now().Unix()
 	if p.client == nil {
-		p.client = newMCPEvolve(c.Endpoint, c.Profile, time.Duration(c.TimeoutMs)*time.Millisecond)
+		p.client = newMCPEvolve(c.Endpoint, c.Profile, *c.Prompt, time.Duration(c.TimeoutMs)*time.Millisecond)
 	}
 	return nil
 }
@@ -316,8 +352,14 @@ func (p *Plugin) OnRequest(ctx context.Context, pctx *pipeline.Context) (action 
 
 	entry, hit := p.guidelinesFor(ctx, sessionID, pctx.Extensions.Inference.Messages)
 	ev := event{Cached: hit, FetchedAt: entry.fetchedAt}
+	if entry.stale {
+		ev.Error = "refresh_failed"
+	}
 	if len(entry.guidelines) == 0 {
 		reason := "no_guidelines"
+		if entry.noTask {
+			reason = "no_task"
+		}
 		if entry.failed {
 			reason = "evolve_unavailable"
 			ev.Error = reason
@@ -351,8 +393,10 @@ func (p *Plugin) OnRequest(ctx context.Context, pctx *pipeline.Context) (action 
 }
 
 // guidelinesFor returns the session's cached guidelines, fetching them when
-// absent or expired. One fetch per session at a time: concurrent requests of
-// the same session wait for it rather than each calling evolve.
+// absent or expired. One fetch per session at a time: a request that arrives
+// while one is in progress waits for it rather than calling evolve again, but
+// only until its own timeout_ms or cancellation, and then goes on with the
+// session's earlier guidelines, or none.
 func (p *Plugin) guidelinesFor(ctx context.Context, sessionID string, messages []pipeline.InferenceMessage) (*cached, bool) {
 	p.mu.Lock()
 	if c, ok := p.cache[sessionID]; ok && p.now().Before(c.expires) {
@@ -360,60 +404,99 @@ func (p *Plugin) guidelinesFor(ctx context.Context, sessionID string, messages [
 		p.m.inc(&p.m.cacheHits)
 		return c, true
 	}
-	lock, ok := p.inflight[sessionID]
-	if !ok {
-		lock = &sync.Mutex{}
-		p.inflight[sessionID] = lock
-	}
-	p.mu.Unlock()
-
-	lock.Lock()
-	defer lock.Unlock()
-	p.mu.Lock()
-	if c, ok := p.cache[sessionID]; ok && p.now().Before(c.expires) {
-		p.mu.Unlock()
-		p.m.inc(&p.m.cacheHits)
-		return c, true
-	}
 	previous := p.cache[sessionID]
+	if f, ok := p.inflight[sessionID]; ok {
+		p.mu.Unlock()
+		return p.await(ctx, f, previous)
+	}
+	f := &flight{done: make(chan struct{})}
+	p.inflight[sessionID] = f
 	p.mu.Unlock()
+	defer func() {
+		p.mu.Lock()
+		if p.inflight[sessionID] == f {
+			delete(p.inflight, sessionID)
+		}
+		p.mu.Unlock()
+		close(f.done)
+	}()
+	f.entry = p.fetch(ctx, sessionID, messages, previous)
+	return f.entry, false
+}
+
+// await waits for another request's fetch of the same session, for as long as
+// this request would have waited for its own.
+func (p *Plugin) await(ctx context.Context, f *flight, previous *cached) (*cached, bool) {
+	timer := time.NewTimer(time.Duration(p.cfg.TimeoutMs) * time.Millisecond)
+	defer timer.Stop()
+	select {
+	case <-f.done:
+		if f.entry != nil {
+			p.m.inc(&p.m.cacheHits)
+			return f.entry, true
+		}
+	case <-timer.C:
+	case <-ctx.Done():
+	}
+	if previous != nil && len(previous.guidelines) > 0 {
+		return previous, true
+	}
+	return &cached{failed: true}, false
+}
+
+// fetch asks evolve for the session's guidelines and caches the result.
+func (p *Plugin) fetch(ctx context.Context, sessionID string, messages []pipeline.InferenceMessage, previous *cached) *cached {
 
 	texts := make([]messageText, len(messages))
 	for i, m := range messages {
 		texts[i] = messageText{role: m.Role, content: m.Content}
 	}
+	task := taskText(texts)
+	if task == "" {
+		// Nothing to ask with yet, such as a request carrying only harness context.
+		// Not cached: caching it would answer the session's next request, which
+		// may carry the task, with no guidelines until retry_after_seconds passed.
+		if previous != nil && len(previous.guidelines) > 0 {
+			return previous
+		}
+		return &cached{noTask: true}
+	}
 	entry := &cached{fetchedAt: p.now()}
-	if task := taskText(texts); task == "" {
+	// Not cancelled with the request that started it: other requests of the
+	// session may be waiting for the answer. timeout_ms still bounds it.
+	callCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Duration(p.cfg.TimeoutMs)*time.Millisecond)
+	gs, err := p.client.Guidelines(callCtx, p.cfg.ServeNamespace, task, sessionID)
+	cancel()
+	p.m.inc(&p.m.fetches)
+	switch {
+	case err != nil:
+		p.m.inc(&p.m.fetchErrors)
+		// No session id: the failure is evolve's, not the session's, and the session's own
+		// event already records the skip. The id comes from a request header, which
+		// CodeQL's go/clear-text-logging treats as sensitive.
+		slog.Warn("evolve: guideline fetch failed; forwarding requests unchanged", "err", err)
+		entry.failed = true
 		entry.expires = p.now().Add(time.Duration(p.cfg.RetryAfter) * time.Second)
-	} else {
-		callCtx, cancel := context.WithTimeout(ctx, time.Duration(p.cfg.TimeoutMs)*time.Millisecond)
-		gs, err := p.client.Guidelines(callCtx, p.cfg.ServeNamespace, task, sessionID)
-		cancel()
-		p.m.inc(&p.m.fetches)
-		switch {
-		case err != nil:
-			p.m.inc(&p.m.fetchErrors)
-			slog.Warn("evolve: guideline fetch failed; forwarding requests unchanged", "session", sessionID, "err", err)
-			entry.failed = true
-			entry.expires = p.now().Add(time.Duration(p.cfg.RetryAfter) * time.Second)
-		default:
-			if len(gs) > p.cfg.TopK {
-				gs = gs[:p.cfg.TopK]
-			}
-			entry.guidelines = gs
-			entry.expires = p.now().Add(time.Duration(p.cfg.CacheTTL) * time.Second)
-			if len(gs) > 0 {
-				entry.block = formatBlock(gs)
-			}
+	default:
+		if len(gs) > p.cfg.TopK {
+			gs = gs[:p.cfg.TopK]
+		}
+		entry.guidelines = gs
+		entry.expires = p.now().Add(time.Duration(p.cfg.CacheTTL) * time.Second)
+		if len(gs) > 0 {
+			entry.block = formatBlock(gs)
 		}
 	}
 	// Keep serving what the session already had through a transient failure,
 	// rather than dropping guidelines mid-session and breaking the prompt cache.
+	// The entry still says the refresh failed, and when evolve last answered: a
+	// guideline withdrawn meanwhile is still being served.
 	if entry.failed && previous != nil && len(previous.guidelines) > 0 {
 		entry.guidelines, entry.block, entry.failed = previous.guidelines, previous.block, false
+		entry.fetchedAt, entry.stale = previous.fetchedAt, true
 	}
 	p.store(sessionID, entry)
-	return entry, false
+	return entry
 }
 
 func (p *Plugin) store(sessionID string, entry *cached) {
@@ -426,8 +509,9 @@ func (p *Plugin) store(sessionID string, entry *cached) {
 	for len(p.order) > p.cfg.MaxCached {
 		evict := p.order[0]
 		p.order = p.order[1:]
+		// A fetch in progress for the evicted session is left alone: the requests
+		// waiting for it still get its answer, and later ones join it.
 		delete(p.cache, evict)
-		delete(p.inflight, evict)
 	}
 }
 
@@ -459,10 +543,14 @@ func (p *Plugin) OnFinish(_ context.Context, pctx *pipeline.Context) {
 	defer p.mu.Unlock()
 	s, ok := p.sessions[sessionID]
 	if !ok {
-		if len(p.sessions) >= p.cfg.MaxCached {
-			p.evictOldestSession()
+		if len(p.sessions) >= p.cfg.MaxCached && !p.evictOldestSession() {
+			// Every tracked session is being sent. Leave this one out rather than
+			// go past max_sessions; its turns aren't learned from.
+			p.m.inc(&p.m.untracked)
+			return
 		}
-		s = &session{rec: newRecorder(agent, p.epoch)}
+		p.recorders++
+		s = &session{rec: newRecorder(agent, fmt.Sprintf("%d.%d", p.epoch, p.recorders))}
 		p.sessions[sessionID] = s
 	}
 	s.rec.observe(pctx.Extensions.Inference)
@@ -474,25 +562,30 @@ func (p *Plugin) OnFinish(_ context.Context, pctx *pipeline.Context) {
 // end of it. Codex closes each stream as soon as it reads response.completed,
 // so the listener marks most of its turns client_canceled and resets the
 // status to 0, though the response arrived whole; without this most of every
-// Codex session would be dropped. A turn the parser never saw finish (no
-// finish reason, or a failed one) and a denied request are still skipped.
+// Codex session would be dropped. Either way the parser must have seen the
+// response finish: a turn with no finish reason was cut off, and a failed one
+// (a provider reporting failure inside a stream that began with 200) has no
+// answer worth learning. A truncated finish (max_tokens, incomplete) is still
+// a turn the agent saw and acted on, so it counts. A denied request is skipped.
 func answered(pctx *pipeline.Context) bool {
 	out := pctx.Outcome()
 	if out == nil {
 		return false
 	}
+	inf := pctx.Extensions.Inference
+	finished := inf != nil && inf.FinishReason != "" && inf.FinishReason != "failed"
 	if out.StatusCode >= 200 && out.StatusCode < 300 {
-		return true
+		return finished
 	}
 	if out.StatusCode != 0 || out.FinalAction != pipeline.OutcomeError {
 		return false
 	}
-	inf := pctx.Extensions.Inference
-	return inf != nil && inf.FinishReason != "" && inf.FinishReason != "failed" &&
-		(inf.Completion != "" || len(inf.ToolCalls) > 0)
+	return finished && (inf.Completion != "" || len(inf.ToolCalls) > 0)
 }
 
-func (p *Plugin) evictOldestSession() {
+// evictOldestSession stops tracking the least recently active session that
+// isn't being sent, and reports whether there was one.
+func (p *Plugin) evictOldestSession() bool {
 	var oldest string
 	var at time.Time
 	for id, s := range p.sessions {
@@ -500,7 +593,11 @@ func (p *Plugin) evictOldestSession() {
 			oldest, at = id, s.last
 		}
 	}
+	if oldest == "" {
+		return false
+	}
 	delete(p.sessions, oldest)
+	return true
 }
 
 func (p *Plugin) learnLoop(ctx context.Context) {
@@ -517,51 +614,65 @@ func (p *Plugin) learnLoop(ctx context.Context) {
 	}
 }
 
-// learnIdle sends each idle session's new turns to evolve. A failed send is
-// restored and retried on a later tick under the same batch id; evolve skips a
-// batch it already processed, so a send that succeeded but reported failure is
-// not learned twice.
+// learnIdle sends each idle session's new turns to evolve, and failed batches
+// whose retry is due, one session at a time. A failed batch is sent again as it
+// was, under the same batch id: evolve skips a batch it already processed, so a
+// send that succeeded but reported failure is not learned twice.
 func (p *Plugin) learnIdle(ctx context.Context) {
-	cutoff := p.now().Add(-time.Duration(p.cfg.IdleAfter) * time.Second)
-	type due struct {
-		id string
-		s  *session
-		t  Trajectory
-	}
-	var batches []due
 	p.mu.Lock()
-	for id, s := range p.sessions {
-		if s.sending || s.last.After(cutoff) {
-			continue
-		}
-		// A session stays tracked after it is learned from, so a resumed session
-		// continues its batch sequence; max_sessions bounds how many are kept.
-		t, ok := s.rec.take(id, p.cfg.MinTurns)
-		if !ok {
-			continue
-		}
-		s.sending = true
-		batches = append(batches, due{id, s, t})
+	ids := make([]string, 0, len(p.sessions))
+	for id := range p.sessions {
+		ids = append(ids, id)
 	}
 	p.mu.Unlock()
+	for _, id := range ids {
+		if ctx.Err() != nil {
+			return
+		}
+		p.learnOne(ctx, id)
+	}
+}
 
-	for _, b := range batches {
-		callCtx, cancel := context.WithTimeout(ctx, time.Duration(p.cfg.LearnTimeout)*time.Second)
-		err := p.client.Learn(callCtx, p.cfg.LearnNamespace, b.t)
-		cancel()
-		p.mu.Lock()
-		b.s.sending = false
-		if err != nil {
-			b.s.rec.restore(b.t)
-		}
+// learnOne sends one session's due batch, if it has one. The batch is taken
+// just before it is sent, so a session that resumed while earlier sessions were
+// being sent is no longer idle, and waits for a later tick.
+func (p *Plugin) learnOne(ctx context.Context, id string) {
+	p.mu.Lock()
+	s, ok := p.sessions[id]
+	if !ok || s.sending {
 		p.mu.Unlock()
-		if err != nil {
-			p.m.inc(&p.m.learnErrors)
-			slog.Warn("evolve: sending session to learn from failed; will retry", "session", b.id, "err", err)
-			continue
-		}
+		return
+	}
+	now := p.now()
+	idle := !s.last.After(now.Add(-time.Duration(p.cfg.IdleAfter) * time.Second))
+	// A session stays tracked after it is learned from, so a resumed session
+	// continues its batch sequence; max_sessions bounds how many are kept.
+	t, due := s.rec.next(id, p.cfg.MinTurns, idle, now)
+	if !due {
+		p.mu.Unlock()
+		return
+	}
+	s.sending = true
+	p.mu.Unlock()
+
+	callCtx, cancel := context.WithTimeout(ctx, time.Duration(p.cfg.LearnTimeout)*time.Second)
+	err := p.client.Learn(callCtx, p.cfg.LearnNamespace, t)
+	cancel()
+	p.mu.Lock()
+	s.sending = false
+	dropped := s.rec.sent(t, err, p.now(), p.tick)
+	p.mu.Unlock()
+	switch {
+	case dropped:
+		p.m.inc(&p.m.learnDropped)
+		slog.Warn("evolve: giving up sending a session batch to learn from", "session", id,
+			"batch", t.Batch.BatchID, "attempts", maxLearnAttempts, "err", err)
+	case err != nil:
+		p.m.inc(&p.m.learnErrors)
+		slog.Warn("evolve: sending session to learn from failed; will retry", "session", id, "err", err)
+	default:
 		p.m.inc(&p.m.learned)
-		slog.Info("evolve: sent idle session to learn from", "session", b.id, "messages", len(b.t.Messages), "batch", b.t.Batch.BatchID)
+		slog.Info("evolve: sent idle session to learn from", "session", id, "messages", len(t.Messages), "batch", t.Batch.BatchID)
 	}
 }
 

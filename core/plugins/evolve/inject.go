@@ -114,20 +114,39 @@ func injectAnthropic(body []byte, block string) ([]byte, error) {
 	return nil, errUnsupportedShape
 }
 
+// injectChat adds block after the system instructions: the leading run of
+// system and developer messages. It goes on the last of them, as more text or a
+// new text part, so the messages before it, and any cache breakpoint in them,
+// are unchanged; or, when that message's content is neither, as a new system
+// message right after it. With no instructions it leads the conversation.
 func injectChat(body []byte, block string) ([]byte, error) {
 	messages := gjson.GetBytes(body, "messages")
 	if !messages.IsArray() {
 		return nil, errUnsupportedShape
 	}
-	first := messages.Get("0")
-	if role := first.Get("role").String(); role == "system" || role == "developer" {
-		if content := first.Get("content"); content.Type == gjson.String {
-			return sjson.SetBytes(body, "messages.0.content", joinText(content.String(), block))
+	items := messages.Array()
+	n := 0
+	for n < len(items) {
+		if role := items[n].Get("role").String(); role != "system" && role != "developer" {
+			break
+		}
+		n++
+	}
+	if n > 0 {
+		at := fmt.Sprintf("messages.%d.content", n-1)
+		switch content := items[n-1].Get("content"); {
+		case content.Type == gjson.String:
+			return sjson.SetBytes(body, at, joinText(content.String(), block))
+		case content.IsArray():
+			return sjson.SetBytes(body, at+".-1", map[string]string{"type": "text", "text": block})
 		}
 	}
-	msgs := make([]any, 0, len(messages.Array())+1)
+	msgs := make([]any, 0, len(items)+1)
+	for _, m := range items[:n] {
+		msgs = append(msgs, rawJSON(m.Raw))
+	}
 	msgs = append(msgs, map[string]string{"role": "system", "content": block})
-	for _, m := range messages.Array() {
+	for _, m := range items[n:] {
 		msgs = append(msgs, rawJSON(m.Raw))
 	}
 	return sjson.SetBytes(body, "messages", msgs)
@@ -154,6 +173,10 @@ func injectFirstUser(body []byte, d dialect, reminder string) ([]byte, error) {
 		path, textType = "input", "input_text"
 	}
 	items := gjson.GetBytes(body, path)
+	if d == dialectResponses && items.Type == gjson.String {
+		// input's shorthand: a bare string is the one user message.
+		return sjson.SetBytes(body, path, joinText(reminder, items.String()))
+	}
 	if !items.IsArray() {
 		return nil, errUnsupportedShape
 	}
@@ -194,10 +217,32 @@ func (r rawJSON) MarshalJSON() ([]byte, error) { return []byte(r), nil }
 // messages; it is not the user's task.
 var reminderPattern = regexp.MustCompile(`(?s)<system-reminder>.*?</system-reminder>`)
 
+// codexContextTags are the blocks Codex sends as user-role text that are its own
+// context, not the user's words (codex-rs/core/src/context, the matchers behind
+// is_contextual_user_fragment). Codex sends them ahead of the prompt as parts of
+// a user item, which the parser joins into the first user message, so without
+// this the plugin's "task" was the repo's AGENTS.md or the cwd and shell.
+var codexContextTags = []string{
+	"environment_context", "user_instructions", "skill", "user_shell_command", "turn_aborted",
+	"subagent_notification", "codex_internal_context", "goal_context", "recommended_plugins",
+	"agent_message_board_notification",
+}
+
+// codexContextPattern matches those blocks, and the AGENTS.md instructions,
+// where they start a line, as Codex writes them.
+var codexContextPattern = func() *regexp.Regexp {
+	alts := []string{`# AGENTS\.md instructions\b.*?</INSTRUCTIONS>`}
+	for _, tag := range codexContextTags {
+		alts = append(alts, `<`+tag+`\b[^>]*>.*?</`+tag+`>`)
+	}
+	return regexp.MustCompile(`(?ms)^[ \t]*(?:` + strings.Join(alts, "|") + `)`)
+}()
+
 const maxTaskChars = 2000
 
 // taskText derives the retrieval query from the conversation's first user
-// message with text, cleaned of harness context and injected guidelines.
+// message with text, cleaned of harness context (Claude Code's and Codex's) and
+// injected guidelines.
 func taskText(messages []messageText) string {
 	for _, m := range messages {
 		if m.role != "user" {
@@ -207,10 +252,7 @@ func taskText(messages []messageText) string {
 		if text == "" {
 			continue
 		}
-		if len(text) > maxTaskChars {
-			text = text[:maxTaskChars]
-		}
-		return text
+		return truncate(text, maxTaskChars)
 	}
 	return ""
 }
