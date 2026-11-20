@@ -69,7 +69,7 @@ session's input is trusted, such as a local demo. In that setup:
 ## What a request looks like
 
 By default the block is appended after the existing system instructions — a trailing `system`
-text block on Anthropic Messages, the leading system message on Chat Completions,
+text block on Anthropic Messages, the last of the leading system and developer messages on Chat Completions,
 `instructions` on the Responses API. With `placement: user` it instead leads the session's
 first user message, wrapped in `<system-reminder>`, where Claude Code carries its own
 harness context. Models attend to that position more than to the end of a long system
@@ -86,25 +86,38 @@ Guidelines learned from earlier sessions on this machine. Apply them when they a
 
 Guidelines are fetched **once per session** (from the session's first user message, with the
 agent's harness context removed) and the rendered block is cached, so every turn appends
-identical bytes and the provider's prompt cache keeps hitting. Requests the plugin leaves
+identical bytes and the provider's prompt cache keeps hitting. Every `cache_ttl_seconds` the
+plugin checks the guidelines again, and keeps the session's block while every guideline in it is
+still served unchanged; guidelines accepted since then reach new sessions. The block changes,
+and the provider re-reads the prompt after it once, when a served guideline is withdrawn, edited
+or no longer selected, or when a session whose first fetch failed gets guidelines later. Requests the plugin leaves
 alone: subagents, tool-less side calls (titles, summaries), sessions without an id, agents
 outside `agents`, and its own calls (`X-Evolve-Cortex`).
 
 ## What is learned from
 
-Only the main conversation of sessions the plugin saw: each successful (2xx) main-agent
-exchange contributes the new user messages, the assistant's reply and tool calls, and the tool
-results the next request carried (truncated to 4 KB each, errors marked `[error]`).
+Only the main conversation of sessions the plugin saw: each main-agent exchange whose response
+finished contributes the new user messages, the assistant's reply and tool calls, and the tool
+results the next request carried (truncated to 4 KB each, errors marked `[error]`; the reply to
+8 KB and each call's arguments to 4 KB). An exchange counts when it got a 2xx, or when the client
+closed the stream after reading the end of it, as Codex does on every turn.
 Harness context and `<evolve-guidelines>` blocks are stripped, so evolve does not learn from
 the agent's own context or from its injected guidelines. Harness context is Claude Code's
 `<system-reminder>` blocks, and the blocks Codex sends as user text ahead of the prompt: the
-repo's AGENTS.md instructions, `<environment_context>` (cwd, shell, date) and the like. A session is sent once it has been
-idle for `idle_after_seconds` with at least `min_turns` new turns; a resumed session sends only
-its new turns, with the original task as context.
+repo's AGENTS.md instructions, `<environment_context>` (cwd, shell, date) and the like,
+removed from Codex's messages only. A session is sent once it has been idle for
+`idle_after_seconds` with at least `min_turns` new turns; a resumed session sends only its new
+turns, with the original task as context. So does a session the plugin first sees part-way
+through (after a restart, a reload, or once evicted by `max_sessions`): it starts at the latest
+prompt.
 
-Each send is an identified batch (`source: cortex`, the session id, a per-process sequence
-number): a send that is retried after a timeout is skipped by evolve if it was already
-processed. Unsent turns live in memory, so a Cortex restart drops them.
+Each send is an identified batch (`source: cortex`, the session id, and a sequence number
+unique to the plugin instance): a send that is retried after a timeout is skipped by evolve if
+it was already processed. Unsent turns live in memory. A Cortex restart drops them, and so does
+a config reload, which replaces the plugin instance: a change to any plugin's config does that,
+agentop's plugin toggles included. A learning call in progress is cancelled too, and evolve's
+work on it is lost. The new instance doesn't send the earlier turns again; it learns from each
+session's next prompt on.
 
 ### Which prompt evolve learns with
 

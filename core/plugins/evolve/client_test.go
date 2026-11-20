@@ -1,15 +1,20 @@
 package evolve
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
@@ -36,6 +41,10 @@ type fakeEvolveServer struct {
 	holdGuidelines, holdLearn chan struct{}
 	// paged serves list_entities a page at a time: 7 and 8, then 9.
 	paged bool
+	// cursor, when set, makes list_entities serve 7 alone, on and on: the same
+	// cursor every time ("same"), or a new one every time ("advancing").
+	cursor string
+	pages  int
 }
 
 func (f *fakeEvolveServer) record(req mcp.CallToolRequest) {
@@ -93,6 +102,18 @@ func (f *fakeEvolveServer) mcpServer() *server.MCPServer {
 		f.record(req)
 		if f.listErr {
 			return text(map[string]any{"error": "invalid cursor"}), nil
+		}
+		if f.cursor != "" {
+			f.mu.Lock()
+			f.pages++
+			next := "same"
+			if f.cursor == "advancing" {
+				next = fmt.Sprintf("page-%d", f.pages)
+			}
+			f.mu.Unlock()
+			return text(map[string]any{"items": []any{
+				map[string]any{"id": "7", "content": "guideline 7", "metadata": map[string]any{}},
+			}, "next_cursor": next}), nil
 		}
 		if f.paged {
 			if req.GetArguments()["cursor"] != "page-2" {
@@ -264,8 +285,16 @@ func TestMCPEvolve_UnreachableIsUnavailable(t *testing.T) {
 	defer e.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	if _, err := e.Guidelines(ctx, "cortex", "t", "s"); !errors.Is(err, ErrUnavailable) {
-		t.Fatalf("err = %v", err)
+	for range 2 {
+		// A refused connection fails at once, not at the call's deadline, the
+		// second time too: nothing is left waiting for a stream that never opened.
+		start := time.Now()
+		if _, err := e.Guidelines(ctx, "cortex", "t", "s"); !errors.Is(err, ErrUnavailable) {
+			t.Fatalf("err = %v", err)
+		}
+		if took := time.Since(start); took > time.Second {
+			t.Fatalf("a refused connection took %v to fail", took)
+		}
 	}
 }
 
@@ -376,7 +405,9 @@ func silentListener(t *testing.T) string {
 	}
 	var mu sync.Mutex
 	var conns []net.Conn
+	accepting := make(chan struct{})
 	go func() {
+		defer close(accepting)
 		for {
 			c, err := ln.Accept()
 			if err != nil {
@@ -388,7 +419,10 @@ func silentListener(t *testing.T) string {
 		}
 	}()
 	t.Cleanup(func() {
+		// Wait for the accept loop to stop before closing what it accepted, so a
+		// connection accepted just before cleanup is closed too.
 		_ = ln.Close()
+		<-accepting
 		mu.Lock()
 		defer mu.Unlock()
 		for _, c := range conns {
@@ -467,8 +501,16 @@ func TestMCPEvolve_OneCallTimingOutLeavesTheOthersRunning(t *testing.T) {
 	go func() {
 		learned <- e.Learn(context.Background(), "cortex", Trajectory{Messages: []map[string]any{{"role": "user", "content": "x"}}})
 	}()
-	for !f.called("process_trajectory") {
-		time.Sleep(5 * time.Millisecond)
+	// Wait for process_trajectory to start, or for Learn to fail before it does.
+	for deadline := time.Now().Add(5 * time.Second); !f.called("process_trajectory"); time.Sleep(5 * time.Millisecond) {
+		select {
+		case err := <-learned:
+			t.Fatalf("Learn ended before process_trajectory: %v", err)
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("process_trajectory never started")
+		}
 	}
 	// A session's fetch times out while evolve is still learning. Before, the
 	// timeout closed the shared session and failed the learning call with it, so
@@ -552,5 +594,263 @@ func TestMCPEvolve_OlderEvolveFindsGuidelinesBeyondTheFirstPage(t *testing.T) {
 	}
 	if pages != 2 {
 		t.Fatalf("list_entities called %d times, want 2 pages", pages)
+	}
+}
+
+// cutStream serves f behind a proxy that ends the first SSE stream after the
+// initialize reply, keeping its own connection to evolve open: the session stays
+// alive on the server, which goes on accepting the session's requests, but no
+// reply reaches the client. Later streams are relayed whole. Evolve advertises
+// the proxy's URL, since mcp-go ignores an endpoint on another host.
+func cutStream(t *testing.T, f *fakeEvolveServer) string {
+	t.Helper()
+	var backend *httptest.Server
+	var mu sync.Mutex
+	cut := false
+	var held []*http.Response
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		req, _ := http.NewRequestWithContext(context.WithoutCancel(r.Context()), r.Method, backend.URL+r.URL.RequestURI(), r.Body)
+		req.Header = r.Header.Clone()
+		resp, err := http.DefaultTransport.RoundTrip(req)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		for k, v := range resp.Header {
+			w.Header()[k] = v
+		}
+		w.WriteHeader(resp.StatusCode)
+		if r.Method != http.MethodGet {
+			_, _ = io.Copy(w, resp.Body)
+			_ = resp.Body.Close()
+			return
+		}
+		mu.Lock()
+		first := !cut
+		cut = true
+		held = append(held, resp)
+		mu.Unlock()
+		br := bufio.NewReader(resp.Body)
+		messages := 0
+		for {
+			line, err := br.ReadString('\n')
+			if err != nil {
+				return
+			}
+			_, _ = w.Write([]byte(line))
+			w.(http.Flusher).Flush()
+			if strings.HasPrefix(line, "event: message") {
+				messages++
+			}
+			// The blank line ending the initialize reply: end this stream here.
+			if first && messages == 1 && strings.TrimRight(line, "\r\n") == "" {
+				return
+			}
+		}
+	}))
+	backend = httptest.NewServer(server.NewSSEServer(f.mcpServer(), server.WithBaseURL(proxy.URL)))
+	t.Cleanup(func() {
+		mu.Lock()
+		for _, resp := range held {
+			_ = resp.Body.Close()
+		}
+		mu.Unlock()
+		proxy.Close()
+		backend.Close()
+	})
+	return proxy.URL + "/sse"
+}
+
+func TestMCPEvolve_ASessionWhoseStreamEndedIsReplaced(t *testing.T) {
+	f := &fakeEvolveServer{}
+	e := newMCPEvolve(cutStream(t, f), "cortex", "environment-grounded", time.Second)
+	defer e.Close()
+	// The first call's reply can't arrive: the stream ended after initialize.
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	_, err := e.Guidelines(ctx, "cortex", "t", "s")
+	cancel()
+	if !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("err = %v, want ErrUnavailable", err)
+	}
+	// Before, the session was kept: evolve accepted every later request on it, and
+	// each call waited out its deadline for a reply.
+	start := time.Now()
+	ctx, cancel = context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if _, err := e.Guidelines(ctx, "cortex", "t", "s"); err != nil {
+		t.Fatalf("after %v, still on the dead session: %v", time.Since(start), err)
+	}
+}
+
+// failBodyOnce answers the first tool call's POST with a body that can't be
+// read, after evolve has received it, so evolve's reply is on its way over the
+// stream while mcp-go's SendRequest fails with its reply channel still
+// registered.
+type failBodyOnce struct {
+	base http.RoundTripper
+	mu   sync.Mutex
+	done bool
+}
+
+type unreadable struct{}
+
+func (unreadable) Read([]byte) (int, error) { return 0, errors.New("connection reset") }
+func (unreadable) Close() error             { return nil }
+
+func (f *failBodyOnce) RoundTrip(req *http.Request) (*http.Response, error) {
+	var body []byte
+	if req.Body != nil {
+		body, _ = io.ReadAll(req.Body)
+		req.Body = io.NopCloser(strings.NewReader(string(body)))
+	}
+	resp, err := f.base.RoundTrip(req)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err == nil && !f.done && req.Method == http.MethodPost && strings.Contains(string(body), `"tools/call"`) {
+		f.done = true
+		_ = resp.Body.Close()
+		resp.Body = unreadable{}
+	}
+	return resp, err
+}
+
+func TestMCPEvolve_ASessionIsClosedOnlyAfterItsReaderStopped(t *testing.T) {
+	f := &fakeEvolveServer{}
+	e := newMCPEvolve(f.start(t), "cortex", "environment-grounded", time.Second)
+	e.http.Transport = &failBodyOnce{base: e.http.Transport}
+	var mu sync.Mutex
+	var closes, early int
+	e.closeHook = func(cn *conn) {
+		mu.Lock()
+		defer mu.Unlock()
+		closes++
+		select {
+		case <-cn.readerDone:
+		default:
+			early++
+		}
+	}
+
+	// The unreadable body is a transport error, so the session is retired and
+	// closed while evolve's reply is in flight on its stream.
+	if _, err := e.Guidelines(context.Background(), "cortex", "t", "s"); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("err = %v, want the unreadable body", err)
+	}
+	if _, err := e.Guidelines(context.Background(), "cortex", "t", "s"); err != nil {
+		t.Fatalf("not reconnected: %v", err)
+	}
+	e.Close()
+	waitFor(t, func() bool { mu.Lock(); defer mu.Unlock(); return closes >= 2 })
+	mu.Lock()
+	defer mu.Unlock()
+	if early > 0 {
+		t.Fatalf("%d of %d sessions were closed while their reader could still deliver a reply", early, closes)
+	}
+}
+
+// lateEndpoint sends the endpoint event after a delay and then never answers
+// initialize: evolve accepts the request and sends no reply.
+func lateEndpoint(t *testing.T, delay time.Duration) string {
+	t.Helper()
+	stop := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			w.WriteHeader(http.StatusAccepted)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		w.(http.Flusher).Flush()
+		select {
+		case <-time.After(delay):
+		case <-stop:
+			return
+		}
+		_, _ = w.Write([]byte("event: endpoint\ndata: /message?sessionId=s\n\n"))
+		w.(http.Flusher).Flush()
+		select {
+		case <-r.Context().Done():
+		case <-stop:
+		}
+	}))
+	t.Cleanup(func() { close(stop); srv.Close() })
+	return srv.URL + "/sse"
+}
+
+func TestMCPEvolve_OneDeadlineCoversStartingAndInitializing(t *testing.T) {
+	e := newMCPEvolve(lateEndpoint(t, 400*time.Millisecond), "cortex", "environment-grounded", time.Second)
+	e.connectBudget = 600 * time.Millisecond
+	defer e.Close()
+	start := time.Now()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if _, err := e.Guidelines(ctx, "cortex", "t", "s"); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("err = %v, want the connect to fail", err)
+	}
+	// The endpoint came at 400 ms and initialize never answered: the connect ends
+	// at its 600 ms budget. Before, initialize got 600 ms of its own, to 1 s.
+	if took := time.Since(start); took > 850*time.Millisecond {
+		t.Fatalf("connect failed after %v, want within its 600ms budget", took)
+	}
+}
+
+func TestMCPEvolve_LearningSetsUpTheSessionItSendsOn(t *testing.T) {
+	sw := &swappable{}
+	ts := httptest.NewServer(sw)
+	t.Cleanup(ts.Close)
+	first, second := &fakeEvolveServer{}, &fakeEvolveServer{}
+	sw.set(server.NewSSEServer(first.mcpServer(), server.WithBaseURL(ts.URL)))
+	e := newMCPEvolve(ts.URL+"/sse", "cortex", "environment-grounded", time.Second)
+	defer e.Close()
+	swapped := false
+	e.afterSetup = func() {
+		if swapped {
+			return
+		}
+		swapped = true
+		// Evolve restarts just after setup, and a concurrent call retires the session.
+		sw.set(server.NewSSEServer(second.mcpServer(), server.WithBaseURL(ts.URL)))
+		e.mu.Lock()
+		if e.client != nil {
+			e.retire()
+		}
+		e.mu.Unlock()
+	}
+	tr := Trajectory{Messages: []map[string]any{{"role": "user", "content": "x"}}}
+	_ = e.Learn(context.Background(), "cortex", tr) // sent on the session that was set up, which evolve no longer knows
+	if err := e.Learn(context.Background(), "cortex", tr); err != nil {
+		t.Fatal(err)
+	}
+	// The new evolve is set up before it is sent anything to learn. Before, the
+	// setup was recorded for the plugin as a whole, so the batch went to the new
+	// evolve unprepared; one without the profile would fail it every time.
+	got := second.tools()
+	if len(got) < 3 || got[0] != "ensure_processing_profile" || got[1] != "list_entities" || got[2] != "process_trajectory" {
+		t.Fatalf("new evolve got %v, want setup before process_trajectory", got)
+	}
+}
+
+func TestMCPEvolve_AListingThatDoesNotFinishIsAnError(t *testing.T) {
+	for _, cursor := range []string{"same", "advancing"} {
+		t.Run(cursor, func(t *testing.T) {
+			f := &fakeEvolveServer{old: true, cursor: cursor}
+			e := newMCPEvolve(f.start(t), "cortex", "environment-grounded", 5*time.Second)
+			defer e.Close()
+			// 9 is never listed. Before, the fallback returned 7 alone as a
+			// successful fetch, and the session cached it.
+			gs, err := e.Guidelines(context.Background(), "cortex", "t", "s")
+			if !errors.Is(err, ErrUnavailable) {
+				t.Fatalf("guidelines = %+v, err = %v; want ErrUnavailable", gs, err)
+			}
+			if want := map[string]int{"same": 2, "advancing": maxListPages}[cursor]; f.pages != want {
+				t.Fatalf("read %d pages, want %d", f.pages, want)
+			}
+		})
+	}
+}
+
+func TestPreview_StopsAtARuneBoundary(t *testing.T) {
+	if got := preview(strings.Repeat("é", 10), 7); got != "ééé…" || !utf8.ValidString(got) {
+		t.Fatalf("preview = %q", got)
 	}
 }
